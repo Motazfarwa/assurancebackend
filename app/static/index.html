@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Gestion Assurance · Clients</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/expert.css">
+</head>
+<body>
+  <section id="login-screen" class="login-screen">
+    <form id="login-form" class="login-card">
+      <div class="login-brand"><div class="brand-mark">A</div><div><strong>ASSURANCE JEMMALI</strong><span>ESPACE DE GESTION</span></div></div>
+      <div class="login-title"><div class="eyebrow">ACCÈS SÉCURISÉ</div><h1>Bienvenue</h1><p>Connectez-vous pour accéder à votre espace.</p></div>
+      <label>Nom d'utilisateur<input name="username" autocomplete="username" required maxlength="25" autofocus></label>
+      <label>Mot de passe<input name="password" type="password" autocomplete="current-password" required maxlength="256"></label>
+      <div id="login-error" class="login-error" hidden></div>
+      <button class="btn btn-primary login-submit" type="submit">Se connecter <span>→</span></button>
+      <small>Utilisez votre compte Assurance existant.</small>
+    </form>
+  </section>
+  <div id="app-shell" hidden>
+  <header class="topbar"><div class="brand-mark">A</div><div><strong>ASSURANCE JEMMALI</strong><span>GESTION ASSURANCE</span></div><div class="top-right">AGENCE · SIÈGE <span class="user-chip" id="current-user">—</span><button class="btn btn-light logout-btn" id="logout-btn">Déconnexion</button></div></header>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="side-caption">ESPACE DE TRAVAIL</div>
+      <div class="side-section">PRODUCTION</div>
+      <button class="nav-item active"><span class="nav-icon">♙</span>Gestion des clients</button>
+      <button class="nav-item" id="open-expert"><span class="nav-icon">✚</span>Saisie expert</button>
+      <button class="nav-item disabled" title="Ce module sera ajouté dans une prochaine étape"><span class="nav-icon">▤</span>Gestion des polices</button>
+      <button class="nav-item disabled" title="Ce module sera ajouté dans une prochaine étape"><span class="nav-icon">▧</span>Quittances</button>
+      <div class="side-section muted">COMPTABILITÉ</div><div class="side-section muted">RECOUVREMENT</div><div class="side-section muted">SINISTRES</div><div class="side-section muted">PARAMÉTRAGE</div>
+      <div class="sidebar-foot">MODULE ACTIF<br><b>Gestion des clients</b></div>
+    </aside>
+    <main>
+      <div class="page-heading"><div><div class="eyebrow">PRODUCTION / CLIENTS</div><h1>Gestion des clients</h1><p>Créer, consulter et mettre à jour les dossiers clients.</p></div><div class="counter"><span id="client-count">—</span><small>CLIENTS AFFICHÉS</small></div></div>
+      <div id="notice" class="notice" hidden></div>
+      <section class="card form-card">
+        <div class="card-head"><div><h2 id="form-title">Nouveau client</h2><p>Les champs marqués * sont obligatoires.</p></div><div class="form-actions"><button class="btn btn-light" id="new-btn" type="button">Nouveau</button><button class="btn btn-primary" id="save-btn" type="submit" form="client-form">Enregistrer le client</button></div></div>
+        <form id="client-form">
+          <fieldset><legend>Informations du client</legend><div class="grid g4">
+            <label>Code client *<input name="code_client" required maxlength="20" placeholder="Ex. 5060"></label><label>Nom<input name="Nom" maxlength="100"></label><label>Prénom<input name="Prenom" maxlength="100"></label><label>Nom complet / raison sociale<input name="nom_client" maxlength="200"></label>
+            <label>Nationalité<input name="Nationnalite"></label><label>Pays<input name="Pays"></label><label>Date de naissance<input name="DateNaissance" type="date"></label><label>Lieu de naissance<input name="LieuNaissance"></label>
+            <label>Profession<input name="profession"></label><label>Situation familiale<select name="Sit_Fam"><option value="">Choisir…</option><option value="C">Célibataire</option><option value="M">Marié(e)</option><option value="D">Divorcé(e)</option><option value="V">Veuf / veuve</option></select></label><label>Titre<select name="Titre"><option value="">Choisir…</option><option>Mme</option><option>Mlle</option><option>Monsieur</option><option>Mr</option></select></label><label>Type client<select name="Type_Client"><option value="P">Particulier</option><option value="S">Société</option></select></label>
+            <label>N° C.I.N.<input name="NumeroCIN"></label><label>Date C.I.N.<input name="DateCIN" type="date"></label><label>Lieu C.I.N.<input name="LieuCIN"></label><label>Exonéré<select name="Exonerer"><option value="N">Non</option><option value="O">Oui</option></select></label>
+            <label>N° permis<input name="NumeroPermis"></label><label>Date permis<input name="DatePermis" type="date"></label><label>Lieu permis<input name="LieuPermis"></label>
+          </div></fieldset>
+          <fieldset><legend>Lien / correspondant</legend><div class="grid g3"><label>Code<input name="code_locuteur"></label><label>Nom<input name="nom_locuteur"></label><label>Qualité / correspondant<input name="Correspondant"></label></div></fieldset>
+          <fieldset><legend>Domicile</legend><div class="grid g4"><label class="span2">Adresse<input name="adresse"></label><label>Ville<input name="ville"></label><label>Code postal<input name="cp" type="number"></label><label>Téléphone<input name="tel" type="tel"></label><label>Fax<input name="fax" type="tel"></label></div></fieldset>
+          <fieldset><legend>Bureau</legend><div class="grid g4"><label class="span2">Adresse<input name="adresse_b"></label><label>Ville<input name="ville_b"></label><label>Code postal<input name="cp_b" type="number"></label><label>Téléphone 1<input name="tel_b" type="tel"></label><label>Téléphone 2<input name="tel_b2" type="tel"></label><label>Fax<input name="fax_b" type="tel"></label><label>Email<input name="adresse_email" type="email"></label></div></fieldset>
+          <fieldset><legend>Observation</legend><label><textarea name="observ" rows="3" placeholder="Ajouter une remarque…"></textarea></label></fieldset>
+        </form>
+      </section>
+      <section class="card list-card"><div class="list-head"><div><h2>Liste des clients</h2><p>Rechercher par code ou nom.</p></div><div class="search"><span>⌕</span><input id="search" placeholder="Rechercher un client…"><button id="search-btn" class="btn btn-light">Rechercher</button></div></div>
+        <div class="table-wrap"><table><thead><tr><th>CODE</th><th>NOM / RAISON SOCIALE</th><th>VILLE</th><th>TÉLÉPHONE</th><th>TYPE</th><th class="actions-col">ACTIONS</th></tr></thead><tbody id="client-rows"><tr><td colspan="6" class="empty">Chargement des clients…</td></tr></tbody></table></div>
+        <div class="pagination"><span id="list-status">—</span><div><button class="btn btn-light" id="prev-btn">← Précédent</button><button class="btn btn-light" id="next-btn">Suivant →</button></div></div>
+      </section>
+      <footer>ASSURANCE JEMMALI <span>•</span> Gestion des clients</footer>
+    </main>
+  </div>
+  <div id="expert-modal" class="modal-backdrop" hidden>
+    <section class="expert-dialog" role="dialog" aria-modal="true" aria-labelledby="expert-title">
+      <header class="expert-header"><div><span class="expert-kicker">PRODUCTION · PRESTATAIRES</span><h2 id="expert-title">Saisie expert</h2></div><button type="button" class="expert-x" id="expert-close" aria-label="Fermer">×</button></header>
+      <div class="expert-toolbar"><button type="button" id="expert-add">Ajouter</button><button type="button" id="expert-edit">Modifier</button><button type="button" id="expert-delete">Supprimer</button><button type="button" id="expert-list-toggle">Lister</button><span id="expert-selected-label">Nouveau prestataire</span><button type="button" id="expert-close-toolbar">Fermer</button></div>
+      <div id="expert-message" class="expert-message" hidden></div>
+      <div id="expert-list-panel" class="expert-list-panel" hidden><div class="expert-search"><input id="expert-search" placeholder="Rechercher un code ou un nom"><button type="button" id="expert-search-btn">Rechercher</button></div><div class="expert-table-wrap"><table><thead><tr><th>CODE</th><th>NOM</th><th>FAMILLE</th><th>RÉGION</th></tr></thead><tbody id="expert-rows"></tbody></table></div></div>
+      <form id="expert-form" class="expert-form">
+        <div class="expert-fields">
+          <label>Famille<select name="Code_Famille" id="expert-family" required></select></label>
+          <label>Code prestataire<input name="Code_Prestataire" type="number" min="1" required></label>
+          <label>Région<select name="Code_Region" id="expert-region"><option value="">Choisir une région</option></select></label>
+          <label class="wide">Nom<input name="Nom_Prestataire" maxlength="60" required></label>
+          <label>Matricule fiscal<input name="Matricule_Fiscal" maxlength="30"></label>
+          <label class="wide">Adresse professionnelle<input name="Adresse_Prof" maxlength="50"></label>
+          <label>Téléphone 1<input name="Tel1" maxlength="30"></label>
+          <label class="wide">Adresse résidence<input name="Adresse_Residence" maxlength="50"></label>
+          <label>Téléphone 2<input name="Tel2" maxlength="30"></label>
+          <label>Fax<input name="Fax" maxlength="30"></label>
+          <label class="wide">E-mail<input name="Adresse_EMail" type="email" maxlength="100"></label>
+          <label>Taux RS<input name="Taux_RS" type="number" min="0" step="0.001" value="0"></label>
+          <label class="wide">Observation<input name="Observation" maxlength="100"></label>
+          <label>Note<select name="Note" id="expert-note"><option value="">Choisir une note</option></select></label>
+        </div>
+        <div class="expert-relations">
+          <fieldset><legend>Compagnies</legend><div id="expert-companies" class="check-list"></div></fieldset>
+          <fieldset><legend>Branches</legend><div id="expert-branches" class="check-list"></div></fieldset>
+        </div>
+        <div class="expert-form-footer"><span>Prestataire et associations enregistrés ensemble.</span><button type="submit" class="expert-save" id="expert-save">Enregistrer le prestataire</button></div>
+      </form>
+    </section>
+  </div>
+  </div>
+  <script src="/static/app.js"></script>
+</body></html>
