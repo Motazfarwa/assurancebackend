@@ -1,3 +1,4 @@
+import hmac
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -40,6 +41,10 @@ def users_table(db: Session) -> Table:
     return table
 
 
+def _is_predefined_admin(username: str) -> bool:
+    return username.strip().casefold() == settings.admin_username.casefold()
+
+
 class RefreshRequest(BaseModel):
     refresh_token: str = Field(min_length=1)
 
@@ -70,6 +75,10 @@ def list_login_users(lieu: str = Query(default="", max_length=255), db: Session 
 
 @router.post("/login")
 def login(credentials: LoginRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
+    if _is_predefined_admin(credentials.username):
+        if not hmac.compare_digest(credentials.password.encode("utf-8"), settings.admin_password.encode("utf-8")):
+            raise HTTPException(status_code=401, detail="Nom d'utilisateur ou mot de passe incorrect.")
+        return _session_payload(settings.admin_username, None)
     table = users_table(db)
     row = db.execute(select(table).where(table.c.Nom_Utilisateur == credentials.username).limit(1)).mappings().first()
     if row is None or row["ModP"] is None:
@@ -90,6 +99,8 @@ def login(credentials: LoginRequest, db: Session = Depends(get_db)) -> dict[str,
 @router.post("/refresh")
 def refresh(payload: RefreshRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
     claims = decode_refresh_token(payload.refresh_token)
+    if _is_predefined_admin(str(claims["sub"])):
+        return _session_payload(settings.admin_username, None)
     table = users_table(db)
     row = db.execute(select(table).where(table.c.Nom_Utilisateur == claims["sub"]).limit(1)).mappings().first()
     if row is None:

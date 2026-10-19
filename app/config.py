@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     db_branch_table: str = "TBranche"
     db_document_table: str = "TDocument"
     db_unpaid_table: str = "TTempEtatImpaye"
+    # Predefined administrator, authenticated without the user table (override with ADMIN_PASSWORD).
+    admin_username: str = "admin"
+    admin_password: str = "123"
     auth_secret_key: str = Field(default_factory=lambda: secrets.token_urlsafe(48))
     cors_origins: list[str] = ["http://localhost:3000", "http://127.0.0.1:3000"]
 
