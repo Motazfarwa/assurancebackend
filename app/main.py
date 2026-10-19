@@ -22,10 +22,13 @@ from app.routers import polices
 app = FastAPI(title="Assurance API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins,
+    allow_origins=[
+        "https://assurancefrontend.onrender.com",
+        "http://localhost:5173",
+    ],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 app.include_router(sinistres_router, dependencies=[Depends(require_current_user)])
 app.include_router(clients_router)
