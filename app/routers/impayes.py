@@ -39,10 +39,30 @@ def serialize(row: Any) -> dict[str, Any]:
     return {key: value.isoformat() if isinstance(value, (date, datetime)) else value for key, value in row.items()}
 
 
+@router.get("/reglements/clients")
+def list_settlement_clients(db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Clients having at least one settlement, for the filter dropdown."""
+    schema = settings.db_schema
+    sql = f"""
+        SELECT DISTINCT q.code_client, c.nom_client
+        FROM "{schema}"."TQuittance" q
+        JOIN "{schema}"."TRDetRegCli" d ON d."Num_quitance" = q.num_quittance
+        LEFT JOIN "{schema}"."TClient" c ON c.code_client = q.code_client
+        WHERE q.code_client IS NOT NULL
+        ORDER BY c.nom_client, q.code_client
+    """
+    try:
+        rows = db.execute(text(sql)).mappings().all()
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Impossible de lire la liste des clients.") from exc
+    return {"items": [{"code_client": row["code_client"], "nom_client": row["nom_client"]} for row in rows]}
+
+
 @router.get("/reglements")
 def list_clients_by_settlement(
     code_client: str = Query(default="", max_length=8),
     nom_client: str = Query(default="", max_length=30),
+    acompte_solde: str = Query(default="", pattern="^(|S|A)$"),
     statut: str = Query(default="impaye", pattern="^(impaye|paye)$"),
     limit: int = Query(default=2000, ge=1, le=5000),
     db: Session = Depends(get_db),
@@ -52,24 +72,27 @@ def list_clients_by_settlement(
     paid = 'r.nq IS NOT NULL AND (COALESCE(r.solde_flag, FALSE) OR COALESCE(r.solde, 1) <= 0)'
     sql = f"""
         SELECT q.code_client, c.nom_client, q.num_quittance, q."Periode", q.echeance, q.prime_total,
-               COALESCE(r.regle, 0) AS montant_regle, COALESCE(r.solde, q.solde_quittance) AS solde_quittance
+               COALESCE(r.regle, 0) AS montant_regle, COALESCE(r.solde, q.solde_quittance) AS solde_quittance,
+               r.acompte_solde
         FROM "{schema}"."TQuittance" q
         LEFT JOIN "{schema}"."TClient" c ON c.code_client = q.code_client
         LEFT JOIN (
             SELECT "Num_quitance" AS nq, SUM("Montant") AS regle, MIN("Solde_Quittance") AS solde,
-                   BOOL_OR("Acompte_Solde" = 'S') AS solde_flag
+                   BOOL_OR("Acompte_Solde" = 'S') AS solde_flag,
+                   CASE WHEN BOOL_OR("Acompte_Solde" = 'S') THEN 'S' WHEN BOOL_OR("Acompte_Solde" = 'A') THEN 'A' END AS acompte_solde
             FROM "{schema}"."TRDetRegCli" GROUP BY "Num_quitance"
         ) r ON r.nq = q.num_quittance
         WHERE {'(' + paid + ')' if statut == 'paye' else 'NOT (' + paid + ')'}
           AND (:code = '' OR q.code_client = :code)
           AND (:nom = '' OR c.nom_client ILIKE :nom_like)
+          AND (:acompte = '' OR r.acompte_solde = :acompte)
         ORDER BY q.echeance, q.code_client
         LIMIT :limit
     """
     try:
         rows = db.execute(
             text(sql),
-            {"code": code_client.strip(), "nom": nom_client.strip(), "nom_like": f"%{nom_client.strip()}%", "limit": limit},
+            {"code": code_client.strip(), "nom": nom_client.strip(), "nom_like": f"%{nom_client.strip()}%", "acompte": acompte_solde, "limit": limit},
         ).mappings().all()
     except SQLAlchemyError as exc:
         raise HTTPException(status_code=503, detail="Impossible de lire les règlements clients (TRDetRegCli).") from exc
