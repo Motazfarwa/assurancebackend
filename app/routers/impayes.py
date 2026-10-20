@@ -2,7 +2,7 @@ from datetime import date, datetime, time, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import MetaData, Table, and_, func, or_, select
+from sqlalchemy import MetaData, Table, and_, func, or_, select, text
 from sqlalchemy.exc import NoSuchTableError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -37,6 +37,44 @@ def list_unpaid_companies(db: Session = Depends(get_db)) -> dict[str, Any]:
 
 def serialize(row: Any) -> dict[str, Any]:
     return {key: value.isoformat() if isinstance(value, (date, datetime)) else value for key, value in row.items()}
+
+
+@router.get("/reglements")
+def list_clients_by_settlement(
+    code_client: str = Query(default="", max_length=8),
+    nom_client: str = Query(default="", max_length=30),
+    statut: str = Query(default="impaye", pattern="^(impaye|paye)$"),
+    limit: int = Query(default=2000, ge=1, le=5000),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Paid / unpaid receipts per client, based on the client settlements (TRDetRegCli)."""
+    schema = settings.db_schema
+    paid = 'r.nq IS NOT NULL AND (COALESCE(r.solde_flag, FALSE) OR COALESCE(r.solde, 1) <= 0)'
+    sql = f"""
+        SELECT q.code_client, c.nom_client, q.num_quittance, q."Periode", q.echeance, q.prime_total,
+               COALESCE(r.regle, 0) AS montant_regle, COALESCE(r.solde, q.solde_quittance) AS solde_quittance
+        FROM "{schema}"."TQuittance" q
+        LEFT JOIN "{schema}"."TClient" c ON c.code_client = q.code_client
+        LEFT JOIN (
+            SELECT "Num_quitance" AS nq, SUM("Montant") AS regle, MIN("Solde_Quittance") AS solde,
+                   BOOL_OR("Acompte_Solde" = 'S') AS solde_flag
+            FROM "{schema}"."TRDetRegCli" GROUP BY "Num_quitance"
+        ) r ON r.nq = q.num_quittance
+        WHERE {'(' + paid + ')' if statut == 'paye' else 'NOT (' + paid + ')'}
+          AND (:code = '' OR q.code_client = :code)
+          AND (:nom = '' OR c.nom_client ILIKE :nom_like)
+        ORDER BY q.echeance, q.code_client
+        LIMIT :limit
+    """
+    try:
+        rows = db.execute(
+            text(sql),
+            {"code": code_client.strip(), "nom": nom_client.strip(), "nom_like": f"%{nom_client.strip()}%", "limit": limit},
+        ).mappings().all()
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Impossible de lire les règlements clients (TRDetRegCli).") from exc
+    items = [serialize(row) for row in rows]
+    return {"items": items, "count": len(items), "limit": limit}
 
 
 @router.get("")
