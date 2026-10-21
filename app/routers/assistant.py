@@ -215,3 +215,93 @@ def chat(request: ChatRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
         raise HTTPException(status_code=503, detail="Impossible de joindre le service IA.") from exc
     except anthropic.APIStatusError as exc:
         raise HTTPException(status_code=502, detail=f"Erreur du service IA ({exc.status_code}).") from exc
+
+
+# ---------------------------------------------------------------------------------------------
+# Reading a scanned / photographed client or contract file (French or Arabic)
+# ---------------------------------------------------------------------------------------------
+FICHE_FIELDS: dict[str, str] = {
+    "last_name": "Family name of the insured / subscriber (Nom). If the document gives one combined name (Nom / RS), put the family name here.",
+    "first_name": "Given name (Prénom); empty if the insured is a company or not separable.",
+    "company_name": "Raison sociale when the insured is a company, else null.",
+    "birth_date": "Date of birth, dd/mm/yyyy.",
+    "birth_place": "Place of birth.",
+    "nationality": "Nationality.",
+    "profession": "Profession.",
+    "id_number": "National ID card (CIN), passport or unique identifier number exactly as printed.",
+    "id_date": "Issue date of the ID, dd/mm/yyyy.",
+    "id_place": "Issue place of the ID.",
+    "license_number": "Driving licence number.",
+    "address": "Street address of the insured.",
+    "city": "City.",
+    "postal_code": "Postal code (4 digits in Tunisia).",
+    "phone": "Phone number, digits only.",
+    "email": "Email address.",
+    "policy_number": "Contract / policy number (Contrat N°, عدد العقد) exactly as printed, digits only.",
+    "effect_date": "Effective date (Date d'effet), dd/mm/yyyy.",
+    "expiry_date": "Expiry or due date (Date d'échéance / expiration), dd/mm/yyyy.",
+    "vehicle_registration": "Vehicle registration plate (Immatriculation), e.g. '209 TU 222'.",
+    "net_premium": "Net contribution / prime nette for the period, number with dot decimals.",
+    "taxes": "Taxes (Taxes), number with dot decimals.",
+    "stamp": "Stamp duty (Timbre), number with dot decimals.",
+    "commission": "Commission, number with dot decimals.",
+    "total_premium": "Total amount to pay (Total / Contribution au comptant / Prime totale), number with dot decimals.",
+    "period": "Period or instalment (Période, Fractionnement), as printed.",
+}
+
+FICHE_SCHEMA = {
+    "type": "object",
+    "properties": {key: {"type": ["string", "null"], "description": hint} for key, hint in FICHE_FIELDS.items()},
+    "required": list(FICHE_FIELDS),
+    "additionalProperties": False,
+}
+
+FICHE_PROMPT = (
+    "This image is a photographed or scanned insurance document from Tunisia (client file, contract, quotation or receipt), "
+    "in French and/or Arabic. It may be skewed, dark or partly cut off. Read it carefully and fill the requested fields. "
+    "Rules: copy values exactly as printed (do not translate names or addresses); use null for anything that is not visible "
+    "or that you are not confident about - never guess; dates as dd/mm/yyyy; amounts as plain numbers with a dot for decimals "
+    "(e.g. '233,745DT' -> '233.745'); Arabic-Indic digits converted to Western digits."
+)
+
+
+class FicheRequest(BaseModel):
+    image_base64: str = Field(min_length=100, max_length=9_000_000)
+    media_type: Literal["image/jpeg", "image/png", "image/webp", "image/gif"] = "image/jpeg"
+
+
+@router.post("/extract-fiche")
+def extract_fiche(request: FicheRequest) -> dict[str, Any]:
+    if not settings.anthropic_api_key:
+        raise HTTPException(status_code=503, detail="Lecture IA non configurée : définissez ANTHROPIC_API_KEY sur le serveur.")
+
+    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    try:
+        response = client.messages.create(
+            model=settings.assistant_model,
+            max_tokens=4000,
+            output_config={"format": {"type": "json_schema", "schema": FICHE_SCHEMA}, "effort": "medium"},
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": request.media_type, "data": request.image_base64}},
+                    {"type": "text", "text": FICHE_PROMPT},
+                ],
+            }],
+        )
+        if response.stop_reason == "refusal":
+            raise HTTPException(status_code=422, detail="Le document n'a pas pu être analysé.")
+        raw = next((block.text for block in response.content if block.type == "text"), "{}")
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=502, detail="Réponse illisible du service IA.") from exc
+    except anthropic.AuthenticationError as exc:
+        raise HTTPException(status_code=503, detail="Clé API de l'assistant invalide.") from exc
+    except anthropic.RateLimitError as exc:
+        raise HTTPException(status_code=429, detail="Service IA surchargé, réessayez dans un instant.") from exc
+    except anthropic.APIConnectionError as exc:
+        raise HTTPException(status_code=503, detail="Impossible de joindre le service IA.") from exc
+    except anthropic.APIStatusError as exc:
+        raise HTTPException(status_code=502, detail=f"Erreur du service IA ({exc.status_code}).") from exc
+
+    return {"fields": {key: (data.get(key) or None) for key in FICHE_FIELDS}}

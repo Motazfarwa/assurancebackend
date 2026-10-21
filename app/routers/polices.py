@@ -328,7 +328,13 @@ def get_police_detail(
             {"cc": police.get("code_compagnie"), "cb": police.get("code_branche")},
         ).scalar()
 
+        nom_client = conn.execute(
+            text('SELECT nom_client FROM dbo."TClient" WHERE TRIM(code_client) = :c LIMIT 1'),
+            {"c": str(police.get("code_client") or "").strip()},
+        ).scalar()
+
     return {
+        "nom_client": nom_client,
         "police": police,
         "quittance": _plain(quittance) if quittance else None,
         "quittances": [_plain(row) for row in quittance_rows],
