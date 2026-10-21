@@ -285,21 +285,25 @@ def _extract_fiche_gemini(request: FicheRequest) -> dict[str, Any]:
         ]}],
         "generationConfig": {"response_mime_type": "application/json", "response_schema": schema, "temperature": 0},
     }
+    # Google AI Studio keys ("AIza...") use the Generative Language API; keys starting with "AQ." are Vertex AI
+    # express-mode keys and only work on the Vertex endpoint.
+    key = settings.gemini_api_key or ""
+    if key.startswith("AQ."):
+        url = f"https://aiplatform.googleapis.com/v1/publishers/google/models/{settings.gemini_model}:generateContent"
+    else:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{settings.gemini_model}:generateContent"
     try:
-        reply = httpx.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{settings.gemini_model}:generateContent",
-            params={"key": settings.gemini_api_key},
-            json=body,
-            timeout=90,
-        )
+        reply = httpx.post(url, headers={"x-goog-api-key": key}, json=body, timeout=90)
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=503, detail="Impossible de joindre le service de lecture.") from exc
-    if reply.status_code in (400, 401, 403):
-        raise HTTPException(status_code=503, detail="Clé GEMINI_API_KEY invalide ou modèle indisponible.")
-    if reply.status_code == 429:
-        raise HTTPException(status_code=429, detail="Quota gratuit atteint, réessayez plus tard.")
     if reply.status_code >= 400:
-        raise HTTPException(status_code=502, detail=f"Erreur du service de lecture ({reply.status_code}).")
+        try:
+            reason = str(reply.json().get("error", {}).get("message", ""))[:200]
+        except ValueError:
+            reason = ""
+        if reply.status_code == 429:
+            raise HTTPException(status_code=429, detail="Quota gratuit atteint, réessayez plus tard.")
+        raise HTTPException(status_code=503 if reply.status_code in (400, 401, 403, 404) else 502, detail=f"Service de lecture ({reply.status_code}) : {reason or 'erreur'}")
     try:
         parts = reply.json()["candidates"][0]["content"]["parts"]
         data = json.loads("".join(part.get("text", "") for part in parts))
