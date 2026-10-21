@@ -9,6 +9,7 @@ import re
 from typing import Any, Literal
 
 import anthropic
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import text
@@ -270,10 +271,52 @@ class FicheRequest(BaseModel):
     media_type: Literal["image/jpeg", "image/png", "image/webp", "image/gif"] = "image/jpeg"
 
 
+def _extract_fiche_gemini(request: FicheRequest) -> dict[str, Any]:
+    """Free-tier alternative: Google Gemini vision (key from https://aistudio.google.com/apikey)."""
+    schema = {
+        "type": "OBJECT",
+        "properties": {key: {"type": "STRING", "nullable": True, "description": hint} for key, hint in FICHE_FIELDS.items()},
+        "required": list(FICHE_FIELDS),
+    }
+    body = {
+        "contents": [{"parts": [
+            {"text": FICHE_PROMPT},
+            {"inline_data": {"mime_type": request.media_type, "data": request.image_base64}},
+        ]}],
+        "generationConfig": {"response_mime_type": "application/json", "response_schema": schema, "temperature": 0},
+    }
+    try:
+        reply = httpx.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{settings.gemini_model}:generateContent",
+            params={"key": settings.gemini_api_key},
+            json=body,
+            timeout=90,
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=503, detail="Impossible de joindre le service de lecture.") from exc
+    if reply.status_code in (400, 401, 403):
+        raise HTTPException(status_code=503, detail="Clé GEMINI_API_KEY invalide ou modèle indisponible.")
+    if reply.status_code == 429:
+        raise HTTPException(status_code=429, detail="Quota gratuit atteint, réessayez plus tard.")
+    if reply.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"Erreur du service de lecture ({reply.status_code}).")
+    try:
+        parts = reply.json()["candidates"][0]["content"]["parts"]
+        data = json.loads("".join(part.get("text", "") for part in parts))
+    except (KeyError, IndexError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="Réponse illisible du service de lecture.") from exc
+    return {"fields": {key: (data.get(key) or None) for key in FICHE_FIELDS}}
+
+
 @router.post("/extract-fiche")
 def extract_fiche(request: FicheRequest) -> dict[str, Any]:
     if not settings.anthropic_api_key:
-        raise HTTPException(status_code=503, detail="Lecture IA non configurée : définissez ANTHROPIC_API_KEY sur le serveur.")
+        if settings.gemini_api_key:
+            return _extract_fiche_gemini(request)
+        raise HTTPException(
+            status_code=503,
+            detail="Lecture IA non configurée : définissez GEMINI_API_KEY (gratuit) ou ANTHROPIC_API_KEY sur le serveur.",
+        )
 
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
     try:
