@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     db_branch_table: str = "TBranche"
     db_document_table: str = "TDocument"
     db_unpaid_table: str = "TTempEtatImpaye"
+    # AI assistant (set ANTHROPIC_API_KEY on the server; ASSISTANT_MODEL overrides the model).
+    anthropic_api_key: str | None = None
+    assistant_model: str = "claude-opus-5-5"
     # Predefined administrator, authenticated without the user table (override with ADMIN_PASSWORD).
     admin_username: str = "admin"
     admin_password: str = "123"

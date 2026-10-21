@@ -1,0 +1,217 @@
+"""AI assistant and task agent grounded in the live database.
+
+Retrieval is done with tools (schema lookup + read-only SQL) rather than a static index, so answers always
+reflect the current data. Every query runs in a read-only transaction, and the user table (password hashes)
+is never reachable.
+"""
+import json
+import re
+from typing import Any, Literal
+
+import anthropic
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
+
+from app.auth import require_current_user
+from app.config import settings
+from app.database import get_db
+
+
+router = APIRouter(prefix="/api/assistant", tags=["Assistant IA"], dependencies=[Depends(require_current_user)])
+
+MAX_ROWS = 100
+MAX_RESULT_CHARS = 14000
+BLOCKED_TABLES = {settings.db_user_table.lower(), "rutilisateur_depot"}
+BLOCKED_COLUMNS = {"modp"}
+FORBIDDEN_SQL = re.compile(
+    r"\b(insert|update|delete|drop|alter|truncate|create|grant|revoke|copy|call|do|execute|vacuum|analyze|"
+    r"set|reset|listen|notify|lock|pg_sleep|pg_read_file|pg_ls_dir|lo_import|lo_export|dblink|nextval|setval)\b",
+    re.IGNORECASE,
+)
+
+SYSTEM_PROMPT = """You are the built-in assistant of "Gestion Assurances", the back-office of an insurance agency in Tunisia (Assurance Jemmali). Users are agency staff. Answer in the language of the user's message (French by default, Arabic if they write Arabic).
+
+You can read the agency database through two tools:
+- list_tables: lists the tables and columns you may query.
+- run_sql: runs ONE read-only PostgreSQL SELECT (max {max_rows} rows). Tables live in schema dbo with mixed-case names, so quote them: dbo."TClient", dbo."TPolice", dbo."TQuittance", dbo."TRDetRegCli" (client settlements), dbo."TBranche", dbo."TCompagnie", dbo."Sinistre". Quote mixed-case columns too (e.g. "Periode").
+
+How to work:
+- Never invent data. If a question concerns clients, policies, receipts (quittances), settlements or claims, look it up with the tools; call list_tables first if you are unsure of a column name.
+- Prefer targeted queries with WHERE and LIMIT; aggregate in SQL (COUNT, SUM) instead of pulling many rows.
+- Money is in Tunisian dinars (TND, 3 decimals). Dates in answers: dd/mm/yyyy.
+- You cannot modify data. If the user wants a change (create a client, a policy, a receipt), explain precisely which screen and which values to use instead.
+- Never reveal or look for passwords, tokens or user accounts.
+- Be concise: lead with the answer, then the key figures; use a short table or list when it helps.
+{mode_rules}"""
+
+MODE_RULES = {
+    "ask": "",
+    "agent": (
+        "\nYou are in TASK mode: the user gives you a goal to accomplish end to end. Briefly plan, run as many queries "
+        "as needed, cross-check the numbers, and finish with a structured result: a one-line summary, the findings "
+        "(table or bullet list with codes/numbers so staff can act on them), and the recommended next steps. "
+        "State clearly what you could not determine."
+    ),
+}
+
+TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "list_tables",
+        "description": "List the database tables you can query with their columns and types. Optionally filter by a table name fragment.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"name_contains": {"type": "string", "description": "Optional fragment of a table name, e.g. 'Quittance'."}},
+        },
+    },
+    {
+        "name": "run_sql",
+        "description": "Run a single read-only PostgreSQL SELECT (or WITH ... SELECT) and return the rows as JSON. At most 100 rows are returned.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "One SELECT statement, no trailing semicolon."}},
+            "required": ["query"],
+        },
+    },
+]
+
+
+class ChatMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=6000)
+
+
+class ChatRequest(BaseModel):
+    messages: list[ChatMessage] = Field(min_length=1, max_length=24)
+    mode: Literal["ask", "agent"] = "ask"
+    client_code: str | None = Field(default=None, max_length=8)
+
+
+def _json(value: Any) -> str:
+    return json.dumps(value, default=str, ensure_ascii=False)
+
+
+def _tool_list_tables(db: Session, name_contains: str = "") -> str:
+    rows = db.execute(
+        text(
+            "SELECT table_name, column_name, data_type FROM information_schema.columns "
+            "WHERE table_schema = :schema AND (:frag = '' OR table_name ILIKE :like) "
+            "ORDER BY table_name, ordinal_position"
+        ),
+        {"schema": settings.db_schema, "frag": name_contains.strip(), "like": f"%{name_contains.strip()}%"},
+    ).all()
+    tables: dict[str, list[str]] = {}
+    for table, column, data_type in rows:
+        if table.lower() in BLOCKED_TABLES or column.lower() in BLOCKED_COLUMNS:
+            continue
+        tables.setdefault(table, []).append(f"{column} ({data_type})")
+    return _json({"schema": settings.db_schema, "tables": tables})
+
+
+def _check_sql(query: str) -> str:
+    sql = query.strip().rstrip(";").strip()
+    if not sql:
+        raise ValueError("Empty query.")
+    if ";" in sql or "--" in sql or "/*" in sql:
+        raise ValueError("Only one statement without comments is allowed.")
+    if not re.match(r"^(select|with)\b", sql, re.IGNORECASE):
+        raise ValueError("Only SELECT queries are allowed.")
+    if FORBIDDEN_SQL.search(sql):
+        raise ValueError("This statement contains a forbidden keyword; only read-only queries are allowed.")
+    lowered = sql.lower()
+    if any(name in lowered for name in BLOCKED_TABLES) or any(name in lowered for name in BLOCKED_COLUMNS):
+        raise ValueError("This table is not accessible.")
+    if "information_schema" in lowered or "pg_catalog" in lowered or "pg_shadow" in lowered:
+        raise ValueError("Use list_tables to inspect the schema.")
+    return sql
+
+
+def _tool_run_sql(db: Session, query: str) -> str:
+    sql = _check_sql(query)
+    db.execute(text("SET TRANSACTION READ ONLY"))
+    db.execute(text("SET LOCAL statement_timeout = 8000"))
+    rows = db.execute(text(f"SELECT * FROM ({sql}) AS q LIMIT {MAX_ROWS + 1}")).mappings().all()
+    truncated = len(rows) > MAX_ROWS
+    payload = {"row_count": min(len(rows), MAX_ROWS), "truncated": truncated, "rows": [dict(row) for row in rows[:MAX_ROWS]]}
+    result = _json(payload)
+    if len(result) > MAX_RESULT_CHARS:
+        result = result[:MAX_RESULT_CHARS] + '... [truncated: select fewer columns/rows or aggregate]'
+    return result
+
+
+def _run_tool(db: Session, name: str, tool_input: dict[str, Any]) -> tuple[str, bool]:
+    """Returns (content, is_error). Errors go back to the model so it can correct itself."""
+    try:
+        if name == "list_tables":
+            return _tool_list_tables(db, str(tool_input.get("name_contains", ""))), False
+        if name == "run_sql":
+            return _tool_run_sql(db, str(tool_input.get("query", ""))), False
+        return f"Unknown tool {name}.", True
+    except ValueError as exc:
+        return str(exc), True
+    except SQLAlchemyError as exc:
+        db.rollback()
+        return f"Database error: {str(getattr(exc, 'orig', exc))[:300]}", True
+    finally:
+        # Every tool call is its own short read-only transaction.
+        db.rollback()
+
+
+@router.post("/chat")
+def chat(request: ChatRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
+    if not settings.anthropic_api_key:
+        raise HTTPException(status_code=503, detail="Assistant non configuré : définissez ANTHROPIC_API_KEY sur le serveur.")
+
+    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    system = SYSTEM_PROMPT.format(max_rows=MAX_ROWS, mode_rules=MODE_RULES[request.mode])
+    if request.client_code:
+        system += f'\nThe user currently has client file "{request.client_code}" open; questions like "this client" refer to code_client = \'{request.client_code}\'.'
+
+    messages: list[dict[str, Any]] = [{"role": m.role, "content": m.content} for m in request.messages]
+    steps: list[dict[str, Any]] = []
+    max_turns = 14 if request.mode == "agent" else 7
+
+    try:
+        for _ in range(max_turns):
+            response = client.messages.create(
+                model=settings.assistant_model,
+                max_tokens=16000,
+                system=system,
+                tools=TOOLS,
+                output_config={"effort": "high" if request.mode == "agent" else "medium"},
+                messages=messages,
+            )
+
+            if response.stop_reason == "refusal":
+                return {"answer": "Je ne peux pas répondre à cette demande.", "steps": steps}
+
+            if response.stop_reason != "tool_use":
+                answer = "".join(block.text for block in response.content if block.type == "text").strip()
+                if response.stop_reason == "max_tokens":
+                    answer += "\n\n(Réponse tronquée : demandez-moi de continuer.)"
+                return {"answer": answer or "Aucune réponse.", "steps": steps}
+
+            messages.append({"role": "assistant", "content": response.content})
+            results = []
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
+                content, is_error = _run_tool(db, block.name, dict(block.input))
+                steps.append({"tool": block.name, "input": block.input, "error": is_error})
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": content, "is_error": is_error})
+            messages.append({"role": "user", "content": results})
+
+        return {
+            "answer": "J'ai atteint la limite d'étapes avant de finir. Précisez la demande ou découpez-la en plusieurs questions.",
+            "steps": steps,
+        }
+    except anthropic.AuthenticationError as exc:
+        raise HTTPException(status_code=503, detail="Clé API de l'assistant invalide.") from exc
+    except anthropic.RateLimitError as exc:
+        raise HTTPException(status_code=429, detail="Assistant surchargé, réessayez dans un instant.") from exc
+    except anthropic.APIConnectionError as exc:
+        raise HTTPException(status_code=503, detail="Impossible de joindre le service IA.") from exc
+    except anthropic.APIStatusError as exc:
+        raise HTTPException(status_code=502, detail=f"Erreur du service IA ({exc.status_code}).") from exc
