@@ -2,7 +2,7 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from sqlalchemy import MetaData, Table, or_, select
+from sqlalchemy import BigInteger, MetaData, Table, cast, func, or_, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -57,6 +57,19 @@ def list_clients(
         return {"items": [serialize(row) for row in rows], "limit": limit, "offset": offset}
     except SQLAlchemyError as exc:
         raise HTTPException(status_code=503, detail="Erreur lors de la lecture des clients.") from exc
+
+
+@router.get("/next-code")
+def next_client_code(db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Last numeric client code + 1, so a new client can be created with an incremented code."""
+    table = client_table(db)
+    try:
+        last = db.execute(
+            select(func.max(cast(table.c.code_client, BigInteger))).where(table.c.code_client.op("~")("^[0-9]+$"))
+        ).scalar()
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Impossible de calculer le prochain code client.") from exc
+    return {"last_code": last, "next_code": str((last or 0) + 1)}
 
 
 @router.get("/{code_client}")

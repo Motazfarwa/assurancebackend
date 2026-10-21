@@ -274,6 +274,63 @@ def get_branche(
 
     return dict(result)
 
+def _plain(row) -> dict:
+    """Row -> JSON-friendly dict with lower-case keys."""
+    out = {}
+    for key, value in dict(row).items():
+        if hasattr(value, "isoformat"):
+            value = value.isoformat()
+        elif value.__class__.__name__ == "Decimal":
+            value = float(value)
+        out[key.lower()] = value
+    return out
+
+
+@router.get("/detail")
+def get_police_detail(
+    num_police: str | None = Query(default=None, max_length=12),
+    code_client: str | None = Query(default=None, max_length=8),
+):
+    """Full policy (and its latest receipt) by policy number or, failing that, the client's latest policy."""
+    number = (num_police or "").strip()
+    client = (code_client or "").strip()
+    if not number and not client:
+        raise HTTPException(status_code=422, detail="Renseignez un numéro de police ou un code client")
+
+    with engine.connect() as conn:
+        if number:
+            rows = conn.execute(
+                text('SELECT * FROM dbo."TPolice" p WHERE TRIM(p.num_police) = :n ORDER BY p.date_creation DESC NULLS LAST'),
+                {"n": number},
+            ).mappings().all()
+        else:
+            rows = conn.execute(
+                text('SELECT * FROM dbo."TPolice" p WHERE TRIM(p.code_client) = :c ORDER BY p.date_creation DESC NULLS LAST, p.num_police DESC'),
+                {"c": client},
+            ).mappings().all()
+        if not rows:
+            raise HTTPException(status_code=404, detail="Aucune police trouvée")
+
+        police = _plain(rows[0])
+        quittance_rows = conn.execute(
+            text('SELECT * FROM dbo."TQuittance" q WHERE q.num_int = :i ORDER BY q.date_emission DESC NULLS LAST, q.num_quittance'),
+            {"i": police.get("num_int")},
+        ).mappings().all()
+        quittance = quittance_rows[0] if quittance_rows else None
+        branche = conn.execute(
+            text('SELECT nom_branche FROM dbo."TBranche" WHERE code_compagnie = :cc AND code_branche = :cb LIMIT 1'),
+            {"cc": police.get("code_compagnie"), "cb": police.get("code_branche")},
+        ).scalar()
+
+    return {
+        "police": police,
+        "quittance": _plain(quittance) if quittance else None,
+        "quittances": [_plain(row) for row in quittance_rows],
+        "nom_branche": branche,
+        "matches": len(rows),
+    }
+
+
 @router.get("/client/{code_client}")
 def get_client_polices(code_client: str):
     code_client = code_client.strip()
