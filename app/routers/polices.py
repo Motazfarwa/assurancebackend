@@ -7,7 +7,7 @@ from secrets import randbelow
 from dotenv import load_dotenv
 from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from app.police_schemas import PoliceWithQuittanceCreate
 
@@ -218,6 +218,12 @@ def create_police_with_quittance(
         raise HTTPException(
             status_code=409,
             detail="Identifiant ou numéro de police déjà utilisé"
+        ) from exc
+    except SQLAlchemyError as exc:
+        # Return JSON (not a bare 500) so the browser can show the real database error.
+        raise HTTPException(
+            status_code=503,
+            detail=f"Enregistrement impossible : {str(getattr(exc, 'orig', exc))[:300]}"
         ) from exc
 
 @router.get("/compagnies")
