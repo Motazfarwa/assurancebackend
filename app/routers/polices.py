@@ -23,6 +23,19 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 
+GARANTIES_DDL = """
+    CREATE TABLE IF NOT EXISTS dbo."TPoliceGarantie" (
+        num_int character varying(20) PRIMARY KEY,
+        vol numeric(14, 3),
+        incendie numeric(14, 3),
+        bdg numeric(14, 3),
+        personnes_transportees numeric(14, 3),
+        ind_conducteur numeric(14, 3),
+        remarquage numeric(14, 3)
+    )
+"""
+
+
 def flag(value):
     if value is None:
         return None
@@ -151,6 +164,19 @@ def create_police_with_quittance(
                     "prime_total": q.prime_total,
                 }
             )
+
+            garanties = payload.garanties.model_dump() if payload.garanties else {}
+            if any(value is not None for value in garanties.values()):
+                conn.execute(text(GARANTIES_DDL))
+                conn.execute(
+                    text("""
+                        INSERT INTO dbo."TPoliceGarantie"
+                            (num_int, vol, incendie, bdg, personnes_transportees, ind_conducteur, remarquage)
+                        VALUES
+                            (:num_int, :vol, :incendie, :bdg, :personnes_transportees, :ind_conducteur, :remarquage)
+                    """),
+                    {"num_int": internal_id, **garanties},
+                )
 
             conn.execute(
                 text("""
@@ -333,7 +359,17 @@ def get_police_detail(
             {"c": str(police.get("code_client") or "").strip()},
         ).scalar()
 
+        try:
+            garanties_row = conn.execute(
+                text('SELECT vol, incendie, bdg, personnes_transportees, ind_conducteur, remarquage FROM dbo."TPoliceGarantie" WHERE num_int = :i'),
+                {"i": police.get("num_int")},
+            ).mappings().first()
+        except SQLAlchemyError:
+            conn.rollback()  # table not created yet: no guarantees saved so far
+            garanties_row = None
+
     return {
+        "garanties": _plain(garanties_row) if garanties_row else None,
         "nom_client": nom_client,
         "police": police,
         "quittance": _plain(quittance) if quittance else None,

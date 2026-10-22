@@ -67,6 +67,18 @@ class QuittanceCreate(BaseModel):
     type_quittance: Optional[str] = None
 
 
+class GarantiesCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    vol: Optional[float] = None
+    incendie: Optional[float] = None
+    bdg: Optional[float] = None
+    personnes_transportees: Optional[float] = None
+    ind_conducteur: Optional[float] = None
+    remarquage: Optional[float] = None
+
+
 class PoliceWithQuittanceCreate(BaseModel):
     police: PoliceCreate
     quittance: QuittanceCreate
+    garanties: Optional[GarantiesCreate] = None
