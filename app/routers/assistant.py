@@ -160,15 +160,110 @@ def _run_tool(db: Session, name: str, tool_input: dict[str, Any]) -> tuple[str, 
         db.rollback()
 
 
+GEMINI_TOOLS = [{
+    "function_declarations": [
+        {
+            "name": "list_tables",
+            "description": TOOLS[0]["description"],
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {"name_contains": {"type": "STRING", "description": "Optional fragment of a table name, e.g. 'Quittance'."}},
+            },
+        },
+        {
+            "name": "run_sql",
+            "description": TOOLS[1]["description"],
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {"query": {"type": "STRING", "description": "One SELECT statement, no trailing semicolon."}},
+                "required": ["query"],
+            },
+        },
+    ]
+}]
+
+
+def _gemini_generate(body: dict[str, Any]) -> dict[str, Any]:
+    """One Gemini call (Google AI Studio key, free tier). Errors become readable HTTP errors."""
+    key = settings.gemini_api_key or ""
+    # "AIza..." keys use the Generative Language API; "AQ." keys are Vertex AI express keys.
+    base = "https://aiplatform.googleapis.com/v1/publishers/google" if key.startswith("AQ.") else "https://generativelanguage.googleapis.com/v1beta"
+    try:
+        reply = httpx.post(f"{base}/models/{settings.gemini_model}:generateContent", headers={"x-goog-api-key": key}, json=body, timeout=90)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=503, detail="Impossible de joindre le service IA.") from exc
+    if reply.status_code >= 400:
+        try:
+            reason = str(reply.json().get("error", {}).get("message", ""))[:200]
+        except ValueError:
+            reason = ""
+        if reply.status_code == 429:
+            raise HTTPException(status_code=429, detail="Quota gratuit atteint, réessayez dans une minute.")
+        raise HTTPException(status_code=503 if reply.status_code in (400, 401, 403, 404) else 502, detail=f"Service IA ({reply.status_code}) : {reason or 'erreur'}")
+    try:
+        return reply.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="Réponse illisible du service IA.") from exc
+
+
+def _chat_gemini(request: ChatRequest, db: Session, system: str) -> dict[str, Any]:
+    contents: list[dict[str, Any]] = [
+        {"role": "user" if m.role == "user" else "model", "parts": [{"text": m.content}]} for m in request.messages
+    ]
+    steps: list[dict[str, Any]] = []
+    max_turns = 14 if request.mode == "agent" else 7
+
+    for _ in range(max_turns):
+        data = _gemini_generate({
+            "system_instruction": {"parts": [{"text": system}]},
+            "contents": contents,
+            "tools": GEMINI_TOOLS,
+            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8000},
+        })
+        candidate = (data.get("candidates") or [{}])[0]
+        parts = (candidate.get("content") or {}).get("parts") or []
+        calls = [part["functionCall"] for part in parts if "functionCall" in part]
+
+        if not calls:
+            answer = "".join(part.get("text", "") for part in parts if not part.get("thought")).strip()
+            if not answer and (data.get("promptFeedback") or {}).get("blockReason"):
+                return {"answer": "Je ne peux pas répondre à cette demande.", "steps": steps}
+            if candidate.get("finishReason") == "MAX_TOKENS":
+                answer += "\n\n(Réponse tronquée : demandez-moi de continuer.)"
+            return {"answer": answer or "Aucune réponse.", "steps": steps}
+
+        # The model turn goes back unchanged (it may carry thought signatures), followed by the tool results.
+        contents.append({"role": "model", "parts": parts})
+        results = []
+        for call in calls:
+            name = str(call.get("name", ""))
+            args = dict(call.get("args") or {})
+            content, is_error = _run_tool(db, name, args)
+            steps.append({"tool": name, "input": args, "error": is_error})
+            results.append({"functionResponse": {"name": name, "response": {"error" if is_error else "result": content}}})
+        contents.append({"role": "user", "parts": results})
+
+    return {
+        "answer": "J'ai atteint la limite d'étapes avant de finir. Précisez la demande ou découpez-la en plusieurs questions.",
+        "steps": steps,
+    }
+
+
 @router.post("/chat")
 def chat(request: ChatRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
-    if not settings.anthropic_api_key:
-        raise HTTPException(status_code=503, detail="Assistant non configuré : définissez ANTHROPIC_API_KEY sur le serveur.")
-
-    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
     system = SYSTEM_PROMPT.format(max_rows=MAX_ROWS, mode_rules=MODE_RULES[request.mode])
     if request.client_code:
         system += f'\nThe user currently has client file "{request.client_code}" open; questions like "this client" refer to code_client = \'{request.client_code}\'.'
+
+    if not settings.anthropic_api_key:
+        if settings.gemini_api_key:
+            return _chat_gemini(request, db, system)
+        raise HTTPException(
+            status_code=503,
+            detail="Assistant non configuré : définissez GEMINI_API_KEY (gratuit, Google AI Studio) ou ANTHROPIC_API_KEY sur le serveur.",
+        )
+
+    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
 
     messages: list[dict[str, Any]] = [{"role": m.role, "content": m.content} for m in request.messages]
     steps: list[dict[str, Any]] = []

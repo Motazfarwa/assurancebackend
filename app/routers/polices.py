@@ -468,6 +468,7 @@ def search_polices(
     num_imat: str | None = Query(default=None, max_length=12),
     effet_du: date | None = None,
     effet_au: date | None = None,
+    statut: str | None = Query(default=None, pattern="^(tous|vigueur|susp|expirees)$"),
 ):
     conditions = []
     params: dict = {}
@@ -522,11 +523,24 @@ def search_polices(
             detail="Renseignez au moins un critère de recherche"
         )
 
+    # Status as in the legacy "Liste des polices": AN = in force, SS / RE / RV = suspended or terminated.
+    if statut == "vigueur":
+        conditions.append("UPPER(TRIM(p.etat)) = 'AN' AND (p.expiration IS NULL OR p.expiration >= CURRENT_DATE)")
+    elif statut == "expirees":
+        conditions.append("UPPER(TRIM(p.etat)) = 'AN' AND p.expiration < CURRENT_DATE")
+    elif statut == "susp":
+        conditions.append("UPPER(TRIM(p.etat)) IN ('SS', 'RE', 'RV')")
+
     with engine.connect() as conn:
         rows = conn.execute(
             text(f"""
                 SELECT
                     p.num_int,
+                    p.echeance,
+                    p.commission,
+                    p.prime_total,
+                    p.obser AS observation,
+                    p.risque,
                     p.num_police,
                     p.code_client,
                     p.code_compagnie,
