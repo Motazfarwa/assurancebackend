@@ -312,6 +312,46 @@ def _extract_fiche_gemini(request: FicheRequest) -> dict[str, Any]:
     return {"fields": {key: (data.get(key) or None) for key in FICHE_FIELDS}}
 
 
+def _ocr_space(image_base64: str, media_type: str, language: str, engine: int) -> str:
+    response = httpx.post(
+        "https://api.ocr.space/parse/image",
+        headers={"apikey": settings.ocr_space_api_key},
+        data={
+            "base64Image": f"data:{media_type};base64,{image_base64}",
+            "language": language,
+            "OCREngine": str(engine),
+            "scale": "true",
+            "detectOrientation": "true",
+            "isTable": "true",
+        },
+        timeout=90,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("IsErroredOnProcessing"):
+        message = payload.get("ErrorMessage")
+        raise ValueError(" ".join(message) if isinstance(message, list) else str(message or "erreur"))
+    return "\n".join(item.get("ParsedText", "") for item in payload.get("ParsedResults") or [])
+
+
+@router.post("/ocr-text")
+def ocr_text(request: FicheRequest) -> dict[str, Any]:
+    """Free OCR (OCR.space, no Google account): French and Arabic readings returned as raw text."""
+    texts: list[str] = []
+    problems: list[str] = []
+    for language, engine in (("fre", 2), ("ara", 1)):
+        try:
+            text_value = _ocr_space(request.image_base64, request.media_type, language, engine).strip()
+        except (httpx.HTTPError, ValueError) as exc:
+            problems.append(f"{language}: {str(exc)[:150]}")
+            continue
+        if text_value:
+            texts.append(text_value)
+    if not texts:
+        raise HTTPException(status_code=503, detail=f"Service OCR indisponible ({'; '.join(problems) or 'aucun texte lu'}).")
+    return {"texts": texts}
+
+
 @router.post("/extract-fiche")
 def extract_fiche(request: FicheRequest) -> dict[str, Any]:
     if not settings.anthropic_api_key:

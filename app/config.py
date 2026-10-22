@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     # Free alternative for reading scanned files only (Google AI Studio key); GEMINI_MODEL can be changed if Google renames it.
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-2.5-flash"
+    # Free OCR (https://ocr.space/ocrapi/freekey): "helloworld" is a shared test key, set OCR_SPACE_API_KEY for your own.
+    ocr_space_api_key: str = "helloworld"
     assistant_model: str = "claude-opus-5-5"
     # Predefined administrator, authenticated without the user table (override with ADMIN_PASSWORD).
     admin_username: str = "admin"
