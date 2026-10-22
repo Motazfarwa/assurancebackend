@@ -517,7 +517,7 @@ def search_polices(
         conditions.append("p.effet < :effet_au_next")
         params["effet_au_next"] = effet_au + timedelta(days=1)
 
-    if not conditions:
+    if not conditions and not statut:
         raise HTTPException(
             status_code=422,
             detail="Renseignez au moins un critère de recherche"
@@ -530,6 +530,8 @@ def search_polices(
         conditions.append("UPPER(TRIM(p.etat)) = 'AN' AND p.expiration < CURRENT_DATE")
     elif statut == "susp":
         conditions.append("UPPER(TRIM(p.etat)) IN ('SS', 'RE', 'RV')")
+
+    where_sql = " AND ".join("(" + condition + ")" for condition in conditions) or "TRUE"
 
     with engine.connect() as conn:
         rows = conn.execute(
@@ -559,7 +561,7 @@ def search_polices(
                       AND tb.code_branche = p.code_branche
                     LIMIT 1
                 ) b ON TRUE
-                WHERE {" AND ".join(conditions)}
+                WHERE {where_sql}
                 ORDER BY p.effet DESC NULLS LAST, p.num_police
                 LIMIT 100
             """),
