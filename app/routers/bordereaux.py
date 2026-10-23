@@ -51,6 +51,13 @@ DDL = (
     )
     """,
     'CREATE INDEX IF NOT EXISTS ix_bordereau_ligne_bordereau ON dbo."TBordereauLigne" (id_bordereau)',
+    # Fusion status of the bordereau (set by the "Fusion bordereau" module).
+    """
+    ALTER TABLE dbo."TBordereauCie"
+        ADD COLUMN IF NOT EXISTS fusionne character varying(1) NOT NULL DEFAULT 'N',
+        ADD COLUMN IF NOT EXISTS date_fusion timestamp,
+        ADD COLUMN IF NOT EXISTS fusion_par character varying(60)
+    """,
 )
 _tables_ready = False
 
@@ -378,6 +385,7 @@ def confrontation(
         "total_commission": sum(float(row["commission"] or 0) for row in results),
         "total_prime_total": sum(float(row["prime_total"] or 0) for row in results),
         "fusion": counts["ecart"] == 0 and counts["inconnue"] == 0 and not not_received,
+        "fusionne": header["fusionne"] == "O",
     }
     return {
         "bordereau": _plain(header),
@@ -407,4 +415,53 @@ def get_bordereau(bordereau_id: int, db: Session = Depends(get_db)) -> dict[str,
 def delete_bordereau(bordereau_id: int, db: Session = Depends(get_db)) -> None:
     _ensure_tables(db)
     db.execute(text('DELETE FROM dbo."TBordereauCie" WHERE id_bordereau = :i'), {"i": bordereau_id})
+    db.commit()
+
+
+class FusionIn(BaseModel):
+    # Merge even though the confrontation found differences (the user confirmed them).
+    forcer: bool = False
+
+
+@router.post("/{bordereau_id}/fusion")
+def fuse_bordereau(
+    bordereau_id: int,
+    payload: FusionIn,
+    user: dict[str, Any] = Depends(require_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Marks a bordereau as merged ("fusionné") once it has been confronted with the agency data."""
+    _ensure_tables(db)
+    header = db.execute(
+        text('SELECT code_compagnie, tc, periode, fusionne FROM dbo."TBordereauCie" WHERE id_bordereau = :i'), {"i": bordereau_id}
+    ).mappings().first()
+    if not header:
+        raise HTTPException(status_code=404, detail="Bordereau introuvable.")
+    if header["fusionne"] == "O":
+        raise HTTPException(status_code=409, detail="Ce bordereau est déjà fusionné.")
+    result = confrontation(code_compagnie=header["code_compagnie"], tc=header["tc"], periode=header["periode"], db=db)
+    summary = result["resume"]
+    if not summary["fusion"] and not payload.forcer:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{summary['nb_ecarts']} écart(s), {summary['nb_inconnues']} police(s) inconnue(s), "
+                f"{summary['nb_non_parvenus']} terme(s) non parvenu(s) : consultez la confrontation ou confirmez la fusion."
+            ),
+        )
+    db.execute(
+        text("""UPDATE dbo."TBordereauCie" SET fusionne = 'O', date_fusion = now(), fusion_par = :u WHERE id_bordereau = :i"""),
+        {"i": bordereau_id, "u": str(user.get("sub", ""))[:60]},
+    )
+    db.commit()
+    return {**summary, "fusionne": True}
+
+
+@router.delete("/{bordereau_id}/fusion", status_code=204)
+def cancel_fusion(bordereau_id: int, db: Session = Depends(get_db)) -> None:
+    _ensure_tables(db)
+    db.execute(
+        text("""UPDATE dbo."TBordereauCie" SET fusionne = 'N', date_fusion = NULL, fusion_par = NULL WHERE id_bordereau = :i"""),
+        {"i": bordereau_id},
+    )
     db.commit()

@@ -29,3 +29,9 @@ CREATE TABLE IF NOT EXISTS dbo."TBordereauLigne" (
 );
 
 CREATE INDEX IF NOT EXISTS ix_bordereau_ligne_bordereau ON dbo."TBordereauLigne" (id_bordereau);
+
+-- Fusion status (set by the "Fusion bordereau" module)
+ALTER TABLE dbo."TBordereauCie"
+    ADD COLUMN IF NOT EXISTS fusionne character varying(1) NOT NULL DEFAULT 'N',
+    ADD COLUMN IF NOT EXISTS date_fusion timestamp,
+    ADD COLUMN IF NOT EXISTS fusion_par character varying(60);
