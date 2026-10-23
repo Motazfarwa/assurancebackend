@@ -38,8 +38,12 @@ class PoliceUpdate(BaseModel):
 class QuittanceUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    date_saisie: datetime | None = None
     date_emission: datetime | None = None
     echeance: datetime | None = None
+    tc: str | None = None
+    date_reglement: datetime | None = None
+    date_m: datetime | None = None
     periode: str | None = None
     prime_net: float | None = None
     prime_total: float | None = None
@@ -53,7 +57,7 @@ class QuittanceUpdate(BaseModel):
 
 
 # API field -> actual column name where the column is mixed-case.
-QUITTANCE_COLUMNS = {"periode": "Periode", "taxe": "Taxe"}
+QUITTANCE_COLUMNS = {"periode": "Periode", "taxe": "Taxe", "date_reglement": "Date_Reglement", "date_m": "Date_M"}
 
 
 def _update_row(db: Session, table_name: str, key_column: str, key_value: str, values: dict[str, Any], column_names: dict[str, str] | None = None) -> None:
