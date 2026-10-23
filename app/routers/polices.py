@@ -65,39 +65,57 @@ def create_police_with_quittance(
 
     try:
         with engine.begin() as conn:
-            internal_id = (
-                "P" + str(conn.execute(
-                    text("SELECT nextval('dbo.police_internal_seq')")
-                ).scalar_one()).zfill(14)
-            )
-
-            receipt_id = (
-                "Q" + str(conn.execute(
-                    text("SELECT nextval('dbo.quittance_internal_seq')")
-                ).scalar_one()).zfill(14)
-            )
+            # This database has no numbering sequences: numbers are derived from the existing data, under a
+            # transaction lock so two simultaneous entries cannot take the same number.
+            conn.execute(text("SELECT pg_advisory_xact_lock(hashtext('dbo.numbering'))"))
 
             if p.num_police:
                 policy_number = p.num_police
             else:
-                seq = conn.execute(
-                    text("SELECT nextval('dbo.police_number_seq')")
+                prefix = f"{datetime.now().year}{p.code_branche}"
+                last_policy = conn.execute(
+                    text(
+                        'SELECT COALESCE(MAX(CAST(SUBSTRING(TRIM(num_police) FROM 8 FOR 5) AS integer)), 0) '
+                        'FROM dbo."TPolice" WHERE TRIM(num_police) ~ :pattern'
+                    ),
+                    {"pattern": f"^{prefix}[0-9]{{5}}$"},
                 ).scalar_one()
 
-                if seq > 99999:
+                if last_policy >= 99999:
                     raise HTTPException(
                         status_code=409,
                         detail="Séquence des polices épuisée"
                     )
 
-                year = datetime.now().year
-                policy_number = (
-                    f"{year}{p.code_branche}{seq:05d}"
-                )
+                policy_number = f"{prefix}{last_policy + 1:05d}"
 
             validate_policy_number(
                 policy_number, p.code_branche
             )
+
+            already_used = conn.execute(
+                text('SELECT 1 FROM dbo."TPolice" WHERE TRIM(num_police) = :n OR TRIM(num_int) = :n LIMIT 1'),
+                {"n": policy_number},
+            ).first()
+            if already_used:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Ce numéro de police existe déjà."
+                )
+
+            # In this database the internal id of a policy is its policy number (column limited to 15 characters).
+            internal_id = policy_number
+
+            # Receipt number: today's date (YYYYMMDD) + a 6-digit counter that continues the day's last number.
+            day_prefix = f"{datetime.now():%Y%m%d}"
+            last_receipt = conn.execute(
+                text(
+                    'SELECT COALESCE(MAX(CAST(RIGHT(TRIM(num_quittance), 6) AS integer)), 0) '
+                    'FROM dbo."TQuittance" WHERE TRIM(num_quittance) ~ :pattern'
+                ),
+                {"pattern": f"^{day_prefix}[0-9]{{6}}$"},
+            ).scalar_one()
+            receipt_id = f"{day_prefix}{last_receipt + 1:06d}"
 
             conn.execute(
                 text("""
