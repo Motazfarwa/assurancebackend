@@ -232,7 +232,7 @@ def confrontation(
     ).mappings().all()]
 
     policy_select = (
-        'SELECT p.num_int, TRIM(p.num_police) AS num_police, TRIM(p.code_client) AS code_client, c.nom_client, '
+        'SELECT TRIM(p.num_int) AS num_int, TRIM(p.num_police) AS num_police, TRIM(p.code_client) AS code_client, c.nom_client, '
         'TRIM(p.echeance) AS echeance, p."Unite" AS unite, p.duree, UPPER(TRIM(p.etat)) AS etat, TRIM(p.code_branche) AS code_branche, '
         "p.code_compagnie, p.effet, p.expiration "
         'FROM dbo."TPolice" p LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(p.code_client) '
@@ -245,7 +245,7 @@ def confrontation(
                 policy_select
                 + "WHERE p.code_compagnie = :c AND UPPER(TRIM(p.etat)) = 'AN' AND split_part(TRIM(p.echeance), '/', 2) = :mm "
                 "AND p.effet < :next_first AND (p.expiration IS NULL OR p.expiration >= :first_day) "
-                "ORDER BY TRIM(p.num_police)"
+                "ORDER BY TRIM(p.num_int)"
             ),
             {"c": code_compagnie, "mm": f"{month:02d}", "next_first": next_first, "first_day": first_day},
         ).mappings().all()
@@ -254,20 +254,21 @@ def confrontation(
             text(
                 policy_select
                 + 'WHERE p.code_compagnie = :c AND EXISTS (SELECT 1 FROM dbo."TQuittance" q WHERE TRIM(q.num_int) = TRIM(p.num_int) '
-                "AND q.tc = 'C' AND q.date_emission >= :first_day AND q.date_emission < :next_first) ORDER BY TRIM(p.num_police)"
+                "AND q.tc = 'C' AND q.date_emission >= :first_day AND q.date_emission < :next_first) ORDER BY TRIM(p.num_int)"
             ),
             {"c": code_compagnie, "next_first": next_first, "first_day": first_day},
         ).mappings().all()
-    expected_numbers = {row["num_police"] for row in expected}
+    # Everything is matched on the internal number (num_int), which is what the insurers' files carry.
+    expected_numbers = {row["num_int"] for row in expected}
 
     # The policies named by the bordereau (whatever their company), in chunks to keep the IN list small.
     numbers = sorted({_clean_number(line["num_police"]) for line in lines})
     found: dict[str, Any] = {}
     for start in range(0, len(numbers), 1000):
         chunk = numbers[start:start + 1000]
-        statement = text(policy_select + "WHERE TRIM(p.num_police) IN :numbers").bindparams(bindparam("numbers", expanding=True))
+        statement = text(policy_select + "WHERE TRIM(p.num_int) IN :numbers").bindparams(bindparam("numbers", expanding=True))
         for row in db.execute(statement, {"numbers": chunk}).mappings().all():
-            found.setdefault(row["num_police"], row)
+            found.setdefault(row["num_int"], row)
 
     # Receipts the agency already holds for these policies, to compare amounts.
     quittance_numbers = sorted({_clean_number(line["num_quittance"]) for line in lines if line["num_quittance"]})
@@ -350,7 +351,7 @@ def confrontation(
         }))
 
     received = set(numbers)
-    not_received = [_plain({**row, "observation": "Terme non parvenu"}) for row in expected if row["num_police"] not in received]
+    not_received = [_plain({**row, "observation": "Terme non parvenu"}) for row in expected if row["num_int"] not in received]
 
     # Totals per branch code: bordereau side and what the agency expected.
     branches: dict[str, dict[str, Any]] = {}
