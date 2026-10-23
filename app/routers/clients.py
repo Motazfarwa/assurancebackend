@@ -99,7 +99,7 @@ def create_client(client: ClientInput, db: Session = Depends(get_db)) -> dict[st
     except SQLAlchemyError as exc:
         db.rollback()
         logger.exception("Client insert failed for code_client=%s", client.code_client)
-        raise HTTPException(status_code=503, detail="Erreur lors de l'enregistrement du client.") from exc
+        raise HTTPException(status_code=503, detail=f"Erreur lors de l'enregistrement du client : {str(getattr(exc, 'orig', exc))[:250]}") from exc
 
 
 @router.put("/{code_client}")
@@ -121,7 +121,8 @@ def update_client(code_client: str, client: ClientInput, db: Session = Depends(g
         return serialize(row)
     except SQLAlchemyError as exc:
         db.rollback()
-        raise HTTPException(status_code=503, detail="Erreur lors de la modification du client.") from exc
+        logger.exception("Client update failed for code_client=%s", code_client)
+        raise HTTPException(status_code=503, detail=f"Erreur lors de la modification du client : {str(getattr(exc, 'orig', exc))[:250]}") from exc
 
 
 @router.delete("/{code_client}", status_code=204)
