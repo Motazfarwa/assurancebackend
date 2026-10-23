@@ -19,6 +19,7 @@ from app.routers.impayes import router as impayes_router
 from app.routers.record_updates import router as record_updates_router
 from app.routers import polices
 from app.routers.assistant import router as assistant_router
+from app.routers.bordereaux import router as bordereaux_router
 
 app = FastAPI(title="Assurance API", version="0.1.0")
 app.add_middleware(
@@ -42,6 +43,7 @@ app.include_router(documents_router)
 app.include_router(impayes_router)
 app.include_router(polices.router)
 app.include_router(assistant_router)
+app.include_router(bordereaux_router)
 app.include_router(record_updates_router)
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 
