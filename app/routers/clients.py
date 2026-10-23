@@ -2,7 +2,7 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from sqlalchemy import BigInteger, MetaData, Table, cast, func, or_, select
+from sqlalchemy import BigInteger, MetaData, Table, cast, func, or_, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -15,6 +15,29 @@ from app.schemas import ClientInput
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/clients", tags=["Clients"], dependencies=[Depends(require_current_user)])
+
+
+_contact_columns_ready = False
+
+
+def ensure_contact_columns(db: Session) -> None:
+    """Adds the phone / email columns of the client form when the database does not have them yet (migration 002)."""
+    global _contact_columns_ready
+    if _contact_columns_ready:
+        return
+    table = f'"{settings.db_schema}"."{settings.db_client_table}"'
+    try:
+        db.execute(text(
+            f"ALTER TABLE {table} "
+            "ADD COLUMN IF NOT EXISTS telephones_domicile jsonb, ADD COLUMN IF NOT EXISTS emails_domicile jsonb, "
+            "ADD COLUMN IF NOT EXISTS telephones_bureau jsonb, ADD COLUMN IF NOT EXISTS emails_bureau jsonb"
+        ))
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        logger.warning("Could not add the client contact columns; run migrations/002_client_contact_details.sql", exc_info=True)
+        return
+    _contact_columns_ready = True
 
 
 def client_table(db: Session) -> Table:
@@ -83,6 +106,7 @@ def get_client(code_client: str, db: Session = Depends(get_db)) -> dict[str, Any
 
 @router.post("", status_code=201)
 def create_client(client: ClientInput, db: Session = Depends(get_db)) -> dict[str, Any]:
+    ensure_contact_columns(db)
     table = client_table(db)
     values = complete_client_name(client.model_dump())
     unknown = set(values) - set(table.c.keys())
@@ -104,6 +128,7 @@ def create_client(client: ClientInput, db: Session = Depends(get_db)) -> dict[st
 
 @router.put("/{code_client}")
 def update_client(code_client: str, client: ClientInput, db: Session = Depends(get_db)) -> dict[str, Any]:
+    ensure_contact_columns(db)
     table = client_table(db)
     if client.code_client != code_client:
         raise HTTPException(status_code=422, detail="Le code client ne peut pas être changé pendant la modification.")
