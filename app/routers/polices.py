@@ -469,6 +469,8 @@ def search_polices(
     effet_du: date | None = None,
     effet_au: date | None = None,
     statut: str | None = Query(default=None, pattern="^(tous|vigueur|susp|expirees)$"),
+    page: int | None = Query(default=None, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200),
 ):
     conditions = []
     params: dict = {}
@@ -532,6 +534,8 @@ def search_polices(
         conditions.append("UPPER(TRIM(p.etat)) IN ('SS', 'RE', 'RV')")
 
     where_sql = " AND ".join("(" + condition + ")" for condition in conditions) or "TRUE"
+    # Without `page` the answer is the plain list (max 100); with it, a page of results plus the total.
+    limit_sql = "LIMIT 100" if page is None else f"LIMIT {int(page_size)} OFFSET {(int(page) - 1) * int(page_size)}"
 
     with engine.connect() as conn:
         rows = conn.execute(
@@ -562,10 +566,18 @@ def search_polices(
                     LIMIT 1
                 ) b ON TRUE
                 WHERE {where_sql}
-                ORDER BY p.effet DESC NULLS LAST, p.num_police
-                LIMIT 100
+                ORDER BY p.effet DESC NULLS LAST, p.num_police, p.num_int
+                {limit_sql}
             """),
             params
         ).mappings().all()
 
-    return [dict(row) for row in rows]
+        if page is None:
+            return [dict(row) for row in rows]
+
+        total = conn.execute(
+            text(f'SELECT COUNT(*) FROM dbo."TPolice" p WHERE {where_sql}'),
+            params
+        ).scalar_one()
+
+    return {"items": [dict(row) for row in rows], "total": total, "page": page, "page_size": page_size}
