@@ -1,4 +1,5 @@
 """Search of policies and receipts across clients (filters of the "Polices du client" / "Quittances de la police" windows)."""
+from datetime import date, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
@@ -55,11 +56,20 @@ def search_receipts(
     nom_client: str | None = Query(default=None, max_length=60),
     code_branche: str | None = Query(default=None, max_length=3),
     num_int: str | None = Query(default=None, max_length=15),
+    num_quittance: str | None = Query(default=None, max_length=15),
+    date_saisie: date | None = None,
     limit: int = Query(default=200, ge=1, le=500),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     conditions = ["TRUE"]
     params: dict[str, Any] = {"limit": limit}
+    if date_saisie:
+        conditions.append("q.date_saisie >= :date_saisie AND q.date_saisie < :date_saisie_next")
+        params["date_saisie"] = date_saisie
+        params["date_saisie_next"] = date_saisie + timedelta(days=1)
+    if num_quittance and num_quittance.strip():
+        conditions.append("TRIM(q.num_quittance) ILIKE :num_quittance")
+        params["num_quittance"] = _like(num_quittance)
     if num_int and num_int.strip():
         conditions.append("TRIM(q.num_int) = :num_int")
         params["num_int"] = num_int.strip()
