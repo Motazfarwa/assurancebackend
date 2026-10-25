@@ -1,5 +1,5 @@
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional
 from pydantic import BaseModel, Field, ConfigDict
 
@@ -80,7 +80,15 @@ class GarantiesCreate(BaseModel):
     remarquage: Optional[float] = None
 
 
+class CarteVerteCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    du: Optional[date] = None
+    au: Optional[date] = None
+
+
 class PoliceWithQuittanceCreate(BaseModel):
     police: PoliceCreate
     quittance: QuittanceCreate
     garanties: Optional[GarantiesCreate] = None
+    carte_verte: Optional[CarteVerteCreate] = None

@@ -36,6 +36,15 @@ GARANTIES_DDL = """
 """
 
 
+CARTE_VERTE_DDL = """
+    CREATE TABLE IF NOT EXISTS dbo."TQuittanceCarteVerte" (
+        num_quittance character varying(15) PRIMARY KEY,
+        date_debut date,
+        date_fin date
+    )
+"""
+
+
 def flag(value):
     if value is None:
         return None
@@ -252,6 +261,17 @@ def create_police_with_quittance(
                     "type_quittance": q.type_quittance,
                 }
             )
+
+            # Green card validity ("Carte verte"): from / to dates, kept with the receipt.
+            if payload.carte_verte and (payload.carte_verte.du or payload.carte_verte.au):
+                conn.execute(text(CARTE_VERTE_DDL))
+                conn.execute(
+                    text(
+                        'INSERT INTO dbo."TQuittanceCarteVerte" (num_quittance, date_debut, date_fin) '
+                        "VALUES (:num_quittance, :du, :au)"
+                    ),
+                    {"num_quittance": receipt_id, "du": payload.carte_verte.du, "au": payload.carte_verte.au},
+                )
 
         return {
             "message": "Police et quittance créées",
