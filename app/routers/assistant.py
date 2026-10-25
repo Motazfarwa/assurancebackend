@@ -363,7 +363,7 @@ FICHE_PROMPT = (
 
 class FicheRequest(BaseModel):
     image_base64: str = Field(min_length=100, max_length=9_000_000)
-    media_type: Literal["image/jpeg", "image/png", "image/webp", "image/gif"] = "image/jpeg"
+    media_type: Literal["image/jpeg", "image/png", "image/webp", "image/gif", "application/pdf"] = "image/jpeg"
 
 
 def _extract_fiche_gemini(request: FicheRequest) -> dict[str, Any]:
@@ -418,6 +418,7 @@ def _ocr_space(image_base64: str, media_type: str, language: str, engine: int) -
             "scale": "true",
             "detectOrientation": "true",
             "isTable": "true",
+            **({"filetype": "PDF"} if media_type == "application/pdf" else {}),
         },
         timeout=90,
     )
@@ -466,7 +467,10 @@ def extract_fiche(request: FicheRequest) -> dict[str, Any]:
             messages=[{
                 "role": "user",
                 "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": request.media_type, "data": request.image_base64}},
+                    {
+                        "type": "document" if request.media_type == "application/pdf" else "image",
+                        "source": {"type": "base64", "media_type": request.media_type, "data": request.image_base64},
+                    },
                     {"type": "text", "text": FICHE_PROMPT},
                 ],
             }],

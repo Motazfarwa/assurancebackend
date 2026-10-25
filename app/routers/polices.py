@@ -129,7 +129,7 @@ def create_police_with_quittance(
                         "TousRisque", "HorsTaxe",
                         risque, num_imat, marque,
                         "Serie", "Puissance", "Circulation",
-                        "Garantie", "Franchise", capital,
+                        "Garantie", "Franchise", capital, neuf, venale,
                         obser, prime_net, commission,
                         prime_total
                     )
@@ -143,7 +143,7 @@ def create_police_with_quittance(
                         :tous_risque, :hors_taxe,
                         :risque, :num_imat, :marque,
                         :serie, :puissance, :circulation,
-                        :garantie, :franchise, :capital,
+                        :garantie, :franchise, :capital, :neuf, :venale,
                         :obser, :prime_net, :commission,
                         :prime_total
                     )
@@ -176,6 +176,8 @@ def create_police_with_quittance(
                     "garantie": p.garantie,
                     "franchise": p.franchise,
                     "capital": p.capital,
+                    "neuf": p.neuf,
+                    "venale": p.venale,
                     "obser": p.obser,
                     "prime_net": q.prime_net,
                     "commission": q.commission,

@@ -38,6 +38,8 @@ class PoliceCreate(BaseModel):
     garantie: Optional[str] = None
     franchise: Optional[int] = None
     capital: Optional[float] = None
+    neuf: Optional[float] = None
+    venale: Optional[float] = None
     obser: Optional[str] = None
 
 
