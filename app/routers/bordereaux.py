@@ -144,6 +144,31 @@ def _line_params(line: LigneIn, number: int) -> dict[str, Any]:
     }
 
 
+def _clients_by_policy(db: Session, numbers: list[str]) -> dict[str, dict[str, Any]]:
+    """Internal policy numbers (num_int) -> client code and name of the policy, for the numbers known to the agency."""
+    clients: dict[str, dict[str, Any]] = {}
+    unique = sorted({_clean_number(number) for number in numbers if _clean_number(number)})
+    for start in range(0, len(unique), 1000):
+        statement = text(
+            'SELECT TRIM(p.num_int) AS num_int, TRIM(p.code_client) AS code_client, TRIM(c.nom_client) AS nom_client '
+            'FROM dbo."TPolice" p LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(p.code_client) '
+            "WHERE TRIM(p.num_int) IN :numbers"
+        ).bindparams(bindparam("numbers", expanding=True))
+        for row in db.execute(statement, {"numbers": unique[start:start + 1000]}).mappings().all():
+            clients.setdefault(row["num_int"], {"code_client": row["code_client"], "nom_client": row["nom_client"]})
+    return clients
+
+
+class NumerosIn(BaseModel):
+    numeros: list[str] = Field(min_length=1, max_length=20000)
+
+
+@router.post("/clients")
+def bordereau_clients(payload: NumerosIn, db: Session = Depends(get_db)) -> dict[str, dict[str, Any]]:
+    """Client (code and name) of each policy named by a bordereau, before it is stored."""
+    return _clients_by_policy(db, payload.numeros)
+
+
 INSERT_LINE = (
     'INSERT INTO dbo."TBordereauLigne" (id_bordereau, ligne, num_police, code_client, nom_client, echeance, num_quittance, prime_net, commission, prime_total) '
     "VALUES (:id_bordereau, :ligne, :num_police, :code_client, :nom_client, :echeance, :num_quittance, :prime_net, :commission, :prime_total)"
@@ -170,6 +195,13 @@ def save_bordereau(payload: BordereauIn, user: dict[str, Any] = Depends(require_
             },
         ).scalar_one()
         rows = [{"id_bordereau": bordereau_id, **_line_params(line, number)} for number, line in enumerate(payload.lignes, start=1)]
+        # The head office's files rarely carry the client: take it from the agency's policy.
+        clients = _clients_by_policy(db, [row["num_police"] for row in rows if not row["code_client"] or not row["nom_client"]])
+        for row in rows:
+            client = clients.get(row["num_police"])
+            if client:
+                row["code_client"] = row["code_client"] or (client["code_client"] or None)
+                row["nom_client"] = row["nom_client"] or ((client["nom_client"] or "")[:120] or None)
         db.execute(text(INSERT_LINE), rows)
         _refresh_totals(db, bordereau_id)
         db.commit()
@@ -220,7 +252,7 @@ def confrontation(
         {"c": code_compagnie, "t": tc, "p": periode},
     ).mappings().first()
     if not header:
-        raise HTTPException(status_code=404, detail="Aucun bordereau reçu pour cette compagnie et cette période. Importez-le d'abord (Réception bordereau).")
+        raise HTTPException(status_code=404, detail="Aucun bordereau reçu pour cette compagnie et cette période. Importez-le d'abord (Réception terme ou Réception comptant).")
 
     month, year = int(periode[:2]), int(periode[3:])
     first_day = date(year, month, 1)
