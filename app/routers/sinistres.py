@@ -201,6 +201,7 @@ def list_sinistres(
     non_regle: bool = False,
     non_cloture: bool = False,
     date_max: date | None = None,
+    code_compagnie: int | None = None,
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
@@ -208,8 +209,9 @@ def list_sinistres(
     """Claims, most recent first; `q` searches the number, client, policy, plate and third party,
     `statut` keeps the open files (en_cours), the settled ones (regle) or the closed ones (cloture),
     `non_regle` / `non_cloture` keep the files whose "Regle" / "Cloture" column is false (both: both false), and `date_max`
-    the claims that happened on or before that day. `counts` gives, for the same search and date,
-    how many files are not settled and not closed."""
+    the claims that happened on or before that day, `code_compagnie` the claims whose opposing party is insured by that
+    company (Code_Compagnie_Advers1). `counts` gives, for the same search, date and company, how many files are not
+    settled and not closed."""
     conditions = ["TRUE"]
     params: dict[str, Any] = {"limit": limit, "offset": offset}
     if statut == "en_cours":
@@ -227,10 +229,13 @@ def list_sinistres(
             'OR REPLACE("Num_Imat", \' \', \'\') ILIKE :plate OR "Tiers1" ILIKE :q OR "Num_Sinistre_Compagnie_Assure" ILIKE :q)'
         )
         params.update({"q": f"%{q.strip()}%", "exact": q.strip(), "plate": f"%{re.sub(r'[ ]', '', q.strip())}%"})
+    if code_compagnie is not None:
+        conditions.append('"Code_Compagnie_Advers1" = :compagnie')
+        params["compagnie"] = code_compagnie
     if date_max is not None:
         conditions.append('"Date_Sinistre" < :date_after')
         params["date_after"] = date.fromordinal(date_max.toordinal() + 1)  # the whole day, whatever the time
-    # The counts follow the search and the date, not the status filters.
+    # The counts follow the search, the date and the company, not the status filters.
     counted = " AND ".join(conditions)
     if non_regle:
         conditions.append('"Regle" = FALSE')

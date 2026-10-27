@@ -1,5 +1,5 @@
 @echo off
-rem Serveur de l'agence : l'application (port 8000, reseau local) et la synchronisation avec Render.
+rem Serveur de l'agence : l'application (port 8000, reseau local) et la synchronisation avec le serveur en ligne.
 rem Lance automatiquement au demarrage du PC par la tache planifiee "Assurance agence" (setup.ps1).
 cd /d "%~dp0..\.."
 if not exist deploy\agency\logs mkdir deploy\agency\logs

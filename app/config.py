@@ -9,8 +9,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 class Settings(BaseSettings):
     database_url: str | None = None
-    # Agency (offline) mode: the Render database the sync worker replicates with, the frontend build this server
-    # serves at "/", and how often the worker syncs. All unset on Render itself.
+    # Agency (offline) mode: the online database (Render, OVH...) the sync worker replicates with, the frontend build this server
+    # serves at "/", and how often the worker syncs. All unset on the online server itself.
     remote_database_url: str | None = None
     frontend_dir: str | None = None
     sync_interval_seconds: int = 15

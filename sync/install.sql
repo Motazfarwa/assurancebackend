@@ -1,4 +1,4 @@
--- Offline sync: change capture and replay, installed on BOTH databases (agency PC and Render).
+-- Offline sync: change capture and replay, installed on BOTH databases (agency PC and the online server).
 -- Re-running it is safe. Nothing in the dbo tables is altered: the legacy software keeps working unchanged.
 --
 -- The dbo tables have no primary keys, so a change is replayed on the other side by matching the whole row:
@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS sync.state (
 CREATE TABLE IF NOT EXISTS sync.conflicts (
     id bigserial PRIMARY KEY,
     at timestamptz NOT NULL DEFAULT now(),
-    direction text NOT NULL,           -- 'push' (agency -> Render) or 'pull' (Render -> agency)
+    direction text NOT NULL,           -- 'push' (agency -> online) or 'pull' (online -> agency)
     source_change_id bigint NOT NULL,
     tbl text NOT NULL,
     op char(1) NOT NULL,
@@ -45,7 +45,9 @@ INSERT INTO sync.excluded (pattern) VALUES ('TTemp%'), ('TMouchard')
 ON CONFLICT (pattern) DO NOTHING;
 
 
-CREATE OR REPLACE FUNCTION sync.capture() RETURNS trigger LANGUAGE plpgsql AS $$
+-- Rows are compared as jsonb text on both servers: same time zone and float output everywhere.
+CREATE OR REPLACE FUNCTION sync.capture() RETURNS trigger LANGUAGE plpgsql
+SET TimeZone = 'UTC' SET extra_float_digits = 1 SET IntervalStyle = 'postgres' AS $$
 BEGIN
     -- A change replayed by the sync worker is not captured again (no echo).
     IF current_setting('sync.applying', true) = 'on' THEN
@@ -95,7 +97,8 @@ $$;
 -- Replays one change captured on the other database. Returns false when the row to update or delete
 -- is not found here (it was changed here too): the caller records a conflict.
 CREATE OR REPLACE FUNCTION sync.apply_change(p_tbl text, p_op text, p_old jsonb, p_new jsonb)
-RETURNS boolean LANGUAGE plpgsql AS $$
+RETURNS boolean LANGUAGE plpgsql
+SET TimeZone = 'UTC' SET extra_float_digits = 1 SET IntervalStyle = 'postgres' AS $$
 DECLARE
     rel regclass := format('dbo.%I', p_tbl)::regclass;
     insert_cols text;

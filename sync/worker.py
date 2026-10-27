@@ -3,9 +3,9 @@
     py -m sync.worker                      run forever (every SYNC_INTERVAL_SECONDS)
     py -m sync.worker --once               one pass, then exit
     py -m sync.worker --install local      install / update the sync schema (local, remote or both)
-    py -m sync.worker --start-after-restore   right after restoring a Render dump on this PC (see deploy/agency)
+    py -m sync.worker --start-after-restore   right after restoring a dump of the online database on this PC (see deploy/agency)
 
-The local database is DATABASE_URL, the Render one REMOTE_DATABASE_URL. Each side keeps, in its own sync.state,
+The local database is DATABASE_URL, the online one (any PostgreSQL host: Render, OVH...) REMOTE_DATABASE_URL. Each side keeps, in its own sync.state,
 "cursor:<other side>" = the last change of the other side applied there, updated in the same transaction as the
 change itself: a pass interrupted by a lost connection resumes exactly where it stopped.
 """
@@ -14,6 +14,7 @@ import argparse
 import json
 import logging
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +24,7 @@ from sqlalchemy.exc import DBAPIError, OperationalError
 
 from app.config import settings
 
-LOCAL, REMOTE = "agency", "render"
+LOCAL, REMOTE = "agency", "online"
 BATCH_SIZE = 500
 RETENTION_DAYS = 30
 LOCK_ID = 726541001  # advisory lock: a single worker per agency database
@@ -157,8 +158,8 @@ def install(engine: Engine) -> int:
 
 
 def start_after_restore(local: Engine, remote: Engine) -> None:
-    """The local database was just restored from a Render dump, which carried Render's change log as of the dump:
-    its last id is exactly where pulling must start. The local log is then emptied, and Render starts reading it
+    """The local database was just restored from a dump of the online database, which carried its change log as of the dump:
+    its last id is exactly where pulling must start. The local log is then emptied, and the online side reads it
     from the beginning."""
     with local.begin() as conn:
         restored_upto = conn.execute(text("SELECT COALESCE(max(id), 0) FROM sync.changes")).scalar()
@@ -168,21 +169,36 @@ def start_after_restore(local: Engine, remote: Engine) -> None:
         set_state(conn, "pushed_upto", 0)
     with remote.begin() as conn:
         set_state(conn, f"cursor:{LOCAL}", 0)
-    log.info("Sync initialised: pulling Render changes after %s.", restored_upto)
+    log.info("Sync initialised: pulling online changes after %s.", restored_upto)
 
 
-def run_forever(local: Engine, remote: Engine) -> None:
+@contextmanager
+def single_worker(local: Engine):
+    """Two workers replaying at once would apply changes twice: the second one stops."""
     with local.connect() as lock_conn:
         if not lock_conn.execute(text("SELECT pg_try_advisory_lock(:id)"), {"id": LOCK_ID}).scalar():
             raise SystemExit("Another sync worker is already running on this database.")
+        lock_conn.commit()
+        with local.begin() as conn:
+            # Installs from before the online side was renamed kept its cursor under "cursor:render".
+            legacy = get_state(conn, "cursor:render")
+            if legacy is not None:
+                if get_state(conn, f"cursor:{REMOTE}") is None:
+                    set_state(conn, f"cursor:{REMOTE}", legacy)
+                conn.execute(text("DELETE FROM sync.state WHERE key = 'cursor:render'"))
+        yield
+
+
+def run_forever(local: Engine, remote: Engine) -> None:
+    with single_worker(local):
         log.info("Sync worker started (every %s s).", settings.sync_interval_seconds)
         while True:
             try:
                 pushed, pulled = sync_once(local, remote)
                 if pushed or pulled:
-                    log.info("Synced: %s sent to Render, %s received.", pushed, pulled)
+                    log.info("Synced: %s sent online, %s received.", pushed, pulled)
             except DBAPIError as exc:
-                log.info("Render unreachable, retrying later (%s).", str(exc.orig or exc).splitlines()[0])
+                log.info("Online database unreachable, retrying later (%s).", str(exc.orig or exc).splitlines()[0])
             time.sleep(settings.sync_interval_seconds)
 
 
@@ -195,7 +211,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     if not settings.database_url or not settings.remote_database_url:
-        raise SystemExit("Set DATABASE_URL (agency database) and REMOTE_DATABASE_URL (Render database) in .env.")
+        raise SystemExit("Set DATABASE_URL (agency database) and REMOTE_DATABASE_URL (online database) in .env.")
     local, remote = make_engine(settings.database_url), make_engine(settings.remote_database_url)
 
     if args.install:
@@ -205,8 +221,9 @@ def main() -> None:
     elif args.start_after_restore:
         start_after_restore(local, remote)
     elif args.once:
-        pushed, pulled = sync_once(local, remote)
-        log.info("Synced: %s sent to Render, %s received.", pushed, pulled)
+        with single_worker(local):
+            pushed, pulled = sync_once(local, remote)
+        log.info("Synced: %s sent online, %s received.", pushed, pulled)
     else:
         run_forever(local, remote)
 

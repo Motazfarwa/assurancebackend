@@ -27,10 +27,12 @@ from app.routers.sync_status import router as sync_status_router
 app = FastAPI(title="Assurance API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
+    # Sites allowed to call this API: the current ones, plus CORS_ORIGINS (for example the frontend's address on OVH).
+    allow_origins=list(dict.fromkeys([
         "https://assurancefrontend.onrender.com",
         "http://localhost:5173",
-    ],
+        *settings.cors_origins,
+    ])),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

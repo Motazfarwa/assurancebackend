@@ -2,25 +2,27 @@
 Installation du serveur de l'agence (mode hors ligne), a lancer UNE fois sur le PC serveur,
 dans PowerShell ouvert "en tant qu'administrateur", AVEC internet :
 
-    powershell -ExecutionPolicy Bypass -File deploy\agency\setup.ps1 -RenderDatabaseUrl "postgresql://user:motdepasse@hote.render.com:5432/base"
+    powershell -ExecutionPolicy Bypass -File deploy\agency\setup.ps1 -OnlineDatabaseUrl "postgresql://user:motdepasse@hote:5432/base"
 
-Etapes : sauvegarde de la base locale actuelle, installation de la synchronisation sur Render, copie de la base
-Render sur ce PC, environnement Python, build du frontend, pare-feu (reseau local) et demarrage automatique.
+Etapes : sauvegarde de la base locale actuelle, installation de la synchronisation sur la base en ligne (Render, OVH...), copie de la base
+en ligne sur ce PC, environnement Python, build du frontend, pare-feu (reseau local) et demarrage automatique.
 Voir deploy\agency\README.md.
 #>
 param(
-    [Parameter(Mandatory = $true)] [string] $RenderDatabaseUrl,   # URL "External Database URL" de Render
+    [Parameter(Mandatory = $true)] [Alias("RenderDatabaseUrl")] [string] $OnlineDatabaseUrl,  # URL PostgreSQL de la base en ligne (Render : "External Database URL")
     [string] $LocalDatabase = "assurance_agence",                 # nouvelle base locale (jamais une base existante)
     [string] $LocalUser = "postgres",
     [string] $LocalHost = "localhost",
     [int] $LocalPort = 5432,
-    [string] $FrontendRepo = (Join-Path $PSScriptRoot "..\..\..\assurancefrontend"),
+    [string] $FrontendRepo = "",                                  # par defaut : le dossier assurancefrontend voisin
     [int] $Port = 8000
 )
 
 $ErrorActionPreference = "Stop"
 $Backend = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $Here = $PSScriptRoot
+# $PSScriptRoot is still empty while Windows PowerShell 5 evaluates parameter defaults: the default is set here.
+if (-not $FrontendRepo) { $FrontendRepo = Join-Path $Backend "..\assurancefrontend" }
 function Step($text) { Write-Host ""; Write-Host "==> $text" -ForegroundColor Cyan }
 
 # --- Prerequis ---------------------------------------------------------------------------------------------
@@ -32,11 +34,14 @@ if ($null -eq (Get-Command py -ErrorAction SilentlyContinue)) { throw "Python (c
 if ($null -eq (Get-Command npm -ErrorAction SilentlyContinue)) { throw "Node.js (npm) introuvable : installez Node.js LTS." }
 if (-not (Test-Path (Join-Path $FrontendRepo "package.json"))) { throw "Projet frontend introuvable : $FrontendRepo (parametre -FrontendRepo)." }
 
-$secure = Read-Host "Mot de passe PostgreSQL local de '$LocalUser'" -AsSecureString
-$env:PGPASSWORD = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
+# Local PostgreSQL password: asked here, unless already given in the PGPASSWORD environment variable.
+if (-not $env:PGPASSWORD) {
+    $secure = Read-Host "Mot de passe PostgreSQL local de '$LocalUser'" -AsSecureString
+    $env:PGPASSWORD = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
+}
 $local = @("-h", $LocalHost, "-p", "$LocalPort", "-U", $LocalUser)
-$RenderPg = $RenderDatabaseUrl -replace '^postgresql\+psycopg://', 'postgresql://' -replace '^postgres://', 'postgresql://'
-$RenderSqlAlchemy = $RenderPg -replace '^postgresql://', 'postgresql+psycopg://'
+$OnlinePg = $OnlineDatabaseUrl -replace '^postgresql\+psycopg://', 'postgresql://' -replace '^postgres://', 'postgresql://'
+$OnlineSqlAlchemy = $OnlinePg -replace '^postgresql://', 'postgresql+psycopg://'
 $encodedPassword = [Uri]::EscapeDataString($env:PGPASSWORD)
 $LocalSqlAlchemy = "postgresql+psycopg://${LocalUser}:${encodedPassword}@${LocalHost}:${LocalPort}/$LocalDatabase"
 
@@ -67,32 +72,33 @@ if ($LASTEXITCODE -ne 0) { throw "Installation des paquets Python impossible." }
 
 $envFile = Join-Path $Backend ".env"
 $frontendDir = Join-Path $Here "frontend"
+if (Test-Path $envFile) { Copy-Item $envFile (Join-Path $backups "env-$stamp.txt") }  # previous settings, kept
 $lines = if (Test-Path $envFile) { @(Get-Content $envFile) } else { @() }
 function Set-EnvLine([string] $key, [string] $value) {
     $script:lines = @($script:lines | Where-Object { $_ -notmatch "^$key=" }) + "$key=$value"
 }
 Set-EnvLine "DATABASE_URL" $LocalSqlAlchemy
-Set-EnvLine "REMOTE_DATABASE_URL" $RenderSqlAlchemy
+Set-EnvLine "REMOTE_DATABASE_URL" $OnlineSqlAlchemy
 Set-EnvLine "FRONTEND_DIR" $frontendDir
 if (-not ($lines | Where-Object { $_ -match "^AUTH_SECRET_KEY=.{32,}" })) {
     Set-EnvLine "AUTH_SECRET_KEY" (& $venvPython -c "import secrets; print(secrets.token_urlsafe(48))")
 }
 [IO.File]::WriteAllLines($envFile, [string[]] $lines, (New-Object Text.UTF8Encoding $false))  # UTF-8 without BOM
-Write-Host "  .env mis a jour (base locale $LocalDatabase, base Render, frontend)."
+Write-Host "  .env mis a jour (base locale $LocalDatabase, base en ligne, frontend)."
 
-# --- 3. Synchronisation installee sur Render, puis copie de Render sur ce PC -----------------------------------
-Step "Installation de la synchronisation sur Render"
+# --- 3. Synchronisation installee sur la base en ligne, puis copie de celle-ci sur ce PC--------------------------------
+Step "Installation de la synchronisation sur la base en ligne"
 Push-Location $Backend
 & $venvPython -m sync.worker --install remote
-if ($LASTEXITCODE -ne 0) { Pop-Location; throw "Installation sur Render impossible (URL, mot de passe, acces internet ?)." }
+if ($LASTEXITCODE -ne 0) { Pop-Location; throw "Installation sur la base en ligne impossible (URL, mot de passe, acces internet ?)." }
 
-Step "Copie de la base Render sur ce PC (peut prendre plusieurs minutes)"
-$renderDump = Join-Path $backups "render-$stamp.dump"
-& "$PgBin\pg_dump.exe" -d $RenderPg -Fc --no-owner --no-acl -f $renderDump
-if ($LASTEXITCODE -ne 0) { Pop-Location; throw "Copie de la base Render impossible." }
+Step "Copie de la base en ligne sur ce PC (peut prendre plusieurs minutes)"
+$onlineDump = Join-Path $backups "online-$stamp.dump"
+& "$PgBin\pg_dump.exe" -d $OnlinePg -Fc --no-owner --no-acl -f $onlineDump
+if ($LASTEXITCODE -ne 0) { Pop-Location; throw "Copie de la base en ligne impossible." }
 & "$PgBin\createdb.exe" @local $LocalDatabase
-& "$PgBin\pg_restore.exe" @local -d $LocalDatabase --no-owner --no-acl $renderDump
-if ($LASTEXITCODE -ne 0) { Write-Warning "pg_restore a signale des avertissements (souvent des roles Render absents ici) : verifiez les messages ci-dessus." }
+& "$PgBin\pg_restore.exe" @local -d $LocalDatabase --no-owner --no-acl $onlineDump
+if ($LASTEXITCODE -ne 0) { Write-Warning "pg_restore a signale des avertissements (souvent des roles du serveur en ligne absents ici) : verifiez les messages ci-dessus." }
 
 Step "Activation de la synchronisation sur ce PC"
 & $venvPython -m sync.worker --install local
@@ -109,19 +115,16 @@ $built = $LASTEXITCODE
 Pop-Location
 if ($built -ne 0) { throw "Build du frontend impossible." }
 
-# --- 5. Reseau local et demarrage automatique ------------------------------------------------------------------
+# --- 5. Reseau local et demarrage automatique (administrateur) -------------------------------------------------
 Step "Pare-feu (reseau local uniquement) et demarrage automatique"
-if (-not (Get-NetFirewallRule -DisplayName "Assurance agence $Port" -ErrorAction SilentlyContinue)) {
-    New-NetFirewallRule -DisplayName "Assurance agence $Port" -Direction Inbound -Protocol TCP -LocalPort $Port `
-        -Profile Private, Domain -RemoteAddress LocalSubnet -Action Allow | Out-Null
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator)
+if ($isAdmin) {
+    & (Join-Path $Here "install-startup.ps1") -Port $Port
+} else {
+    Write-Warning "PowerShell n'est pas ouvert en administrateur : pare-feu et demarrage automatique non installes."
+    Write-Warning "Lancez dans un PowerShell administrateur :  powershell -ExecutionPolicy Bypass -File `"$Here\install-startup.ps1`""
 }
-$action = New-ScheduledTaskAction -Execute (Join-Path $Here "start.bat")
-$trigger = New-ScheduledTaskTrigger -AtStartup
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 `
-    -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
-Register-ScheduledTask -TaskName "Assurance agence" -Action $action -Trigger $trigger -Settings $settings `
-    -User "SYSTEM" -RunLevel Highest -Force | Out-Null
-Start-ScheduledTask -TaskName "Assurance agence"
 
 $name = $env:COMPUTERNAME
 Write-Host ""

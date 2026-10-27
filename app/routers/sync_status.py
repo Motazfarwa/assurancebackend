@@ -1,6 +1,6 @@
-"""Offline mode status for the frontend badge: is Render reachable, what is waiting, what conflicted.
+"""Offline mode status for the frontend badge: is the online database reachable, what is waiting, what conflicted.
 
-On Render itself (no REMOTE_DATABASE_URL) the app is simply online and no sync runs there.
+On the online server itself (no REMOTE_DATABASE_URL) the app is simply online and no sync runs there.
 """
 
 from datetime import datetime, timedelta, timezone
