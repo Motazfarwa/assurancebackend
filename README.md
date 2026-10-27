@@ -55,7 +55,12 @@ The supplied `AssurancejSQL_dataa.sql` file is a SQL Server export (`USE [Assura
 - `POST /api/prestataires` — create the prestataire and selected company/branch links in one transaction.
 - `PUT /api/prestataires/{code_prestataire}` — update the prestataire and replace its selected links atomically.
 - `DELETE /api/prestataires/{code_prestataire}` — delete the prestataire and its company/branch links.
-- `GET /api/sinistres?limit=100&offset=0` — paginated rows from the configured table (limit is capped at 500).
+- `GET /api/sinistres?q=&code_client=&limit=100&offset=0` — claims, most recent first (`q` searches number, client, policy, plate, third party).
+- `GET /api/sinistres/lookups` — responsibilities, claim types, branch types, companies, experts, garages, guarantees and damage types.
+- `GET /api/sinistres/next-number?date_sinistre=YYYY-MM-DD` — next claim number (`YYYYMM` + 3-digit sequence).
+- `GET /api/sinistres/police?numero=&immat=` — the insured's policy (client, company, branch, risk) by policy number or plate.
+- `GET|PUT|DELETE /api/sinistres/{numero}`, `POST /api/sinistres` — read, update, delete, create a claim.
+- `POST /api/sinistres/extract` — reads a scanned constat / déclaration (image or PDF) and proposes the claim's values.
 - `GET /docs` — interactive API documentation.
 
 All business API routes require `Authorization: Bearer <token>`. Login and health check are public. The browser stores the session token for the current tab and clears it on sign out. `ModPrg` is returned as user metadata; the screenshot does not establish its authorization semantics, so it is not treated as an access-control role. The database account needs permission to connect to the database, use the configured schema, read/write the client and prestataire tables, update `TUtilisateur.modp`, and modify both prestataire relation tables. Other insurance categories remain outside this implementation.

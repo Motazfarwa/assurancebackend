@@ -87,8 +87,16 @@ class CarteVerteCreate(BaseModel):
     au: Optional[date] = None
 
 
+class RevalorisationCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    date_revalorisation: Optional[date] = None
+    date_envoi: Optional[date] = None
+
+
 class PoliceWithQuittanceCreate(BaseModel):
     police: PoliceCreate
     quittance: QuittanceCreate
     garanties: Optional[GarantiesCreate] = None
     carte_verte: Optional[CarteVerteCreate] = None
+    revalorisation: Optional[RevalorisationCreate] = None

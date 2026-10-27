@@ -45,6 +45,25 @@ CARTE_VERTE_DDL = """
 """
 
 
+REVALORISATION_DDL = """
+    CREATE TABLE IF NOT EXISTS dbo."TPoliceRevalorisation" (
+        num_int character varying(20) PRIMARY KEY,
+        date_revalorisation date,
+        date_envoi date
+    )
+"""
+_revalorisation_ready = False
+
+
+def ensure_revalorisation_table():
+    """Revalorisation dates of a policy (the policy table has no column for them); created on first use."""
+    global _revalorisation_ready
+    if not _revalorisation_ready:
+        with engine.begin() as conn:
+            conn.execute(text(REVALORISATION_DDL))
+        _revalorisation_ready = True
+
+
 def flag(value):
     if value is None:
         return None
@@ -205,6 +224,13 @@ def create_police_with_quittance(
                             (:num_int, :vol, :incendie, :bdg, :personnes_transportees, :ind_conducteur, :remarquage)
                     """),
                     {"num_int": internal_id, **garanties},
+                )
+
+            if payload.revalorisation and payload.revalorisation.date_revalorisation:
+                conn.execute(text(REVALORISATION_DDL))
+                conn.execute(
+                    text('INSERT INTO dbo."TPoliceRevalorisation" (num_int, date_revalorisation, date_envoi) VALUES (:num_int, :d, :e)'),
+                    {"num_int": internal_id, "d": payload.revalorisation.date_revalorisation, "e": payload.revalorisation.date_envoi},
                 )
 
             conn.execute(
@@ -408,8 +434,18 @@ def get_police_detail(
             conn.rollback()  # table not created yet: no guarantees saved so far
             garanties_row = None
 
+        try:
+            revalorisation_row = conn.execute(
+                text('SELECT date_revalorisation, date_envoi FROM dbo."TPoliceRevalorisation" WHERE num_int = :i'),
+                {"i": str(police.get("num_int") or "").strip()},
+            ).mappings().first()
+        except SQLAlchemyError:
+            conn.rollback()  # table not created yet: no revalorisation saved so far
+            revalorisation_row = None
+
     return {
         "garanties": _plain(garanties_row) if garanties_row else None,
+        "revalorisation": _plain(revalorisation_row) if revalorisation_row else None,
         "nom_client": nom_client,
         "police": police,
         "quittance": _plain(quittance) if quittance else None,
@@ -509,6 +545,7 @@ def search_polices(
     effet_du: date | None = None,
     effet_au: date | None = None,
     statut: str | None = Query(default=None, pattern="^(tous|vigueur|susp|expirees)$"),
+    revalorisation: str | None = Query(default=None, pattern="^(oui|non)$"),
     page: int | None = Query(default=None, ge=1),
     page_size: int = Query(default=50, ge=1, le=200),
 ):
@@ -559,6 +596,13 @@ def search_polices(
         conditions.append("p.effet < :effet_au_next")
         params["effet_au_next"] = effet_au + timedelta(days=1)
 
+    # Policies with (oui) or without (non) a revalorisation date.
+    ensure_revalorisation_table()
+    if revalorisation == "oui":
+        conditions.append('EXISTS (SELECT 1 FROM dbo."TPoliceRevalorisation" r WHERE r.num_int = TRIM(p.num_int) AND r.date_revalorisation IS NOT NULL)')
+    elif revalorisation == "non":
+        conditions.append('NOT EXISTS (SELECT 1 FROM dbo."TPoliceRevalorisation" r WHERE r.num_int = TRIM(p.num_int) AND r.date_revalorisation IS NOT NULL)')
+
     if not conditions and not statut:
         raise HTTPException(
             status_code=422,
@@ -596,7 +640,9 @@ def search_polices(
                     p.expiration,
                     p.etat,
                     p.prime_net,
-                    p.num_imat
+                    p.num_imat,
+                    rv.date_revalorisation,
+                    rv.date_envoi
                 FROM dbo."TPolice" p
                 LEFT JOIN LATERAL (
                     SELECT tb.nom_branche
@@ -605,6 +651,7 @@ def search_polices(
                       AND tb.code_branche = p.code_branche
                     LIMIT 1
                 ) b ON TRUE
+                LEFT JOIN dbo."TPoliceRevalorisation" rv ON rv.num_int = TRIM(p.num_int)
                 WHERE {where_sql}
                 ORDER BY p.effet DESC NULLS LAST, p.num_police, p.num_int
                 {limit_sql}
