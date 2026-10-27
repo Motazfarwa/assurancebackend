@@ -193,12 +193,18 @@ def list_sinistres(
     q: str = Query(default="", max_length=60),
     code_client: str = Query(default="", max_length=8),
     statut: str = Query(default="", pattern="^(|en_cours|regle|cloture)$"),
+    non_regle: bool = False,
+    non_cloture: bool = False,
+    date_max: date | None = None,
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """Claims, most recent first; `q` searches the number, client, policy, plate and third party,
-    `statut` keeps the open files (en_cours), the settled ones (regle) or the closed ones (cloture)."""
+    `statut` keeps the open files (en_cours), the settled ones (regle) or the closed ones (cloture),
+    `non_regle` / `non_cloture` keep the files not settled / not closed (both: neither), and `date_max`
+    the claims that happened on or before that day. `counts` gives, for the same search and date,
+    how many files are not settled and not closed."""
     conditions = ["TRUE"]
     params: dict[str, Any] = {"limit": limit, "offset": offset}
     if statut == "en_cours":
@@ -216,8 +222,25 @@ def list_sinistres(
             'OR REPLACE("Num_Imat", \' \', \'\') ILIKE :plate OR "Tiers1" ILIKE :q OR "Num_Sinistre_Compagnie_Assure" ILIKE :q)'
         )
         params.update({"q": f"%{q.strip()}%", "exact": q.strip(), "plate": f"%{re.sub(r'[ ]', '', q.strip())}%"})
+    if date_max is not None:
+        conditions.append('"Date_Sinistre" < :date_after')
+        params["date_after"] = date.fromordinal(date_max.toordinal() + 1)  # the whole day, whatever the time
+    # The counts follow the search and the date, not the status filters.
+    counted = " AND ".join(conditions)
+    if non_regle:
+        conditions.append('COALESCE("Regle", FALSE) = FALSE')
+    if non_cloture:
+        conditions.append('COALESCE("Cloture", FALSE) = FALSE')
     where = " AND ".join(conditions)
     try:
+        counts = db.execute(
+            text(
+                'SELECT COUNT(*) FILTER (WHERE COALESCE("Regle", FALSE) = FALSE) AS non_regle, '
+                'COUNT(*) FILTER (WHERE COALESCE("Cloture", FALSE) = FALSE) AS non_cloture '
+                f'FROM dbo."Sinistre" WHERE {counted}'
+            ),
+            params,
+        ).mappings().first()
         total = db.execute(text(f'SELECT COUNT(*) FROM dbo."Sinistre" WHERE {where}'), params).scalar()
         rows = db.execute(
             text(f'SELECT {LIST_COLUMNS} FROM dbo."Sinistre" WHERE {where} ORDER BY "Date_Saisie" DESC NULLS LAST, "Num_Sinistre_Agence" DESC LIMIT :limit OFFSET :offset'),
@@ -225,7 +248,10 @@ def list_sinistres(
         ).mappings().all()
     except SQLAlchemyError as exc:
         raise HTTPException(status_code=503, detail="Lecture des sinistres impossible.") from exc
-    return {"items": [_plain(row) for row in rows], "total": total, "limit": limit, "offset": offset}
+    return {
+        "items": [_plain(row) for row in rows], "total": total, "limit": limit, "offset": offset,
+        "counts": {"non_regle": counts["non_regle"], "non_cloture": counts["non_cloture"]},
+    }
 
 
 @router.get("/next-number")
