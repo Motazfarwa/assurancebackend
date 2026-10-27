@@ -43,8 +43,13 @@ FLOAT_COLUMNS = {
 }
 EDITABLE = set(TEXT_COLUMNS) | INT_COLUMNS | BOOL_COLUMNS | DATE_COLUMNS | FLOAT_COLUMNS
 
+# The client name and the risk, when the claim does not hold them, come from the client file and the policy.
 LIST_COLUMNS = (
-    '"Num_Sinistre_Agence", "Date_Saisie", "Date_Sinistre", "Lieu_Sinistre", TRIM("Code_Client") AS "Code_Client", nom_client, '
+    '"Num_Sinistre_Agence", "Date_Saisie", "Date_Sinistre", "Lieu_Sinistre", TRIM("Code_Client") AS "Code_Client", '
+    'COALESCE(NULLIF(TRIM(nom_client), \'\'), (SELECT TRIM(c.nom_client) FROM dbo."TClient" c '
+    'WHERE TRIM(c.code_client) = TRIM(dbo."Sinistre"."Code_Client") LIMIT 1)) AS nom_client, '
+    'COALESCE(NULLIF(TRIM("Risque"), \'\'), (SELECT TRIM(p.risque) FROM dbo."TPolice" p '
+    'WHERE TRIM(p.num_int) = TRIM(dbo."Sinistre"."Num_Int") ORDER BY p.effet DESC NULLS LAST LIMIT 1)) AS "Risque", '
     '"Num_Int", "Num_Imat", "Type_Sinistre", "Garantie", "Tiers1", "Code_Compagnie_Assure", "Regle", "Cloture", "Montant_Reglement", '
     '"Montant_Devis"'
 )
