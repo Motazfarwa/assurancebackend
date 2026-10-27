@@ -202,7 +202,7 @@ def list_sinistres(
 ) -> dict[str, Any]:
     """Claims, most recent first; `q` searches the number, client, policy, plate and third party,
     `statut` keeps the open files (en_cours), the settled ones (regle) or the closed ones (cloture),
-    `non_regle` / `non_cloture` keep the files not settled / not closed (both: neither), and `date_max`
+    `non_regle` / `non_cloture` keep the files whose "Regle" / "Cloture" column is false (both: both false), and `date_max`
     the claims that happened on or before that day. `counts` gives, for the same search and date,
     how many files are not settled and not closed."""
     conditions = ["TRUE"]
@@ -228,15 +228,15 @@ def list_sinistres(
     # The counts follow the search and the date, not the status filters.
     counted = " AND ".join(conditions)
     if non_regle:
-        conditions.append('COALESCE("Regle", FALSE) = FALSE')
+        conditions.append('"Regle" = FALSE')
     if non_cloture:
-        conditions.append('COALESCE("Cloture", FALSE) = FALSE')
+        conditions.append('"Cloture" = FALSE')
     where = " AND ".join(conditions)
     try:
         counts = db.execute(
             text(
-                'SELECT COUNT(*) FILTER (WHERE COALESCE("Regle", FALSE) = FALSE) AS non_regle, '
-                'COUNT(*) FILTER (WHERE COALESCE("Cloture", FALSE) = FALSE) AS non_cloture '
+                'SELECT COUNT(*) FILTER (WHERE "Regle" = FALSE) AS non_regle, '
+                'COUNT(*) FILTER (WHERE "Cloture" = FALSE) AS non_cloture '
                 f'FROM dbo."Sinistre" WHERE {counted}'
             ),
             params,
