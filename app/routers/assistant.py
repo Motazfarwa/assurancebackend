@@ -191,7 +191,7 @@ def _gemini_generate(body: dict[str, Any]) -> dict[str, Any]:
     try:
         reply = httpx.post(f"{base}/models/{settings.gemini_model}:generateContent", headers={"x-goog-api-key": key}, json=body, timeout=90)
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=503, detail="Impossible de joindre le service IA.") from exc
+        raise HTTPException(status_code=503, detail="Service IA injoignable (pas de connexion internet ?). La saisie manuelle reste disponible.") from exc
     if reply.status_code >= 400:
         try:
             reason = str(reply.json().get("error", {}).get("message", ""))[:200]
@@ -308,7 +308,7 @@ def chat(request: ChatRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
     except anthropic.RateLimitError as exc:
         raise HTTPException(status_code=429, detail="Assistant surchargé, réessayez dans un instant.") from exc
     except anthropic.APIConnectionError as exc:
-        raise HTTPException(status_code=503, detail="Impossible de joindre le service IA.") from exc
+        raise HTTPException(status_code=503, detail="Service IA injoignable (pas de connexion internet ?). La saisie manuelle reste disponible.") from exc
     except anthropic.APIStatusError as exc:
         raise HTTPException(status_code=502, detail=f"Erreur du service IA ({exc.status_code}).") from exc
 
@@ -390,7 +390,7 @@ def _extract_fiche_gemini(request: FicheRequest) -> dict[str, Any]:
     try:
         reply = httpx.post(url, headers={"x-goog-api-key": key}, json=body, timeout=90)
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=503, detail="Impossible de joindre le service de lecture.") from exc
+        raise HTTPException(status_code=503, detail="Service de lecture injoignable (pas de connexion internet ?). La saisie manuelle reste disponible.") from exc
     if reply.status_code >= 400:
         try:
             reason = str(reply.json().get("error", {}).get("message", ""))[:200]
@@ -486,7 +486,7 @@ def extract_fiche(request: FicheRequest) -> dict[str, Any]:
     except anthropic.RateLimitError as exc:
         raise HTTPException(status_code=429, detail="Service IA surchargé, réessayez dans un instant.") from exc
     except anthropic.APIConnectionError as exc:
-        raise HTTPException(status_code=503, detail="Impossible de joindre le service IA.") from exc
+        raise HTTPException(status_code=503, detail="Service IA injoignable (pas de connexion internet ?). La saisie manuelle reste disponible.") from exc
     except anthropic.APIStatusError as exc:
         raise HTTPException(status_code=502, detail=f"Erreur du service IA ({exc.status_code}).") from exc
 

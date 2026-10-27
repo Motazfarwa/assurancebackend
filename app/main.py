@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,6 +22,7 @@ from app.routers.assistant import router as assistant_router
 from app.routers.bordereaux import router as bordereaux_router
 from app.routers.records_search import router as records_search_router
 from app.routers.cheques import router as cheques_router
+from app.routers.sync_status import router as sync_status_router
 
 app = FastAPI(title="Assurance API", version="0.1.0")
 app.add_middleware(
@@ -49,14 +50,31 @@ app.include_router(bordereaux_router)
 app.include_router(records_search_router)
 app.include_router(cheques_router)
 app.include_router(record_updates_router)
-app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
-
-
-@app.get("/", include_in_schema=False)
-def home() -> FileResponse:
-    return FileResponse(Path(__file__).parent / "static" / "index.html")
+app.include_router(sync_status_router)
 
 
 @app.get("/health", tags=["Health"])
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+if settings.frontend_dir:
+    # Agency (offline) server: the React build is served here, so the agency PCs only need this address.
+    frontend = Path(settings.frontend_dir).resolve()
+    app.mount("/static", StaticFiles(directory=frontend / "static"), name="static")
+
+    @app.get("/{path:path}", include_in_schema=False)
+    def frontend_file(path: str) -> FileResponse:
+        if path.startswith(("api/", "docs", "openapi.json")):
+            raise HTTPException(status_code=404)
+        file = (frontend / path).resolve()
+        # Files of the build (manifest, logos, OCR data...), anything else is a screen of the app.
+        if path and file.is_file() and file.is_relative_to(frontend):
+            return FileResponse(file)
+        return FileResponse(frontend / "index.html")
+else:
+    app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
+
+    @app.get("/", include_in_schema=False)
+    def home() -> FileResponse:
+        return FileResponse(Path(__file__).parent / "static" / "index.html")

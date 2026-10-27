@@ -3,3 +3,8 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# agency (offline) server: database backups, logs and the frontend build made by deploy/agency/setup.ps1
+deploy/agency/backups/
+deploy/agency/logs/
+deploy/agency/frontend/
