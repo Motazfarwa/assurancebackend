@@ -226,7 +226,10 @@ def list_sinistres(
         params["code"] = code_client.strip()
     if q.strip():
         conditions.append(
-            '("Num_Sinistre_Agence" ILIKE :q OR TRIM("Code_Client") = :exact OR nom_client ILIKE :q OR "Num_Int" ILIKE :q '
+            '("Num_Sinistre_Agence" ILIKE :q OR TRIM("Code_Client") = :exact OR nom_client ILIKE :q '
+            # The client name shown in the list comes from the client file when the claim does not hold it.
+            'OR EXISTS (SELECT 1 FROM dbo."TClient" c WHERE TRIM(c.code_client) = TRIM(dbo."Sinistre"."Code_Client") AND c.nom_client ILIKE :q) '
+            'OR "Num_Int" ILIKE :q '
             'OR REPLACE("Num_Imat", \' \', \'\') ILIKE :plate OR "Tiers1" ILIKE :q OR "Num_Sinistre_Compagnie_Assure" ILIKE :q)'
         )
         params.update({"q": f"%{q.strip()}%", "exact": q.strip(), "plate": f"%{re.sub(r'[ ]', '', q.strip())}%"})
