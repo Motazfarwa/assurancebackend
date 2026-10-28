@@ -12,6 +12,7 @@ from typing import Any
 
 import anthropic
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -57,6 +58,7 @@ LIST_COLUMNS = (
 # Values the legacy software offers for these free-text columns (completed with what the table already holds).
 GARANTIES = ["(Aucun)", "RC", "TR", "COLL", "Dom.Véhicule", "BG", "Vol", "Incendie", "AUTRE"]
 TYPES_DEGATS = ["(Aucun)", "Matériel", "Corporel", "Matériel et corporel"]
+URGENCES = ["Non Urgent", "Urgent", "Très Urgent"]
 
 # Branch name keywords -> TType_Branche code.
 BRANCH_TYPES = [
@@ -190,6 +192,11 @@ def lookups(db: Session = Depends(get_db)) -> dict[str, Any]:
         "garages": [{"id": r[0].strip(), "label": r[1].strip()} for r in rows('SELECT "Code_Garage", "Nom_Garage" FROM dbo."TGarage" ORDER BY "Nom_Garage"')],
         "garanties": merge(GARANTIES, used_garanties),
         "types_degats": merge(TYPES_DEGATS, used_degats),
+        "etapes": [
+            {"id": r[0], "label": (r[1] or "").strip(), "ouverture": (r[2] or "").strip() == "O"}
+            for r in rows('SELECT "Code_Etape", "Libelle_Etape", "Etape_Ouverture" FROM dbo."TEtape_Siniste" ORDER BY "Code_Etape"')
+        ],
+        "urgences": URGENCES,
     }
 
 
@@ -315,6 +322,12 @@ def create_sinistre(payload: dict[str, Any], user: dict[str, Any] = Depends(requ
         values["Num_Sinistre_Agence"] = chosen or _next_number(db, values["Date_Sinistre"].date())
         columns = ", ".join(f'"{key}"' for key in values)
         db.execute(text(f'INSERT INTO dbo."Sinistre" ({columns}) VALUES ({", ".join(f":{key}" for key in values)})'), values)
+        # Like the legacy software, a new file starts its follow-up with the opening step(s) (Etape_Ouverture = 'O').
+        for (code,) in db.execute(text('SELECT "Code_Etape" FROM dbo."TEtape_Siniste" WHERE "Etape_Ouverture" = \'O\' ORDER BY 1')).all():
+            _insert_follow_up(db, "Sinistre_Suivi", {
+                "Num_Sinistre_Agence": values["Num_Sinistre_Agence"], "Code_Etape": code, "Date_Etape": values["Date_Saisie"],
+                "Description": "Ouverture de dossier", "Create_User": login, "Create_Date": now,
+            })
         db.commit()
         return {"numero": values["Num_Sinistre_Agence"]}
     except SQLAlchemyError as exc:
@@ -349,10 +362,153 @@ def delete_sinistre(numero: str, db: Session = Depends(get_db)) -> None:
         if result.rowcount == 0:
             db.rollback()
             raise HTTPException(status_code=404, detail="Sinistre introuvable.")
+        for table in FOLLOW_UP_TABLES:
+            db.execute(text(f'DELETE FROM dbo."{table}" WHERE TRIM("Num_Sinistre_Agence") = :n'), {"n": numero.strip()})
         db.commit()
     except SQLAlchemyError as exc:
         db.rollback()
         raise HTTPException(status_code=503, detail=f"Suppression impossible : {str(getattr(exc, 'orig', exc))[:250]}") from exc
+
+
+# ---------------------------------------------------------------------------------------------
+# Suivi: the steps of a file (Sinistre_Suivi, steps listed in TEtape_Siniste) and the calls / letters
+# sent or received about it (Sinistre_Appel). Rows are keyed by "Cmp", numbered here (the tables have no sequence).
+# ---------------------------------------------------------------------------------------------
+FOLLOW_UP_TABLES = ("Sinistre_Suivi", "Sinistre_Appel")
+
+
+class EtapeIn(BaseModel):
+    Code_Etape: int
+    Date_Etape: datetime | None = None
+    Description: str = Field(default="", max_length=200)
+
+
+class AppelIn(BaseModel):
+    Date_Appel: datetime
+    Description: str = Field(default="", max_length=200)
+    Urgence: str = Field(default="Non Urgent", max_length=50)
+
+
+def _insert_follow_up(db: Session, table: str, values: dict[str, Any]) -> int:
+    # Rows added at the same time from several PCs get different numbers (lock held until the commit).
+    db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": f"dbo.{table}.Cmp"})
+    cmp = db.execute(text(f'SELECT COALESCE(MAX("Cmp"), 0) + 1 FROM dbo."{table}"')).scalar()
+    values = {"Cmp": cmp, **values}
+    columns = ", ".join(f'"{key}"' for key in values)
+    db.execute(text(f'INSERT INTO dbo."{table}" ({columns}) VALUES ({", ".join(f":{key}" for key in values)})'), values)
+    return cmp
+
+
+def _require_claim(db: Session, numero: str) -> str:
+    found = db.execute(text('SELECT TRIM("Num_Sinistre_Agence") FROM dbo."Sinistre" WHERE TRIM("Num_Sinistre_Agence") = :n'), {"n": numero.strip()}).scalar()
+    if found is None:
+        raise HTTPException(status_code=404, detail="Sinistre introuvable.")
+    return found
+
+
+def _require_step(db: Session, code: int) -> None:
+    if db.execute(text('SELECT 1 FROM dbo."TEtape_Siniste" WHERE "Code_Etape" = :c'), {"c": code}).first() is None:
+        raise HTTPException(status_code=422, detail="Étape inconnue.")
+
+
+@router.get("/{numero}/suivi")
+def get_suivi(numero: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """The file's steps (in date order) and its calls / letters (most recent first)."""
+    params = {"n": numero.strip()}
+    try:
+        etapes = db.execute(
+            text(
+                'SELECT s."Cmp", s."Code_Etape", TRIM(e."Libelle_Etape") AS "Libelle_Etape", s."Date_Etape", s."Description" '
+                'FROM dbo."Sinistre_Suivi" s LEFT JOIN dbo."TEtape_Siniste" e ON e."Code_Etape" = s."Code_Etape" '
+                'WHERE TRIM(s."Num_Sinistre_Agence") = :n ORDER BY s."Date_Etape" NULLS LAST, s."Code_Etape", s."Cmp"'
+            ),
+            params,
+        ).mappings().all()
+        appels = db.execute(
+            text('SELECT "Cmp", "Date_Appel", "Description", "Urgence" FROM dbo."Sinistre_Appel" WHERE TRIM("Num_Sinistre_Agence") = :n ORDER BY "Date_Appel" DESC, "Cmp" DESC'),
+            params,
+        ).mappings().all()
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Lecture du suivi impossible.") from exc
+    return {"etapes": [_plain(row) for row in etapes], "appels": [_plain(row) for row in appels]}
+
+
+def _write_follow_up(db: Session, action: str, run: Any) -> Any:
+    try:
+        result = run()
+        db.commit()
+        return result
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(status_code=503, detail=f"{action} impossible : {str(getattr(exc, 'orig', exc))[:250]}") from exc
+
+
+def _update_follow_up(db: Session, table: str, numero: str, cmp: int, values: dict[str, Any]) -> None:
+    assignments = ", ".join(f'"{key}" = :{key}' for key in values)
+    result = db.execute(
+        text(f'UPDATE dbo."{table}" SET {assignments} WHERE "Cmp" = :cmp_key AND TRIM("Num_Sinistre_Agence") = :numero_key'),
+        {**values, "cmp_key": cmp, "numero_key": numero.strip()},
+    )
+    if result.rowcount == 0:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="Ligne de suivi introuvable.")
+
+
+def _delete_follow_up(db: Session, table: str, numero: str, cmp: int) -> None:
+    result = db.execute(text(f'DELETE FROM dbo."{table}" WHERE "Cmp" = :c AND TRIM("Num_Sinistre_Agence") = :n'), {"c": cmp, "n": numero.strip()})
+    if result.rowcount == 0:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="Ligne de suivi introuvable.")
+
+
+def _stamp(user: dict[str, Any], kind: str) -> dict[str, Any]:
+    return {f"{kind}_User": str(user.get("sub", ""))[:20], f"{kind}_Date": datetime.now().replace(microsecond=0)}
+
+
+@router.post("/{numero}/etapes", status_code=201)
+def add_etape(numero: str, payload: EtapeIn, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, int]:
+    claim = _require_claim(db, numero)
+    _require_step(db, payload.Code_Etape)
+    values = {
+        "Num_Sinistre_Agence": claim, "Code_Etape": payload.Code_Etape, "Date_Etape": payload.Date_Etape or datetime.now().replace(microsecond=0),
+        "Description": payload.Description.strip(), **_stamp(user, "Create"),
+    }
+    return {"Cmp": _write_follow_up(db, "Enregistrement", lambda: _insert_follow_up(db, "Sinistre_Suivi", values))}
+
+
+@router.put("/{numero}/etapes/{cmp}")
+def update_etape(numero: str, cmp: int, payload: EtapeIn, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, int]:
+    _require_step(db, payload.Code_Etape)
+    values = {"Code_Etape": payload.Code_Etape, "Date_Etape": payload.Date_Etape, "Description": payload.Description.strip(), **_stamp(user, "Update")}
+    _write_follow_up(db, "Modification", lambda: _update_follow_up(db, "Sinistre_Suivi", numero, cmp, values))
+    return {"Cmp": cmp}
+
+
+@router.delete("/{numero}/etapes/{cmp}", status_code=204)
+def delete_etape(numero: str, cmp: int, db: Session = Depends(get_db)) -> None:
+    _write_follow_up(db, "Suppression", lambda: _delete_follow_up(db, "Sinistre_Suivi", numero, cmp))
+
+
+@router.post("/{numero}/appels", status_code=201)
+def add_appel(numero: str, payload: AppelIn, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, int]:
+    claim = _require_claim(db, numero)
+    values = {
+        "Num_Sinistre_Agence": claim, "Date_Appel": payload.Date_Appel, "Description": payload.Description.strip(),
+        "Urgence": payload.Urgence.strip() or "Non Urgent", **_stamp(user, "Create"),
+    }
+    return {"Cmp": _write_follow_up(db, "Enregistrement", lambda: _insert_follow_up(db, "Sinistre_Appel", values))}
+
+
+@router.put("/{numero}/appels/{cmp}")
+def update_appel(numero: str, cmp: int, payload: AppelIn, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, int]:
+    values = {"Date_Appel": payload.Date_Appel, "Description": payload.Description.strip(), "Urgence": payload.Urgence.strip() or "Non Urgent", **_stamp(user, "Update")}
+    _write_follow_up(db, "Modification", lambda: _update_follow_up(db, "Sinistre_Appel", numero, cmp, values))
+    return {"Cmp": cmp}
+
+
+@router.delete("/{numero}/appels/{cmp}", status_code=204)
+def delete_appel(numero: str, cmp: int, db: Session = Depends(get_db)) -> None:
+    _write_follow_up(db, "Suppression", lambda: _delete_follow_up(db, "Sinistre_Appel", numero, cmp))
 
 
 # ---------------------------------------------------------------------------------------------

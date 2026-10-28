@@ -22,6 +22,7 @@ from app.routers.assistant import router as assistant_router
 from app.routers.bordereaux import router as bordereaux_router
 from app.routers.records_search import router as records_search_router
 from app.routers.cheques import router as cheques_router
+from app.routers.reglements_clients import router as reglements_clients_router
 from app.routers.sync_status import router as sync_status_router
 
 app = FastAPI(title="Assurance API", version="0.1.0")
@@ -51,6 +52,7 @@ app.include_router(assistant_router)
 app.include_router(bordereaux_router)
 app.include_router(records_search_router)
 app.include_router(cheques_router)
+app.include_router(reglements_clients_router)
 app.include_router(record_updates_router)
 app.include_router(sync_status_router)
 

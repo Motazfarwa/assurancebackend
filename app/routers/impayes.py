@@ -149,3 +149,53 @@ def list_agency_unpaid(
     return {"items": items, "count": len(items), "limit": limit}
 
 
+
+
+@router.get("/acomptes")
+def list_partial_payments(
+    code_client: str = Query(default="", max_length=8),
+    nom_client: str = Query(default="", max_length=30),
+    date_debut: date | None = None,
+    date_fin: date | None = None,
+    limit: int = Query(default=2000, ge=1, le=5000),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Etat des acomptes: receipts partly paid, i.e. 0.01 < solde_quittance < montant_quittance, with what was paid
+    and the Acompte (A) / Solde (S) mark of their last client settlement (RDetRegCli)."""
+    if date_debut and date_fin and date_debut > date_fin:
+        raise HTTPException(status_code=422, detail="La date de début doit précéder la date de fin.")
+    schema = settings.db_schema
+    sql = f"""
+        SELECT TRIM(q.code_client) AS code_client, TRIM(c.nom_client) AS nom_client, TRIM(q.num_quittance) AS num_quittance,
+               TRIM(p.num_police) AS num_police, TRIM(k.nom_compagnie) AS nom_compagnie, q."Periode", q.echeance,
+               q.montant_quittance, q.montant_quittance - q.solde_quittance AS montant_regle, q.solde_quittance, q."Date_Reglement",
+               COALESCE(NULLIF(TRIM(d."Acompte_Solde"), ''), 'A') AS acompte_solde
+        FROM "{schema}"."TQuittance" q
+        LEFT JOIN "{schema}"."TClient" c ON TRIM(c.code_client) = TRIM(q.code_client)
+        LEFT JOIN LATERAL (
+            SELECT num_police, code_compagnie FROM "{schema}"."TPolice" WHERE TRIM(num_int) = TRIM(q.num_int) ORDER BY effet DESC NULLS LAST LIMIT 1
+        ) p ON TRUE
+        LEFT JOIN "{schema}"."TCompagnie" k ON k.code_compagnie = p.code_compagnie
+        LEFT JOIN LATERAL (
+            SELECT "Acompte_Solde" FROM "{schema}"."RDetRegCli" WHERE TRIM("Num_quitance") = TRIM(q.num_quittance) ORDER BY "Num_Recu" DESC NULLS LAST LIMIT 1
+        ) d ON TRUE
+        WHERE q.solde_quittance > 0.01 AND q.solde_quittance < q.montant_quittance
+          AND COALESCE(q.annule, 'N') <> 'O'
+          AND (:code = '' OR TRIM(q.code_client) = :code)
+          AND (:nom = '' OR c.nom_client ILIKE :nom_like)
+          AND (CAST(:debut AS timestamp) IS NULL OR q.echeance >= CAST(:debut AS timestamp))
+          AND (CAST(:fin AS timestamp) IS NULL OR q.echeance < CAST(:fin AS timestamp))
+        ORDER BY q.echeance DESC NULLS LAST, q.code_client
+        LIMIT :limit
+    """
+    params = {
+        "code": code_client.strip(), "nom": nom_client.strip(), "nom_like": f"%{nom_client.strip()}%", "limit": limit,
+        "debut": datetime.combine(date_debut, time.min) if date_debut else None,
+        "fin": datetime.combine(date_fin + timedelta(days=1), time.min) if date_fin else None,
+    }
+    try:
+        rows = db.execute(text(sql), params).mappings().all()
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Impossible de lire les quittances en acompte.") from exc
+    items = [serialize(row) for row in rows]
+    return {"items": items, "count": len(items), "limit": limit}

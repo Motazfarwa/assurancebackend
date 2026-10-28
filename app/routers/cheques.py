@@ -1,7 +1,8 @@
 """Gestion des chèques: cheques, bills of exchange and other payment pieces of a client, and what they are meant to settle.
 
-A piece is stored in TPiece (the same table the legacy software uses) and its split over the client's unpaid receipts in
-RPiece. Receipts and settlement tables are not modified here: a piece "en instance" only reserves amounts.
+A piece "en instance" is stored in TPiece (the same table the legacy software uses) and its split over the client's unpaid
+receipts in RPiece: it only reserves amounts. A piece "à verser" is a client settlement: it is stored in TRegCli, the receipts
+it pays in RDetRegCli, and their balance (TQuittance.solde_quittance) goes down, as the legacy software does.
 """
 import json
 import re
@@ -42,6 +43,8 @@ class ChequeIn(BaseModel):
     code_banque: str | None = Field(default=None, max_length=15)
     a_verser: bool = True
     en_instance: bool = True
+    # Agency account (TBanque) the piece is paid into, required "à verser".
+    compte_versement: str | None = Field(default=None, max_length=15)
     allocations: list[AllocationIn] = Field(default_factory=list, max_length=500)
 
 
@@ -134,6 +137,72 @@ def _store(db: Session, payload: ChequeIn, user: str, allocations: list[Allocati
         )
 
 
+def _store_reglement(db: Session, payload: ChequeIn, user: str, allocations: list[AllocationIn]) -> int:
+    """Records the piece as a client settlement (TRegCli) paying the allocated receipts (RDetRegCli, TQuittance balance)."""
+    # Settlements saved at the same time from several PCs get different numbers (locks held until the commit).
+    db.execute(text("SELECT pg_advisory_xact_lock(hashtext('dbo.TRegCli.num_reg_cli'))"))
+    numero = db.execute(text('SELECT COALESCE(MAX(num_reg_cli), 0) + 1 FROM dbo."TRegCli"')).scalar()
+    values = {
+        "numero": numero, "client": payload.code_client.strip(), "typep": payload.typep, "nump": payload.nump.strip(),
+        "montant": payload.montant, "compte": (payload.compte_versement or "").strip(), "user": user[:20],
+    }
+    db.execute(
+        text(
+            'INSERT INTO dbo."TRegCli" (num_reg_cli, date_reg_cli, code_client, type_reg_cli, num_piece, mont_reg_cli, code_banque, "Fectif", "Create_User", "Create_Date") '
+            "VALUES (:numero, CURRENT_DATE, :client, :typep, :nump, :montant, :compte, 'N', :user, now())"
+        ),
+        values,
+    )
+    if allocations:
+        db.execute(text("SELECT pg_advisory_xact_lock(hashtext('dbo.RDetRegCli.Num_Recu'))"))
+        recu = db.execute(text('SELECT COALESCE(MAX("Num_Recu"), 0) FROM dbo."RDetRegCli"')).scalar()
+    for item in allocations:
+        solde = db.execute(
+            text('SELECT COALESCE(solde_quittance, 0) FROM dbo."TQuittance" WHERE TRIM(num_quittance) = :q FOR UPDATE'), {"q": item.num_quittance.strip()}
+        ).scalar() or 0
+        left = round(float(solde) - item.montant, 3)
+        left = 0.0 if abs(left) < TOLERANCE else left
+        recu += 1
+        db.execute(
+            text(
+                'INSERT INTO dbo."RDetRegCli" ("Num_Recu", "Num_reg_cli", "Num_quitance", "Ncpt", "Montant", "Validation", "Comptabiliser", '
+                '"Acompte_Solde", "Solde_Quittance", create_user, create_date) '
+                "VALUES (:recu, :numero, :quittance, :client, :montant, 'N', 'N', :acompte, :left, :user, now())"
+            ),
+            {**values, "recu": recu, "quittance": item.num_quittance.strip(), "montant": item.montant, "acompte": "S" if left <= 0 else "A", "left": left},
+        )
+        db.execute(
+            text('UPDATE dbo."TQuittance" SET solde_quittance = :left, "Date_Reglement" = CURRENT_DATE WHERE TRIM(num_quittance) = :quittance'),
+            {"left": left, "quittance": item.num_quittance.strip()},
+        )
+    return numero
+
+
+def _check_reglement(db: Session, payload: ChequeIn) -> None:
+    """A piece "à verser": one status only, an agency account, and not a piece already settled for this client."""
+    if payload.en_instance:
+        raise HTTPException(status_code=422, detail="Choisissez un seul statut : « À verser » ou « En instance ».")
+    compte = (payload.compte_versement or "").strip()
+    if not compte:
+        raise HTTPException(status_code=422, detail="Choisissez le compte de versement de l'agence.")
+    if db.execute(text('SELECT 1 FROM dbo."TBanque" WHERE TRIM(code_banque) = :c'), {"c": compte}).first() is None:
+        raise HTTPException(status_code=422, detail=f"Compte de versement {compte} inconnu.")
+    if db.execute(
+        text('SELECT 1 FROM dbo."TRegCli" WHERE TRIM(num_piece) = :n AND TRIM(code_client) = :c LIMIT 1'),
+        {"n": payload.nump.strip(), "c": payload.code_client.strip()},
+    ).first():
+        raise HTTPException(status_code=409, detail=f"La pièce {payload.nump.strip()} est déjà enregistrée comme règlement de ce client.")
+
+
+@router.get("/comptes")
+def list_accounts(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    """Agency bank accounts (TBanque, not archived) a piece "à verser" can be paid into."""
+    rows = db.execute(
+        text('SELECT TRIM(code_banque) AS code_banque, TRIM(nom_banque) AS nom_banque FROM dbo."TBanque" WHERE COALESCE("Archive", FALSE) = FALSE ORDER BY code_banque')
+    ).mappings().all()
+    return [_plain(row) for row in rows]
+
+
 @router.get("/banques")
 def list_banks(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
     rows = db.execute(text('SELECT TRIM(code_banque) AS code_banque, TRIM(nom_banque) AS nom_banque FROM dbo."TTBanque" ORDER BY code_banque')).mappings().all()
@@ -212,14 +281,22 @@ def list_pieces(
 def create_piece(payload: ChequeIn, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     if db.execute(text('SELECT 1 FROM dbo."TPiece" WHERE TRIM(nump) = :n LIMIT 1'), {"n": payload.nump.strip()}).first():
         raise HTTPException(status_code=409, detail=f"Le numéro de pièce {payload.nump} existe déjà.")
+    if not payload.a_verser and not payload.en_instance:
+        raise HTTPException(status_code=422, detail="Le statut est obligatoire : « À verser » ou « En instance ».")
+    if payload.a_verser:
+        _check_reglement(db, payload)
     allocations = _check_allocations(db, payload)
+    numero = None
     try:
-        _store(db, payload, str(user.get("sub", "")), allocations, creating=True)
+        if payload.a_verser:
+            numero = _store_reglement(db, payload, str(user.get("sub", "")), allocations)
+        else:
+            _store(db, payload, str(user.get("sub", "")), allocations, creating=True)
         db.commit()
     except SQLAlchemyError as exc:
         db.rollback()
         raise HTTPException(status_code=503, detail=f"Enregistrement impossible : {str(getattr(exc, 'orig', exc))[:250]}") from exc
-    return {"nump": payload.nump.strip()}
+    return {"nump": payload.nump.strip(), "num_reg_cli": numero}
 
 
 @router.put("/{nump}")
@@ -232,14 +309,30 @@ def update_piece(nump: str, payload: ChequeIn, user: dict[str, Any] = Depends(re
         raise HTTPException(status_code=404, detail="Pièce introuvable.")
     if (current[0] or "N") != "N":
         raise HTTPException(status_code=409, detail="Cette pièce est déjà réglée : modification impossible.")
+    if not payload.a_verser and not payload.en_instance:
+        raise HTTPException(status_code=422, detail="Le statut est obligatoire : « À verser » ou « En instance ».")
+    if payload.a_verser:
+        _check_reglement(db, payload)
     allocations = _check_allocations(db, payload, exclude_nump=nump)
+    numero = None
     try:
-        _store(db, payload, str(user.get("sub", "")), allocations, creating=False)
+        if payload.a_verser:
+            # The piece en instance is paid in: it becomes a client settlement, its reservations are released and it stays
+            # in TPiece as settled (regle = 'O').
+            numero = _store_reglement(db, payload, str(user.get("sub", "")), allocations)
+            keys = {"nump": nump.strip(), "client": payload.code_client.strip(), "user": str(user.get("sub", ""))[:20]}
+            db.execute(text('DELETE FROM dbo."RPiece" WHERE TRIM("NumP") = :nump AND TRIM("Code_Client") = :client'), keys)
+            db.execute(
+                text('UPDATE dbo."TPiece" SET regle = \'O\', "Update_User" = :user, "Update_Date" = now() WHERE TRIM(nump) = :nump AND TRIM(code_client) = :client'),
+                keys,
+            )
+        else:
+            _store(db, payload, str(user.get("sub", "")), allocations, creating=False)
         db.commit()
     except SQLAlchemyError as exc:
         db.rollback()
         raise HTTPException(status_code=503, detail=f"Modification impossible : {str(getattr(exc, 'orig', exc))[:250]}") from exc
-    return {"nump": nump.strip()}
+    return {"nump": nump.strip(), "num_reg_cli": numero}
 
 
 @router.delete("/{nump}", status_code=204)
