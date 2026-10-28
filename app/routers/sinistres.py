@@ -13,7 +13,7 @@ from typing import Any
 import anthropic
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.auth import require_current_user
@@ -297,22 +297,22 @@ def create_sinistre(payload: dict[str, Any], user: dict[str, Any] = Depends(requ
     values["Date_Saisie"] = values["Date_Saisie"] or now
     values.update({"Date_Systeme": now, "Create_User": login, "Create_Date": now})
     chosen = values.get("Num_Sinistre_Agence")
-    for _attempt in range(3):
+    try:
+        # The table has no unique key: claims saved at the same time from several PCs are numbered one after the
+        # other (lock held until the commit), so two of them never get the same year-month-sequence number.
+        db.execute(text("SELECT pg_advisory_xact_lock(hashtext('dbo.Sinistre.Num_Sinistre_Agence'))"))
+        if chosen and db.execute(
+            text('SELECT 1 FROM dbo."Sinistre" WHERE TRIM("Num_Sinistre_Agence") = :n'), {"n": str(chosen).strip()}
+        ).first():
+            raise HTTPException(status_code=409, detail=f"Le sinistre {chosen} existe déjà.")
         values["Num_Sinistre_Agence"] = chosen or _next_number(db, values["Date_Sinistre"].date())
         columns = ", ".join(f'"{key}"' for key in values)
-        try:
-            db.execute(text(f'INSERT INTO dbo."Sinistre" ({columns}) VALUES ({", ".join(f":{key}" for key in values)})'), values)
-            db.commit()
-            return {"numero": values["Num_Sinistre_Agence"]}
-        except IntegrityError as exc:
-            db.rollback()
-            if chosen:
-                raise HTTPException(status_code=409, detail=f"Le sinistre {chosen} existe déjà.") from exc
-            # Two claims numbered at the same time: take the next number.
-        except SQLAlchemyError as exc:
-            db.rollback()
-            raise HTTPException(status_code=503, detail=f"Enregistrement impossible : {str(getattr(exc, 'orig', exc))[:250]}") from exc
-    raise HTTPException(status_code=409, detail="Numérotation du sinistre impossible, réessayez.")
+        db.execute(text(f'INSERT INTO dbo."Sinistre" ({columns}) VALUES ({", ".join(f":{key}" for key in values)})'), values)
+        db.commit()
+        return {"numero": values["Num_Sinistre_Agence"]}
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(status_code=503, detail=f"Enregistrement impossible : {str(getattr(exc, 'orig', exc))[:250]}") from exc
 
 
 @router.put("/{numero}")
