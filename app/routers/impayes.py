@@ -160,7 +160,7 @@ def list_partial_payments(
     limit: int = Query(default=2000, ge=1, le=5000),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Etat des acomptes: receipts partly paid, i.e. 0.01 < solde_quittance < montant_quittance, with what was paid
+    """Etat des acomptes: receipts of type P partly paid, i.e. 0.01 < solde_quittance < montant_quittance, with what was paid
     and the Acompte (A) / Solde (S) mark of their last client settlement (RDetRegCli)."""
     if date_debut and date_fin and date_debut > date_fin:
         raise HTTPException(status_code=422, detail="La date de début doit précéder la date de fin.")
@@ -180,7 +180,7 @@ def list_partial_payments(
             SELECT "Acompte_Solde" FROM "{schema}"."RDetRegCli" WHERE TRIM("Num_quitance") = TRIM(q.num_quittance) ORDER BY "Num_Recu" DESC NULLS LAST LIMIT 1
         ) d ON TRUE
         WHERE q.solde_quittance > 0.01 AND q.solde_quittance < q.montant_quittance
-          AND COALESCE(q.annule, 'N') <> 'O'
+          AND q.type_quittance = 'P' AND COALESCE(q.annule, 'N') <> 'O'
           AND (:code = '' OR TRIM(q.code_client) = :code)
           AND (:nom = '' OR c.nom_client ILIKE :nom_like)
           AND (CAST(:debut AS timestamp) IS NULL OR q.echeance >= CAST(:debut AS timestamp))
