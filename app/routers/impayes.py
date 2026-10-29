@@ -2,7 +2,7 @@ from datetime import date, datetime, time, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import MetaData, Table, and_, func, or_, select, text
+from sqlalchemy import MetaData, Table, and_, bindparam, func, or_, select, text
 from sqlalchemy.exc import NoSuchTableError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -199,3 +199,87 @@ def list_partial_payments(
         raise HTTPException(status_code=503, detail="Impossible de lire les quittances en acompte.") from exc
     items = [serialize(row) for row in rows]
     return {"items": items, "count": len(items), "limit": limit}
+
+
+@router.get("/etat")
+def unpaid_statement(
+    code_client: str = Query(default="", max_length=8),
+    nom_client: str = Query(default="", max_length=30),
+    piece: str = Query(default="avec", pattern="^(avec|sans)$"),
+    date_debut: date | None = None,
+    date_fin: date | None = None,
+    type_client: str = Query(default="", pattern="^(|P|S)$"),
+    code_compagnie: int | None = None,
+    mise_en_demeure: bool = False,
+    limit: int = Query(default=5000, ge=1, le=10000),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Etat des impayés, read live from TQuittance (TTempEtatImpaye is only a print buffer of the legacy software).
+    A quittance is unpaid while solde_quittance > 0; the cheques / traites still "en instance" on it are the RPiece
+    reservations of a TPiece not settled yet (regle <> 'O'). `piece=avec` keeps the quittances with such a cheque, their
+    solde being what the cheques leave (0 when they cover it); `piece=sans` the ones without, solde > 0. Ristournes (R)
+    and cancelled quittances are left out; `date_debut` / `date_fin` bound the échéance."""
+    if date_debut and date_fin and date_debut > date_fin:
+        raise HTTPException(status_code=422, detail="La date de début doit précéder la date de fin.")
+    schema = settings.db_schema
+    sql = f"""
+        WITH instance AS (
+            SELECT TRIM(r."Num_Quittance") AS num_quittance, SUM(r."Montant_Reglement") AS montant,
+                   STRING_AGG(DISTINCT TRIM(r."NumP"), ', ') AS pieces
+            FROM "{schema}"."RPiece" r
+            JOIN "{schema}"."TPiece" t ON TRIM(t.nump) = TRIM(r."NumP") AND TRIM(t.code_client) = TRIM(r."Code_Client")
+            WHERE COALESCE(t.regle, 'N') <> 'O'
+            GROUP BY 1
+        )
+        SELECT TRIM(q.code_client) AS code_client, TRIM(c.nom_client) AS nom_client, TRIM(c.adresse) AS adresse,
+               TRIM(c.ville) AS ville, c.cp, TRIM(c."Type_Client") AS type_client,
+               TRIM(q.num_quittance) AS num_quittance, TRIM(q.num_int) AS num_int, TRIM(q.tc) AS tc, TRIM(q."Periode") AS periode,
+               q.echeance, q.montant_quittance, q.solde_quittance, COALESCE(i.montant, 0) AS en_instance, i.pieces,
+               GREATEST(q.solde_quittance - COALESCE(i.montant, 0), 0) AS solde,
+               COALESCE(NULLIF(TRIM(p.risque), ''), '') AS risque, TRIM(q.observation) AS observation,
+               p.code_compagnie, TRIM(k.nom_compagnie) AS nom_compagnie
+        FROM "{schema}"."TQuittance" q
+        LEFT JOIN "{schema}"."TClient" c ON TRIM(c.code_client) = TRIM(q.code_client)
+        LEFT JOIN instance i ON i.num_quittance = TRIM(q.num_quittance)
+        LEFT JOIN LATERAL (
+            SELECT risque, code_compagnie FROM "{schema}"."TPolice" WHERE TRIM(num_int) = TRIM(q.num_int) ORDER BY effet DESC NULLS LAST LIMIT 1
+        ) p ON TRUE
+        LEFT JOIN "{schema}"."TCompagnie" k ON k.code_compagnie = p.code_compagnie
+        WHERE q.solde_quittance > 0.001 AND COALESCE(q.type_quittance, '') <> 'R' AND COALESCE(q.annule, 'N') <> 'O'
+          AND (CASE WHEN :piece = 'avec' THEN COALESCE(i.montant, 0) > 0 ELSE COALESCE(i.montant, 0) = 0 END)
+          AND (:code = '' OR TRIM(q.code_client) = :code)
+          AND (:nom = '' OR c.nom_client ILIKE :nom_like)
+          AND (:type_client = '' OR TRIM(c."Type_Client") = :type_client)
+          AND (CAST(:compagnie AS integer) IS NULL OR p.code_compagnie = CAST(:compagnie AS integer))
+          AND (NOT :mise OR q.mised = 'O' OR q.observation ILIKE '%mise en demeure%')
+          AND (CAST(:debut AS timestamp) IS NULL OR q.echeance >= CAST(:debut AS timestamp))
+          AND (CAST(:fin AS timestamp) IS NULL OR q.echeance < CAST(:fin AS timestamp))
+        ORDER BY c.nom_client, q.code_client, k.nom_compagnie, q.echeance
+        LIMIT :limit
+    """
+    params = {
+        "piece": piece, "code": code_client.strip(), "nom": nom_client.strip(), "nom_like": f"%{nom_client.strip()}%",
+        "type_client": type_client, "compagnie": code_compagnie, "mise": mise_en_demeure, "limit": limit,
+        "debut": datetime.combine(date_debut, time.min) if date_debut else None,
+        "fin": datetime.combine(date_fin + timedelta(days=1), time.min) if date_fin else None,
+    }
+    try:
+        rows = db.execute(text(sql), params).mappings().all()
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Impossible de calculer l’état des impayés.") from exc
+    items = [serialize(row) for row in rows]
+    return {"items": items, "count": len(items), "limit": limit}
+
+
+# Compagnies the agency does not work with: left out of the Etat des impayés choice.
+HIDDEN_COMPANIES = ("MAE", "EL AMANA TAKAFUL", "SALIM", "STAR", "BH ASSURANCES")
+
+
+@router.get("/etat/compagnies")
+def unpaid_statement_companies(db: Session = Depends(get_db)) -> dict[str, Any]:
+    rows = db.execute(
+        text(f'SELECT code_compagnie, TRIM(nom_compagnie) FROM "{settings.db_schema}"."TCompagnie" '
+             'WHERE UPPER(TRIM(nom_compagnie)) NOT IN :hidden ORDER BY nom_compagnie').bindparams(bindparam("hidden", expanding=True)),
+        {"hidden": list(HIDDEN_COMPANIES)},
+    ).all()
+    return {"items": [{"id": row[0], "label": row[1]} for row in rows]}
