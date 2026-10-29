@@ -213,7 +213,7 @@ def list_sinistres(
     type_sinistre: str = Query(default="", max_length=50),
     code_expert: int | None = None,
     date_min: date | None = None,
-    limit: int = Query(default=100, ge=1, le=500),
+    limit: int = Query(default=100, ge=1, le=2000),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
