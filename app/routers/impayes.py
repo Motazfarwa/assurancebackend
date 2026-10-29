@@ -215,11 +215,10 @@ def unpaid_statement(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """Etat des impayés, read live from TQuittance (TTempEtatImpaye is only a print buffer of the legacy software).
-    A quittance is unpaid while solde_quittance > 0; the cheques / traites still "en instance" on it are the RPiece
-    reservations of a TPiece not settled yet (regle <> 'O'). Only primes (type_quittance = 'P') are kept, cancelled ones
-    left out. `piece=avec` keeps those with solde_quittance = 0 still paid by such a cheque, their solde being the amount
-    en instance; `piece=sans` those with solde_quittance > 0, cheque or not, with their solde_quittance.
-    `date_debut` / `date_fin` bound the échéance."""
+    Only unpaid primes are kept (type_quittance = 'P', solde_quittance > 0), cancelled ones left out; the pièces
+    (cheques / traites) on a quittance are its RPiece rows. `piece=avec` keeps the quittances found in RPiece, their solde
+    being solde_quittance less the RPiece amounts (0 when they cover it); `piece=sans` keeps them all with their
+    solde_quittance. `date_debut` / `date_fin` bound the échéance."""
     if date_debut and date_fin and date_debut > date_fin:
         raise HTTPException(status_code=422, detail="La date de début doit précéder la date de fin.")
     schema = settings.db_schema
@@ -228,17 +227,15 @@ def unpaid_statement(
             SELECT TRIM(r."Num_Quittance") AS num_quittance, SUM(r."Montant_Reglement") AS montant,
                    STRING_AGG(DISTINCT TRIM(r."NumP"), ', ') AS pieces
             FROM "{schema}"."RPiece" r
-            JOIN "{schema}"."TPiece" t ON TRIM(t.nump) = TRIM(r."NumP") AND TRIM(t.code_client) = TRIM(r."Code_Client")
-            WHERE COALESCE(t.regle, 'N') <> 'O'
             GROUP BY 1
         ),
-        -- The quittances kept, chosen before the client / policy / company lookups (avec starts from ~50 000 paid primes).
+        -- The quittances kept, chosen before the client / policy / company lookups.
         q AS MATERIALIZED (
             SELECT q.*
             FROM "{schema}"."TQuittance" q
             LEFT JOIN instance i ON i.num_quittance = TRIM(q.num_quittance)
-            WHERE TRIM(q.type_quittance) = 'P' AND COALESCE(q.annule, 'N') <> 'O'
-              AND (CASE WHEN :piece = 'avec' THEN q.solde_quittance = 0 AND COALESCE(i.montant, 0) > 0 ELSE q.solde_quittance > 0 END)
+            WHERE TRIM(q.type_quittance) = 'P' AND q.solde_quittance > 0 AND COALESCE(q.annule, 'N') <> 'O'
+              AND (:piece = 'sans' OR i.num_quittance IS NOT NULL)
               AND (:code = '' OR TRIM(q.code_client) = :code)
               AND (NOT :mise OR q.mised = 'O' OR q.observation ILIKE '%mise en demeure%')
               AND (CAST(:debut AS timestamp) IS NULL OR q.echeance >= CAST(:debut AS timestamp))
@@ -255,7 +252,8 @@ def unpaid_statement(
                TRIM(c.ville) AS ville, c.cp, TRIM(c."Type_Client") AS type_client,
                TRIM(q.num_quittance) AS num_quittance, TRIM(q.num_int) AS num_int, TRIM(q.tc) AS tc, TRIM(q."Periode") AS periode,
                q.echeance, q.montant_quittance, q.solde_quittance, COALESCE(i.montant, 0) AS en_instance, i.pieces,
-               CASE WHEN :piece = 'avec' THEN COALESCE(i.montant, 0) ELSE q.solde_quittance END AS solde,
+               CASE WHEN :piece = 'avec' THEN GREATEST(q.solde_quittance - COALESCE(i.montant, 0), 0)
+                    ELSE q.solde_quittance END AS solde,
                COALESCE(NULLIF(TRIM(p.risque), ''), '') AS risque, TRIM(q.observation) AS observation,
                p.code_compagnie, TRIM(k.nom_compagnie) AS nom_compagnie
         FROM q
