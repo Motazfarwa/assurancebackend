@@ -216,9 +216,9 @@ def unpaid_statement(
 ) -> dict[str, Any]:
     """Etat des impayés, read live from TQuittance (TTempEtatImpaye is only a print buffer of the legacy software).
     A quittance is unpaid while solde_quittance > 0; the cheques / traites still "en instance" on it are the RPiece
-    reservations of a TPiece not settled yet (regle <> 'O'). Only primes (type_quittance = 'P') with solde_quittance > 0
-    are kept, cancelled ones left out. `piece=avec` keeps the quittances with such a cheque, their solde being what the
-    cheques leave (0 when they cover it); `piece=sans` keeps them all, cheque or not, with their solde_quittance.
+    reservations of a TPiece not settled yet (regle <> 'O'). Only primes (type_quittance = 'P') are kept, cancelled ones
+    left out. `piece=avec` keeps those with solde_quittance = 0 still paid by such a cheque, their solde being the amount
+    en instance; `piece=sans` those with solde_quittance > 0, cheque or not, with their solde_quittance.
     `date_debut` / `date_fin` bound the échéance."""
     if date_debut and date_fin and date_debut > date_fin:
         raise HTTPException(status_code=422, detail="La date de début doit précéder la date de fin.")
@@ -231,31 +231,41 @@ def unpaid_statement(
             JOIN "{schema}"."TPiece" t ON TRIM(t.nump) = TRIM(r."NumP") AND TRIM(t.code_client) = TRIM(r."Code_Client")
             WHERE COALESCE(t.regle, 'N') <> 'O'
             GROUP BY 1
+        ),
+        -- The quittances kept, chosen before the client / policy / company lookups (avec starts from ~50 000 paid primes).
+        q AS MATERIALIZED (
+            SELECT q.*
+            FROM "{schema}"."TQuittance" q
+            LEFT JOIN instance i ON i.num_quittance = TRIM(q.num_quittance)
+            WHERE TRIM(q.type_quittance) = 'P' AND COALESCE(q.annule, 'N') <> 'O'
+              AND (CASE WHEN :piece = 'avec' THEN q.solde_quittance = 0 AND COALESCE(i.montant, 0) > 0 ELSE q.solde_quittance > 0 END)
+              AND (:code = '' OR TRIM(q.code_client) = :code)
+              AND (NOT :mise OR q.mised = 'O' OR q.observation ILIKE '%mise en demeure%')
+              AND (CAST(:debut AS timestamp) IS NULL OR q.echeance >= CAST(:debut AS timestamp))
+              AND (CAST(:fin AS timestamp) IS NULL OR q.echeance < CAST(:fin AS timestamp))
+        ),
+        -- The latest version of each policy, read once (a per-row lookup on TRIM(num_int) cannot use an index).
+        pol AS (
+            SELECT DISTINCT ON (TRIM(num_int)) TRIM(num_int) AS num_int, risque, code_compagnie
+            FROM "{schema}"."TPolice"
+            WHERE TRIM(num_int) IN (SELECT TRIM(num_int) FROM q)
+            ORDER BY TRIM(num_int), effet DESC NULLS LAST
         )
         SELECT TRIM(q.code_client) AS code_client, TRIM(c.nom_client) AS nom_client, TRIM(c.adresse) AS adresse,
                TRIM(c.ville) AS ville, c.cp, TRIM(c."Type_Client") AS type_client,
                TRIM(q.num_quittance) AS num_quittance, TRIM(q.num_int) AS num_int, TRIM(q.tc) AS tc, TRIM(q."Periode") AS periode,
                q.echeance, q.montant_quittance, q.solde_quittance, COALESCE(i.montant, 0) AS en_instance, i.pieces,
-               CASE WHEN :piece = 'avec' THEN GREATEST(q.solde_quittance - COALESCE(i.montant, 0), 0)
-                    ELSE q.solde_quittance END AS solde,
+               CASE WHEN :piece = 'avec' THEN COALESCE(i.montant, 0) ELSE q.solde_quittance END AS solde,
                COALESCE(NULLIF(TRIM(p.risque), ''), '') AS risque, TRIM(q.observation) AS observation,
                p.code_compagnie, TRIM(k.nom_compagnie) AS nom_compagnie
-        FROM "{schema}"."TQuittance" q
+        FROM q
         LEFT JOIN "{schema}"."TClient" c ON TRIM(c.code_client) = TRIM(q.code_client)
         LEFT JOIN instance i ON i.num_quittance = TRIM(q.num_quittance)
-        LEFT JOIN LATERAL (
-            SELECT risque, code_compagnie FROM "{schema}"."TPolice" WHERE TRIM(num_int) = TRIM(q.num_int) ORDER BY effet DESC NULLS LAST LIMIT 1
-        ) p ON TRUE
+        LEFT JOIN pol p ON p.num_int = TRIM(q.num_int)
         LEFT JOIN "{schema}"."TCompagnie" k ON k.code_compagnie = p.code_compagnie
-        WHERE q.solde_quittance > 0 AND TRIM(q.type_quittance) = 'P' AND COALESCE(q.annule, 'N') <> 'O'
-          AND (:piece = 'sans' OR COALESCE(i.montant, 0) > 0)
-          AND (:code = '' OR TRIM(q.code_client) = :code)
-          AND (:nom = '' OR c.nom_client ILIKE :nom_like)
+        WHERE (:nom = '' OR c.nom_client ILIKE :nom_like)
           AND (:type_client = '' OR TRIM(c."Type_Client") = :type_client)
           AND (CAST(:compagnie AS integer) IS NULL OR p.code_compagnie = CAST(:compagnie AS integer))
-          AND (NOT :mise OR q.mised = 'O' OR q.observation ILIKE '%mise en demeure%')
-          AND (CAST(:debut AS timestamp) IS NULL OR q.echeance >= CAST(:debut AS timestamp))
-          AND (CAST(:fin AS timestamp) IS NULL OR q.echeance < CAST(:fin AS timestamp))
         ORDER BY c.nom_client, q.code_client, k.nom_compagnie, q.echeance
         LIMIT :limit
     """
