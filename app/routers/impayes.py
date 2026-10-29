@@ -217,8 +217,9 @@ def unpaid_statement(
     """Etat des impayés, read live from TQuittance (TTempEtatImpaye is only a print buffer of the legacy software).
     A quittance is unpaid while solde_quittance > 0; the cheques / traites still "en instance" on it are the RPiece
     reservations of a TPiece not settled yet (regle <> 'O'). `piece=avec` keeps the quittances with such a cheque, their
-    solde being what the cheques leave (0 when they cover it); `piece=sans` the ones without, solde > 0. Ristournes (R)
-    and cancelled quittances are left out; `date_debut` / `date_fin` bound the échéance."""
+    solde being what the cheques leave (0 when they cover it); `piece=sans` the ones without, solde > 0. Only the
+    quittances whose type_quittance contains P are kept (no ristournes R, no C), cancelled ones are left out;
+    `date_debut` / `date_fin` bound the échéance."""
     if date_debut and date_fin and date_debut > date_fin:
         raise HTTPException(status_code=422, detail="La date de début doit précéder la date de fin.")
     schema = settings.db_schema
@@ -245,7 +246,7 @@ def unpaid_statement(
             SELECT risque, code_compagnie FROM "{schema}"."TPolice" WHERE TRIM(num_int) = TRIM(q.num_int) ORDER BY effet DESC NULLS LAST LIMIT 1
         ) p ON TRUE
         LEFT JOIN "{schema}"."TCompagnie" k ON k.code_compagnie = p.code_compagnie
-        WHERE q.solde_quittance > 0.001 AND COALESCE(q.type_quittance, '') <> 'R' AND COALESCE(q.annule, 'N') <> 'O'
+        WHERE q.solde_quittance > 0.001 AND q.type_quittance ILIKE '%P%' AND COALESCE(q.annule, 'N') <> 'O'
           AND (CASE WHEN :piece = 'avec' THEN COALESCE(i.montant, 0) > 0 ELSE COALESCE(i.montant, 0) = 0 END)
           AND (:code = '' OR TRIM(q.code_client) = :code)
           AND (:nom = '' OR c.nom_client ILIKE :nom_like)
