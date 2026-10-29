@@ -212,7 +212,7 @@ def list_sinistres(
     code_compagnie: int | None = None,
     type_sinistre: str = Query(default="", max_length=50),
     code_expert: int | None = None,
-    mois: int | None = Query(default=None, ge=1, le=600),
+    date_min: date | None = None,
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
@@ -222,7 +222,7 @@ def list_sinistres(
     `non_regle` / `non_cloture` keep the files whose "Regle" / "Cloture" column is false (both: both false), and `date_max`
     the claims that happened on or before that day, `code_compagnie` the claims whose opposing party is insured by that
     company (Code_Compagnie_Advers1), `type_sinistre` the claims of that type, `code_expert` the claims of that expert
-    (Code_Expert1, a TPrestataire), `mois` the claims that happened in the `mois` months before `date_max` (today when not given). `counts` gives, for the same
+    (Code_Expert1, a TPrestataire), `date_min` the claims that happened on or after that day. `counts` gives, for the same
     search, date, company, type, expert and period, how many files are not settled and not closed."""
     conditions = ["TRUE"]
     params: dict[str, Any] = {"limit": limit, "offset": offset}
@@ -255,9 +255,9 @@ def list_sinistres(
     if code_expert is not None:
         conditions.append('"Code_Expert1" = :expert')
         params["expert"] = code_expert
-    if mois is not None:
-        conditions.append('"Date_Sinistre" >= CAST(:date_ref AS date) - make_interval(months => :mois)')
-        params.update({"mois": mois, "date_ref": date_max or date.today()})
+    if date_min is not None:
+        conditions.append('"Date_Sinistre" >= :date_min')
+        params["date_min"] = date_min
     if date_max is not None:
         conditions.append('"Date_Sinistre" < :date_after')
         params["date_after"] = date.fromordinal(date_max.toordinal() + 1)  # the whole day, whatever the time
