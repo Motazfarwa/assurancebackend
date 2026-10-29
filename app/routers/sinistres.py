@@ -217,7 +217,7 @@ def list_sinistres(
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Claims, most recent first; `q` searches the number, client, policy, plate and third party,
+    """Claims, most recent first; `q` searches the number, client, policy, plate, third party and expert,
     `statut` keeps the open files (en_cours), the settled ones (regle) or the closed ones (cloture),
     `non_regle` / `non_cloture` keep the files whose "Regle" / "Cloture" column is false (both: both false), and `date_max`
     the claims that happened on or before that day, `code_compagnie` the claims whose opposing party is insured by that
@@ -241,6 +241,8 @@ def list_sinistres(
             # The client name shown in the list comes from the client file when the claim does not hold it.
             'OR EXISTS (SELECT 1 FROM dbo."TClient" c WHERE TRIM(c.code_client) = TRIM(dbo."Sinistre"."Code_Client") AND c.nom_client ILIKE :q) '
             'OR "Num_Int" ILIKE :q '
+            # ... and the expert's name, from TPrestataire.
+            'OR EXISTS (SELECT 1 FROM dbo."TPrestataire" e WHERE e."Code_Prestataire" = dbo."Sinistre"."Code_Expert1" AND e."Nom_Prestataire" ILIKE :q) '
             'OR REPLACE("Num_Imat", \' \', \'\') ILIKE :plate OR "Tiers1" ILIKE :q OR "Num_Sinistre_Compagnie_Assure" ILIKE :q)'
         )
         params.update({"q": f"%{q.strip()}%", "exact": q.strip(), "plate": f"%{re.sub(r'[ ]', '', q.strip())}%"})
