@@ -52,7 +52,8 @@ LIST_COLUMNS = (
     'COALESCE(NULLIF(TRIM("Risque"), \'\'), (SELECT TRIM(p.risque) FROM dbo."TPolice" p '
     'WHERE TRIM(p.num_int) = TRIM(dbo."Sinistre"."Num_Int") ORDER BY p.effet DESC NULLS LAST LIMIT 1)) AS "Risque", '
     '"Num_Int", "Num_Imat", "Type_Sinistre", "Garantie", "Tiers1", "Code_Compagnie_Assure", "Code_Compagnie_Advers1", "Regle", "Cloture", "Montant_Reglement", '
-    '"Montant_Devis"'
+    '"Montant_Devis", "Code_Expert1", (SELECT TRIM(e."Nom_Prestataire") FROM dbo."TPrestataire" e '
+    'WHERE e."Code_Prestataire" = dbo."Sinistre"."Code_Expert1" LIMIT 1) AS nom_expert'
 )
 
 # Values the legacy software offers for these free-text columns (completed with what the table already holds).
@@ -210,6 +211,8 @@ def list_sinistres(
     date_max: date | None = None,
     code_compagnie: int | None = None,
     type_sinistre: str = Query(default="", max_length=50),
+    code_expert: int | None = None,
+    mois: int | None = Query(default=None, ge=1, le=600),
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
@@ -218,8 +221,9 @@ def list_sinistres(
     `statut` keeps the open files (en_cours), the settled ones (regle) or the closed ones (cloture),
     `non_regle` / `non_cloture` keep the files whose "Regle" / "Cloture" column is false (both: both false), and `date_max`
     the claims that happened on or before that day, `code_compagnie` the claims whose opposing party is insured by that
-    company (Code_Compagnie_Advers1), `type_sinistre` the claims of that type. `counts` gives, for the same search, date,
-    company and type, how many files are not settled and not closed."""
+    company (Code_Compagnie_Advers1), `type_sinistre` the claims of that type, `code_expert` the claims of that expert
+    (Code_Expert1, a TPrestataire), `mois` the claims that happened in the last `mois` months. `counts` gives, for the same
+    search, date, company, type, expert and period, how many files are not settled and not closed."""
     conditions = ["TRUE"]
     params: dict[str, Any] = {"limit": limit, "offset": offset}
     if statut == "en_cours":
@@ -246,10 +250,16 @@ def list_sinistres(
     if type_sinistre.strip():
         conditions.append('TRIM("Type_Sinistre") = :type_sinistre')
         params["type_sinistre"] = type_sinistre.strip()
+    if code_expert is not None:
+        conditions.append('"Code_Expert1" = :expert')
+        params["expert"] = code_expert
+    if mois is not None:
+        conditions.append('"Date_Sinistre" >= CURRENT_DATE - make_interval(months => :mois)')
+        params["mois"] = mois
     if date_max is not None:
         conditions.append('"Date_Sinistre" < :date_after')
         params["date_after"] = date.fromordinal(date_max.toordinal() + 1)  # the whole day, whatever the time
-    # The counts follow the search, the date, the company and the type, not the status filters.
+    # The counts follow the search, the date, the company, the type, the expert and the period, not the status filters.
     counted = " AND ".join(conditions)
     if non_regle:
         conditions.append('"Regle" = FALSE')
