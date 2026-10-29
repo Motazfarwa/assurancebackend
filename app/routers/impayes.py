@@ -216,9 +216,9 @@ def unpaid_statement(
 ) -> dict[str, Any]:
     """Etat des impayés, read live from TQuittance (TTempEtatImpaye is only a print buffer of the legacy software).
     A quittance is unpaid while solde_quittance > 0; the cheques / traites still "en instance" on it are the RPiece
-    reservations of a TPiece not settled yet (regle <> 'O'). `piece=avec` keeps the quittances with such a cheque, their
-    solde being what the cheques leave (0 when they cover it); `piece=sans` the ones without, solde > 0. Only the
-    quittances whose type_quittance contains P are kept (no ristournes R, no C), cancelled ones are left out;
+    reservations of a TPiece not settled yet (regle <> 'O'). Only primes (type_quittance = 'P') with solde_quittance > 0
+    are kept, cancelled ones left out. `piece=avec` keeps the quittances with such a cheque, their solde being what the
+    cheques leave (0 when they cover it); `piece=sans` keeps them all, cheque or not, with their solde_quittance.
     `date_debut` / `date_fin` bound the échéance."""
     if date_debut and date_fin and date_debut > date_fin:
         raise HTTPException(status_code=422, detail="La date de début doit précéder la date de fin.")
@@ -236,7 +236,8 @@ def unpaid_statement(
                TRIM(c.ville) AS ville, c.cp, TRIM(c."Type_Client") AS type_client,
                TRIM(q.num_quittance) AS num_quittance, TRIM(q.num_int) AS num_int, TRIM(q.tc) AS tc, TRIM(q."Periode") AS periode,
                q.echeance, q.montant_quittance, q.solde_quittance, COALESCE(i.montant, 0) AS en_instance, i.pieces,
-               GREATEST(q.solde_quittance - COALESCE(i.montant, 0), 0) AS solde,
+               CASE WHEN :piece = 'avec' THEN GREATEST(q.solde_quittance - COALESCE(i.montant, 0), 0)
+                    ELSE q.solde_quittance END AS solde,
                COALESCE(NULLIF(TRIM(p.risque), ''), '') AS risque, TRIM(q.observation) AS observation,
                p.code_compagnie, TRIM(k.nom_compagnie) AS nom_compagnie
         FROM "{schema}"."TQuittance" q
@@ -246,8 +247,8 @@ def unpaid_statement(
             SELECT risque, code_compagnie FROM "{schema}"."TPolice" WHERE TRIM(num_int) = TRIM(q.num_int) ORDER BY effet DESC NULLS LAST LIMIT 1
         ) p ON TRUE
         LEFT JOIN "{schema}"."TCompagnie" k ON k.code_compagnie = p.code_compagnie
-        WHERE q.solde_quittance > 0.001 AND q.type_quittance ILIKE '%P%' AND COALESCE(q.annule, 'N') <> 'O'
-          AND (CASE WHEN :piece = 'avec' THEN COALESCE(i.montant, 0) > 0 ELSE COALESCE(i.montant, 0) = 0 END)
+        WHERE q.solde_quittance > 0 AND TRIM(q.type_quittance) = 'P' AND COALESCE(q.annule, 'N') <> 'O'
+          AND (:piece = 'sans' OR COALESCE(i.montant, 0) > 0)
           AND (:code = '' OR TRIM(q.code_client) = :code)
           AND (:nom = '' OR c.nom_client ILIKE :nom_like)
           AND (:type_client = '' OR TRIM(c."Type_Client") = :type_client)
