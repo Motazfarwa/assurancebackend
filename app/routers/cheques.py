@@ -60,7 +60,7 @@ def _plain(row: Any) -> dict[str, Any]:
 
 
 def _open_quittances(db: Session, code_client: str, exclude_nump: str | None = None) -> list[dict[str, Any]]:
-    """Unpaid receipts of the client, with what other pieces "en instance" already reserve on them."""
+    """Unpaid premium receipts (type P, not cancelled) of the client, with what other pieces "en instance" already reserve on them."""
     rows = db.execute(
         text(
             """
@@ -77,6 +77,7 @@ def _open_quittances(db: Session, code_client: str, exclude_nump: str | None = N
             FROM dbo."TQuittance" q
             LEFT JOIN dbo."TPolice" p ON TRIM(p.num_int) = TRIM(q.num_int)
             WHERE TRIM(q.code_client) = :client AND COALESCE(q.solde_quittance, 0) > 0.0005
+              AND TRIM(q.type_quittance) = 'P' AND COALESCE(q.annule, 'N') <> 'O'
             ORDER BY q.echeance, q.num_quittance
             """
         ),
