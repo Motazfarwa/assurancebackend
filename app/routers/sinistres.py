@@ -220,7 +220,7 @@ def list_sinistres(
 ) -> dict[str, Any]:
     """Claims, most recent first; `q` searches the number, client, policy, plate, third party and expert,
     `statut` keeps the open files (en_cours), the settled ones (regle) or the closed ones (cloture),
-    `non_regle` / `non_cloture` keep the files whose "Regle" / "Cloture" column is false (both: both false), and `date_max`
+    `non_regle` / `non_cloture` keep the files whose "Regle" / "Cloture" column is false or empty (both: both), and `date_max`
     the claims that happened on or before that day, `code_compagnie` the claims whose opposing party is insured by that
     company (Code_Compagnie_Advers1), `type_sinistre` the claims of that type, `code_expert` the claims of that expert
     (Code_Expert1, a TPrestataire), `date_min` the claims that happened on or after that day. `counts` gives, for the same
@@ -271,16 +271,17 @@ def list_sinistres(
         params["date_after"] = date.fromordinal(date_max.toordinal() + 1)  # the whole day, whatever the time
     # The counts follow the search, the date, the company, the type, the expert and the period, not the status filters.
     counted = " AND ".join(conditions)
+    # A file whose "Regle" / "Cloture" is empty (26 files saved in 2023) is not settled / not closed either.
     if non_regle:
-        conditions.append('"Regle" = FALSE')
+        conditions.append('COALESCE("Regle", FALSE) = FALSE')
     if non_cloture:
-        conditions.append('"Cloture" = FALSE')
+        conditions.append('COALESCE("Cloture", FALSE) = FALSE')
     where = " AND ".join(conditions)
     try:
         counts = db.execute(
             text(
-                'SELECT COUNT(*) FILTER (WHERE "Regle" = FALSE) AS non_regle, '
-                'COUNT(*) FILTER (WHERE "Cloture" = FALSE) AS non_cloture '
+                'SELECT COUNT(*) FILTER (WHERE COALESCE("Regle", FALSE) = FALSE) AS non_regle, '
+                'COUNT(*) FILTER (WHERE COALESCE("Cloture", FALSE) = FALSE) AS non_cloture '
                 f'FROM dbo."Sinistre" WHERE {counted}'
             ),
             params,
