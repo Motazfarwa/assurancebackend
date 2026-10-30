@@ -215,10 +215,10 @@ def unpaid_statement(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """Etat des impayés, read live from TQuittance (TTempEtatImpaye is only a print buffer of the legacy software).
-    Only unpaid quittances are kept (solde_quittance > 0), cancelled ones left out; the pièces (cheques / traites) on a
-    quittance are its RPiece rows. `piece=avec` keeps the quittances found in RPiece, whatever their type, their solde
-    being solde_quittance less the RPiece amounts (0 when they cover it); `piece=sans` keeps the primes
-    (type_quittance = 'P') with their solde_quittance. `date_debut` / `date_fin` bound the échéance."""
+    Only unpaid primes are kept (type_quittance = 'P', solde_quittance > 0), cancelled ones left out; the pièces
+    (cheques / traites) on a quittance are its RPiece rows. `piece=avec` keeps the quittances found in RPiece, their solde
+    being solde_quittance less the RPiece amounts (0 when they cover it); `piece=sans` keeps them all with their
+    solde_quittance. `date_debut` / `date_fin` bound the échéance."""
     if date_debut and date_fin and date_debut > date_fin:
         raise HTTPException(status_code=422, detail="La date de début doit précéder la date de fin.")
     schema = settings.db_schema
@@ -234,8 +234,8 @@ def unpaid_statement(
             SELECT q.*
             FROM "{schema}"."TQuittance" q
             LEFT JOIN instance i ON i.num_quittance = TRIM(q.num_quittance)
-            WHERE q.solde_quittance > 0 AND COALESCE(q.annule, 'N') <> 'O'
-              AND (CASE WHEN :piece = 'avec' THEN i.num_quittance IS NOT NULL ELSE TRIM(q.type_quittance) = 'P' END)
+            WHERE TRIM(q.type_quittance) = 'P' AND q.solde_quittance > 0 AND COALESCE(q.annule, 'N') <> 'O'
+              AND (:piece = 'sans' OR i.num_quittance IS NOT NULL)
               AND (:code = '' OR TRIM(q.code_client) = :code)
               AND (NOT :mise OR q.mised = 'O' OR q.observation ILIKE '%mise en demeure%')
               AND (CAST(:debut AS timestamp) IS NULL OR q.echeance >= CAST(:debut AS timestamp))
