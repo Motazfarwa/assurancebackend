@@ -217,8 +217,9 @@ def unpaid_statement(
     """Etat des impayés, read live from TQuittance (TTempEtatImpaye is only a print buffer of the legacy software).
     Only unpaid primes are kept (type_quittance = 'P', solde_quittance > 0), cancelled ones left out; the pièces
     (cheques / traites) on a quittance are its RPiece rows. `piece=avec` keeps the quittances found in RPiece, their solde
-    being solde_quittance less the RPiece amounts (0 when they cover it); `piece=sans` keeps them all with their
-    solde_quittance. `date_debut` / `date_fin` bound the échéance."""
+    being solde_quittance less the RPiece amounts (0 when they cover it), or, when there is none, the sans pièce
+    statement; `piece=sans` keeps them all with their solde_quittance. `piece` in the answer says which one was given.
+    `date_debut` / `date_fin` bound the échéance."""
     if date_debut and date_fin and date_debut > date_fin:
         raise HTTPException(status_code=422, detail="La date de début doit précéder la date de fin.")
     schema = settings.db_schema
@@ -275,10 +276,14 @@ def unpaid_statement(
     }
     try:
         rows = db.execute(text(sql), params).mappings().all()
+        # No quittance with a pièce for these criteria: the statement falls back to the sans pièce one.
+        if not rows and piece == "avec":
+            piece = params["piece"] = "sans"
+            rows = db.execute(text(sql), params).mappings().all()
     except SQLAlchemyError as exc:
         raise HTTPException(status_code=503, detail="Impossible de calculer l’état des impayés.") from exc
     items = [serialize(row) for row in rows]
-    return {"items": items, "count": len(items), "limit": limit}
+    return {"items": items, "count": len(items), "limit": limit, "piece": piece}
 
 
 # Compagnies the agency does not work with: left out of the Etat des impayés choice.
