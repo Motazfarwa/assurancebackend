@@ -205,6 +205,7 @@ def lookups(db: Session = Depends(get_db)) -> dict[str, Any]:
 def list_sinistres(
     q: str = Query(default="", max_length=60),
     code_client: str = Query(default="", max_length=8),
+    nom_client: str = Query(default="", max_length=60),
     statut: str = Query(default="", pattern="^(|en_cours|regle|cloture)$"),
     non_regle: bool = False,
     non_cloture: bool = False,
@@ -235,6 +236,13 @@ def list_sinistres(
     if code_client.strip():
         conditions.append('TRIM("Code_Client") = :code')
         params["code"] = code_client.strip()
+    if nom_client.strip():
+        # The name held on the claim or, when it has none, the one of the client file.
+        conditions.append(
+            '(nom_client ILIKE :nom OR EXISTS (SELECT 1 FROM dbo."TClient" c '
+            'WHERE TRIM(c.code_client) = TRIM(dbo."Sinistre"."Code_Client") AND c.nom_client ILIKE :nom))'
+        )
+        params["nom"] = f"%{nom_client.strip()}%"
     if q.strip():
         conditions.append(
             '("Num_Sinistre_Agence" ILIKE :q OR TRIM("Code_Client") = :exact OR nom_client ILIKE :q '

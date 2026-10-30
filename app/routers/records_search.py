@@ -58,11 +58,20 @@ def search_receipts(
     num_int: str | None = Query(default=None, max_length=15),
     num_quittance: str | None = Query(default=None, max_length=15),
     date_saisie: date | None = None,
-    limit: int = Query(default=200, ge=1, le=500),
+    # Échéance between date_min and date_max (both days included).
+    date_min: date | None = None,
+    date_max: date | None = None,
+    limit: int = Query(default=200, ge=1, le=2000),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     conditions = ["TRUE"]
     params: dict[str, Any] = {"limit": limit}
+    if date_min:
+        conditions.append("q.echeance >= :date_min")
+        params["date_min"] = date_min
+    if date_max:
+        conditions.append("q.echeance < :date_after")
+        params["date_after"] = date_max + timedelta(days=1)
     if date_saisie:
         conditions.append("q.date_saisie >= :date_saisie AND q.date_saisie < :date_saisie_next")
         params["date_saisie"] = date_saisie
