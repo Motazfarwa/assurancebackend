@@ -162,11 +162,18 @@ def _find_policy(db: Session, numero: str | None = None, immat: str | None = Non
     return policy
 
 
-def _company_code(db: Session, name: str | None) -> int | None:
+# The insured's company is coded in TCompagnie, the opposing one in TCompagnie_Advers: the two numberings differ.
+COMPANY_TABLES = {
+    "assure": 'SELECT code_compagnie, nom_compagnie FROM dbo."TCompagnie"',
+    "advers": 'SELECT "Code_Compagnie_Advers", "Nom_Compagnie_Advers" FROM dbo."TCompagnie_Advers"',
+}
+
+
+def _company_code(db: Session, name: str | None, table: str = "assure") -> int | None:
     wanted = _ascii(name or "").strip()
     if len(wanted) < 2:
         return None
-    companies = [(row[0], _ascii(row[1] or "").strip()) for row in db.execute(text('SELECT code_compagnie, nom_compagnie FROM dbo."TCompagnie"')).all()]
+    companies = [(row[0], _ascii(row[1] or "").strip()) for row in db.execute(text(COMPANY_TABLES[table])).all()]
     for code, company in sorted(companies, key=lambda item: -len(item[1])):
         if company and (re.search(rf"\b{re.escape(company)}\b", wanted) or wanted in company):
             return code
@@ -189,6 +196,10 @@ def lookups(db: Session = Depends(get_db)) -> dict[str, Any]:
         "types_sinistre": [{"id": r[0].strip(), "label": r[0].strip(), "recours": r[1] == "O"} for r in rows('SELECT "TypeSin", "Reco" FROM dbo."TType_Sinistre"')],
         "branches": [{"id": r[0], "label": r[1].strip()} for r in rows('SELECT "Code_Type_Branche", "Libelle_Type_Branche" FROM dbo."TType_Branche" ORDER BY 1')],
         "compagnies": [{"id": r[0], "label": r[1].strip()} for r in rows('SELECT code_compagnie, nom_compagnie FROM dbo."TCompagnie" ORDER BY nom_compagnie')],
+        "compagnies_adverses": [
+            {"id": r[0], "label": r[1].strip()}
+            for r in rows('SELECT "Code_Compagnie_Advers", "Nom_Compagnie_Advers" FROM dbo."TCompagnie_Advers" ORDER BY "Nom_Compagnie_Advers"')
+        ],
         "experts": [{"id": r[0], "label": r[1].strip()} for r in rows('SELECT "Code_Prestataire", "Nom_Prestataire" FROM dbo."TPrestataire" WHERE "Code_Famille" = 1 ORDER BY "Nom_Prestataire"')],
         "garages": [{"id": r[0].strip(), "label": r[1].strip()} for r in rows('SELECT "Code_Garage", "Nom_Garage" FROM dbo."TGarage" ORDER BY "Nom_Garage"')],
         "garanties": merge(GARANTIES, used_garanties),
@@ -662,7 +673,7 @@ def _suggest(db: Session, fields: dict[str, Any]) -> tuple[dict[str, Any], dict[
         "Degats": (value(f"{ours}_degats") or "")[:50] or None,
         "Code_Compagnie_Assure": _company_code(db, value(f"{ours}_compagnie")),
         "Tiers1": (value(f"{other}_nom_assure") or value(f"{other}_conducteur") or "")[:50] or None,
-        "Code_Compagnie_Advers1": _company_code(db, value(f"{other}_compagnie")),
+        "Code_Compagnie_Advers1": _company_code(db, value(f"{other}_compagnie"), "advers"),
         "Num_Int1": (re.sub(r"\D", "", value(f"{other}_num_police") or "") or None),
         "Num_Imat1": (value(f"{other}_immatriculation") or "")[:12] or None,
         "Num_Sinistre_Compagnie_Assure": (value("num_sinistre_compagnie") or "")[:20] or None,
