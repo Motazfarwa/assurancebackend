@@ -288,7 +288,7 @@ def list_sinistres(
         ).mappings().first()
         total = db.execute(text(f'SELECT COUNT(*) FROM dbo."Sinistre" WHERE {where}'), params).scalar()
         rows = db.execute(
-            text(f'SELECT {LIST_COLUMNS} FROM dbo."Sinistre" WHERE {where} ORDER BY "Date_Saisie" DESC NULLS LAST, "Num_Sinistre_Agence" DESC LIMIT :limit OFFSET :offset'),
+            text(f'SELECT {LIST_COLUMNS} FROM dbo."Sinistre" WHERE {where} ORDER BY LENGTH(TRIM("Num_Sinistre_Agence")), TRIM("Num_Sinistre_Agence") LIMIT :limit OFFSET :offset'),
             params,
         ).mappings().all()
     except SQLAlchemyError as exc:
