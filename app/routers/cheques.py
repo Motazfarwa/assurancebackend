@@ -108,7 +108,8 @@ def _store(db: Session, payload: ChequeIn, user: str, allocations: list[Allocati
     values = {
         "nump": payload.nump.strip(), "client": payload.code_client.strip(), "datep": payload.datep or date.today(),
         "montant": payload.montant, "typep": payload.typep, "banque": (payload.code_banque or "").strip() or None,
-        "verser": "N" if payload.a_verser else "O", "regle": "N" if payload.en_instance else "O", "user": user[:20],
+        # As in the legacy software, a piece en instance is not paid into the bank yet: verser = 'N'.
+        "verser": "N" if payload.en_instance else "O", "regle": "N" if payload.en_instance else "O", "user": user[:20],
     }
     if creating:
         db.execute(
@@ -175,6 +176,19 @@ def _store_reglement(db: Session, payload: ChequeIn, user: str, allocations: lis
             text('UPDATE dbo."TQuittance" SET solde_quittance = :left, "Date_Reglement" = CURRENT_DATE WHERE TRIM(num_quittance) = :quittance'),
             {"left": left, "quittance": item.num_quittance.strip()},
         )
+    return numero
+
+
+def _pay_in(db: Session, payload: ChequeIn, nump: str, user: str, allocations: list[AllocationIn]) -> int:
+    """The piece en instance is paid into the agency account: it becomes a client settlement, its reservations are
+    released and it stays in TPiece as paid in and settled (verser = regle = 'O')."""
+    numero = _store_reglement(db, payload, user, allocations)
+    keys = {"nump": nump.strip(), "client": payload.code_client.strip(), "user": user[:20]}
+    db.execute(text('DELETE FROM dbo."RPiece" WHERE TRIM("NumP") = :nump AND TRIM("Code_Client") = :client'), keys)
+    db.execute(
+        text('UPDATE dbo."TPiece" SET verser = \'O\', regle = \'O\', "Update_User" = :user, "Update_Date" = now() WHERE TRIM(nump) = :nump AND TRIM(code_client) = :client'),
+        keys,
+    )
     return numero
 
 
@@ -277,6 +291,65 @@ def list_pieces(
     return [_plain(row) for row in rows]
 
 
+@router.get("/instance")
+def list_pieces_to_pay_in(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    """Chèques et traites en instance: the pieces not paid into the bank yet (verser = 'N') nor settled, by échéance."""
+    rows = db.execute(
+        text(
+            'SELECT TRIM(p.nump) AS nump, p.datep, p.dates, p.montant, p.typep, TRIM(p.code_client) AS code_client, '
+            'TRIM(c.nom_client) AS nom_client, TRIM(b.nom_banque) AS nom_banque '
+            'FROM dbo."TPiece" p LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(p.code_client) '
+            'LEFT JOIN dbo."TTBanque" b ON TRIM(b.code_banque) = TRIM(p.code_banque) '
+            "WHERE COALESCE(p.verser, 'N') = 'N' AND COALESCE(p.regle, 'N') = 'N' "
+            "ORDER BY p.datep NULLS LAST, p.nump LIMIT 2000"
+        )
+    ).mappings().all()
+    return [_plain(row) for row in rows]
+
+
+class VersementIn(BaseModel):
+    # In the body, not the path: piece numbers may hold a "/" (e.g. BT9168333/2).
+    nump: str = Field(min_length=1, max_length=20)
+    code_client: str = Field(min_length=1, max_length=8)
+    compte_versement: str = Field(min_length=1, max_length=15)
+
+
+@router.post("/verser")
+def pay_in_piece(payload: VersementIn, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Pays a piece en instance into an agency account (TBanque), the quittances it was reserved for being settled."""
+    nump = payload.nump
+    piece = db.execute(
+        text(
+            'SELECT TRIM(nump) AS nump, typep, datep, montant, TRIM(code_banque) AS code_banque, verser, regle '
+            'FROM dbo."TPiece" WHERE TRIM(nump) = :n AND TRIM(code_client) = :c'
+        ),
+        {"n": nump.strip(), "c": payload.code_client.strip()},
+    ).mappings().first()
+    if piece is None:
+        raise HTTPException(status_code=404, detail="Pièce introuvable.")
+    if (piece["verser"] or "N") != "N" or (piece["regle"] or "N") != "N":
+        raise HTTPException(status_code=409, detail=f"La pièce {piece['nump']} est déjà versée.")
+    allocations = db.execute(
+        text('SELECT TRIM("Num_Quittance") AS num_quittance, "Montant_Reglement" AS montant FROM dbo."RPiece" WHERE TRIM("NumP") = :n AND TRIM("Code_Client") = :c'),
+        {"n": nump.strip(), "c": payload.code_client.strip()},
+    ).mappings().all()
+    cheque = ChequeIn(
+        code_client=payload.code_client, nump=piece["nump"], typep=piece["typep"] if piece["typep"] in TYPE_NAMES else "C",
+        datep=piece["datep"].date() if piece["datep"] else None, montant=piece["montant"], code_banque=piece["code_banque"],
+        a_verser=True, en_instance=False, compte_versement=payload.compte_versement,
+        allocations=[AllocationIn(num_quittance=row["num_quittance"], montant=max(float(row["montant"] or 0), 0)) for row in allocations],
+    )
+    _check_reglement(db, cheque)
+    checked = _check_allocations(db, cheque, exclude_nump=nump)
+    try:
+        numero = _pay_in(db, cheque, nump, str(user.get("sub", "")), checked)
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(status_code=503, detail=f"Versement impossible : {str(getattr(exc, 'orig', exc))[:250]}") from exc
+    return {"nump": piece["nump"], "num_reg_cli": numero, "compte_versement": payload.compte_versement.strip()}
+
+
 @router.post("", status_code=201)
 def create_piece(payload: ChequeIn, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     if db.execute(text('SELECT 1 FROM dbo."TPiece" WHERE TRIM(nump) = :n LIMIT 1'), {"n": payload.nump.strip()}).first():
@@ -317,15 +390,7 @@ def update_piece(nump: str, payload: ChequeIn, user: dict[str, Any] = Depends(re
     numero = None
     try:
         if payload.a_verser:
-            # The piece en instance is paid in: it becomes a client settlement, its reservations are released and it stays
-            # in TPiece as settled (regle = 'O').
-            numero = _store_reglement(db, payload, str(user.get("sub", "")), allocations)
-            keys = {"nump": nump.strip(), "client": payload.code_client.strip(), "user": str(user.get("sub", ""))[:20]}
-            db.execute(text('DELETE FROM dbo."RPiece" WHERE TRIM("NumP") = :nump AND TRIM("Code_Client") = :client'), keys)
-            db.execute(
-                text('UPDATE dbo."TPiece" SET regle = \'O\', "Update_User" = :user, "Update_Date" = now() WHERE TRIM(nump) = :nump AND TRIM(code_client) = :client'),
-                keys,
-            )
+            numero = _pay_in(db, payload, nump, str(user.get("sub", "")), allocations)
         else:
             _store(db, payload, str(user.get("sub", "")), allocations, creating=False)
         db.commit()
