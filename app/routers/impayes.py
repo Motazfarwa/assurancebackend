@@ -216,9 +216,9 @@ def unpaid_statement(
 ) -> dict[str, Any]:
     """Etat des impayés, read live from TQuittance (TTempEtatImpaye is only a print buffer of the legacy software).
     Only unpaid primes are kept (type_quittance = 'P', solde_quittance > 0), cancelled ones left out; the pièces
-    (cheques / traites) on a quittance are its RPiece rows. Both statements list the same quittances: `piece=sans` with
-    their solde_quittance, `piece=avec` with solde_quittance less their RPiece amounts (negative when the pièces exceed
-    it). `date_debut` / `date_fin` bound the échéance."""
+    (cheques / traites) en instance on a quittance are its RPiece rows whose TPiece is not settled yet (regle <> 'O').
+    Both statements list the same quittances: `piece=sans` with their solde_quittance, `piece=avec` with
+    solde_quittance less the pièces en instance. `date_debut` / `date_fin` bound the échéance."""
     if date_debut and date_fin and date_debut > date_fin:
         raise HTTPException(status_code=422, detail="La date de début doit précéder la date de fin.")
     schema = settings.db_schema
@@ -227,6 +227,9 @@ def unpaid_statement(
             SELECT TRIM(r."Num_Quittance") AS num_quittance, SUM(r."Montant_Reglement") AS montant,
                    STRING_AGG(DISTINCT TRIM(r."NumP"), ', ') AS pieces
             FROM "{schema}"."RPiece" r
+            -- A cashed pièce (regle = 'O') has already lowered solde_quittance: only the ones en instance are subtracted.
+            JOIN "{schema}"."TPiece" t ON TRIM(t.nump) = TRIM(r."NumP") AND TRIM(t.code_client) = TRIM(r."Code_Client")
+            WHERE COALESCE(t.regle, 'N') <> 'O'
             GROUP BY 1
         ),
         -- The quittances kept, chosen before the client / policy / company lookups.
@@ -261,7 +264,8 @@ def unpaid_statement(
         WHERE (:nom = '' OR c.nom_client ILIKE :nom_like)
           AND (:type_client = '' OR TRIM(c."Type_Client") = :type_client)
           AND (CAST(:compagnie AS integer) IS NULL OR p.code_compagnie = CAST(:compagnie AS integer))
-        ORDER BY c.nom_client, q.code_client, k.nom_compagnie, q.echeance
+        -- Clients by code, ascending as numbers (the codes are text: shorter first, then alphabetical).
+        ORDER BY LENGTH(TRIM(q.code_client)), TRIM(q.code_client), k.nom_compagnie, q.echeance
         LIMIT :limit
     """
     params = {
