@@ -211,6 +211,7 @@ def unpaid_statement(
     type_client: str = Query(default="", pattern="^(|P|S)$"),
     code_compagnie: int | None = None,
     mise_en_demeure: bool = False,
+    automobile: bool = False,
     limit: int = Query(default=5000, ge=1, le=10000),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
@@ -218,7 +219,8 @@ def unpaid_statement(
     Only unpaid primes are kept (type_quittance = 'P', solde_quittance > 0), cancelled ones left out; the pièces
     (cheques / traites) en instance on a quittance are its RPiece rows whose TPiece is not settled yet (regle <> 'O').
     Both statements list the same quittances: `piece=sans` with their solde_quittance, `piece=avec` with
-    solde_quittance less the pièces en instance. `date_debut` / `date_fin` bound the échéance."""
+    solde_quittance less the pièces en instance. `date_debut` / `date_fin` bound the échéance; `automobile` keeps only
+    the policies of a motor branch (TBranche "Automobile" = 'O' or the motor tariff, Nature_Tarif = 'A')."""
     if date_debut and date_fin and date_debut > date_fin:
         raise HTTPException(status_code=422, detail="La date de début doit précéder la date de fin.")
     schema = settings.db_schema
@@ -244,7 +246,7 @@ def unpaid_statement(
         ),
         -- The latest version of each policy, read once (a per-row lookup on TRIM(num_int) cannot use an index).
         pol AS (
-            SELECT DISTINCT ON (TRIM(num_int)) TRIM(num_int) AS num_int, risque, code_compagnie
+            SELECT DISTINCT ON (TRIM(num_int)) TRIM(num_int) AS num_int, risque, code_compagnie, TRIM(code_branche) AS code_branche
             FROM "{schema}"."TPolice"
             WHERE TRIM(num_int) IN (SELECT TRIM(num_int) FROM q)
             ORDER BY TRIM(num_int), effet DESC NULLS LAST
@@ -261,16 +263,18 @@ def unpaid_statement(
         LEFT JOIN instance i ON i.num_quittance = TRIM(q.num_quittance)
         LEFT JOIN pol p ON p.num_int = TRIM(q.num_int)
         LEFT JOIN "{schema}"."TCompagnie" k ON k.code_compagnie = p.code_compagnie
+        LEFT JOIN "{schema}"."TBranche" b ON b.code_compagnie = p.code_compagnie AND TRIM(b.code_branche) = p.code_branche
         WHERE (:nom = '' OR c.nom_client ILIKE :nom_like)
           AND (:type_client = '' OR TRIM(c."Type_Client") = :type_client)
           AND (CAST(:compagnie AS integer) IS NULL OR p.code_compagnie = CAST(:compagnie AS integer))
+          AND (NOT :auto OR TRIM(b."Automobile") = 'O' OR TRIM(b."Nature_Tarif") = 'A')
         -- Clients by code, ascending as numbers (the codes are text: shorter first, then alphabetical).
         ORDER BY LENGTH(TRIM(q.code_client)), TRIM(q.code_client), k.nom_compagnie, q.echeance
         LIMIT :limit
     """
     params = {
         "piece": piece, "code": code_client.strip(), "nom": nom_client.strip(), "nom_like": f"%{nom_client.strip()}%",
-        "type_client": type_client, "compagnie": code_compagnie, "mise": mise_en_demeure, "limit": limit,
+        "type_client": type_client, "compagnie": code_compagnie, "mise": mise_en_demeure, "auto": automobile, "limit": limit,
         "debut": datetime.combine(date_debut, time.min) if date_debut else None,
         "fin": datetime.combine(date_fin + timedelta(days=1), time.min) if date_fin else None,
     }
