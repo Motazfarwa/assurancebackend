@@ -13,11 +13,11 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.auth import require_current_user
+from app.auth import require_admin
 from app.database import get_db
 
 
-router = APIRouter(prefix="/api/frais-generaux", tags=["Frais généraux"], dependencies=[Depends(require_current_user)])
+router = APIRouter(prefix="/api/frais-generaux", tags=["Frais généraux"], dependencies=[Depends(require_admin)])
 
 NATURES = {"D": "Frais Généraux (W.J)", "F": "Frais Généraux (M.J)"}
 MODES = {"C": "Chèque", "V": "Virement", "E": "Espèces", "T": "Traite"}
