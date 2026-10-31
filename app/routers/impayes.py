@@ -286,7 +286,7 @@ def unpaid_statement(
 
 
 # Compagnies the agency does not work with: left out of the Etat des impayés choice.
-HIDDEN_COMPANIES = ("MAE", "EL AMANA TAKAFUL", "SALIM", "STAR", "BH ASSURANCES")
+HIDDEN_COMPANIES = ("MAE", "EL AMANA TAKAFUL", "SALIM", "STAR")
 
 
 @router.get("/etat/compagnies")
