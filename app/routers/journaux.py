@@ -44,6 +44,10 @@ def _fail(exc: SQLAlchemyError) -> HTTPException:
     return HTTPException(status_code=503, detail=f"Base de données indisponible : {exc.__class__.__name__}.")
 
 
+# Companies the agency keeps no journal or feuille de caisse for.
+EXCLUDED_COMPANIES = ["STAR", "SALIM", "MAE", "EL AMANA TAKAFUL", "BH ASSURANCES", "EUROP ASSISTANCE"]
+
+
 @router.get("/compagnies")
 def companies(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
     """The companies, with the agent code and address printed on the journals."""
@@ -51,8 +55,10 @@ def companies(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
         rows = db.execute(
             text(
                 'SELECT code_compagnie, TRIM(nom_compagnie) AS nom_compagnie, TRIM("Code_Agent") AS code_agent, '
-                'TRIM("Adresse_Compagnie") AS adresse, TRIM("Ville_Compagnie") AS ville FROM dbo."TCompagnie" ORDER BY nom_compagnie'
-            )
+                'TRIM("Adresse_Compagnie") AS adresse, TRIM("Ville_Compagnie") AS ville FROM dbo."TCompagnie" '
+                "WHERE UPPER(TRIM(nom_compagnie)) <> ALL(:excluded) ORDER BY nom_compagnie"
+            ),
+            {"excluded": EXCLUDED_COMPANIES},
         ).mappings().all()
     except SQLAlchemyError as exc:
         raise _fail(exc) from exc
