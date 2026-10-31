@@ -270,3 +270,58 @@ def post_expenses(payload: ComptabiliserDepenses, db: Session = Depends(get_db))
         db.rollback()
         raise _fail(exc) from exc
     return {"comptabilisees": len(ids)}
+
+
+# ---------------------------------------------------------------------------------------------
+# Etat des moins perçus & trop perçus
+# ---------------------------------------------------------------------------------------------
+# Moins perçu: the small rest of a receipt the agency writes off, a client settlement of type 'R'.
+# Trop perçu: what a client paid over the receipts, put on the placeholder receipt 9999999999.
+OVERPAID_RECEIPT = "9999999999"
+
+UNDERPAID_SQL = """
+WITH pol AS (
+    SELECT DISTINCT ON (TRIM(num_int)) TRIM(num_int) AS num_int, TRIM(num_police) AS num_police
+    FROM dbo."TPolice" ORDER BY TRIM(num_int), num_police
+)
+SELECT r.date_reg_cli AS date_mvt, TRIM(r.code_client) AS code_client, TRIM(c.nom_client) AS nom_client,
+       pol.num_police, TRIM(d."Num_quitance") AS num_quittance, q.echeance,
+       TRIM(q.tc) || COALESCE(SPLIT_PART(TRIM(q."Periode"), '/', 1) || '-' || SPLIT_PART(TRIM(q."Periode"), '/', 2), '') AS tc,
+       TRIM(r.code_banque) AS banque, d."Montant" AS montant
+FROM dbo."TRegCli" r
+JOIN dbo."RDetRegCli" d ON d."Num_reg_cli" = r.num_reg_cli
+LEFT JOIN dbo."TQuittance" q ON q.num_quittance = d."Num_quitance"
+LEFT JOIN pol ON pol.num_int = TRIM(q.num_int)
+LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(r.code_client)
+WHERE TRIM(r.type_reg_cli) = 'R' AND r.date_reg_cli >= :debut AND r.date_reg_cli < :fin
+ORDER BY r.date_reg_cli, r.num_reg_cli
+"""
+
+OVERPAID_SQL = """
+SELECT r.date_reg_cli AS date_mvt, TRIM(r.code_client) AS code_client, TRIM(c.nom_client) AS nom_client,
+       TRIM(r.code_banque) AS banque, d."Montant" AS montant
+FROM dbo."TRegCli" r
+JOIN dbo."RDetRegCli" d ON d."Num_reg_cli" = r.num_reg_cli
+LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(r.code_client)
+WHERE TRIM(d."Num_quitance") = :overpaid AND r.date_reg_cli >= :debut AND r.date_reg_cli < :fin
+ORDER BY TRIM(r.code_client), r.date_reg_cli
+"""
+
+
+@router.get("/percus")
+def received_gaps(
+    debut: date,
+    fin: date,
+    type: str = Query("moins", pattern="^(moins|trop)$"),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Moins perçus (written-off rests) or trop perçus (overpayments) of the client settlements dated debut..fin."""
+    if fin < debut:
+        raise HTTPException(status_code=422, detail="La date de fin précède la date de début.")
+    params = {"debut": debut, "fin": fin + timedelta(days=1), "overpaid": OVERPAID_RECEIPT}
+    try:
+        rows = db.execute(text(UNDERPAID_SQL if type == "moins" else OVERPAID_SQL), params).mappings().all()
+    except SQLAlchemyError as exc:
+        raise _fail(exc) from exc
+    items = [_plain(row) for row in rows]
+    return {"items": items, "total": round(sum(float(row["montant"] or 0) for row in items), 3)}
