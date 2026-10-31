@@ -40,8 +40,24 @@ INT_COLUMNS = {
 BOOL_COLUMNS = {"IDA", "FTUSA", "Regle", "CXP", "Cloture", "Prescription"}
 DATE_COLUMNS = {"Date_Saisie", "Date_Sinistre", "Date_FTUSA", "Date_Reglement", "Date_CXP", "Date_Cloture", "Date_Prescription"}
 FLOAT_COLUMNS = {
-    "Montant_Devis", "Montant_Facture", "Montant_Reglement", "Montant_Rapport", "mont_cie", "solde", "MTVA_Devis", "MTVA_Facture", "MTVA_Rapport",
+    "Montant_Devis", "Montant_Facture", "Montant_Reglement", "Montant_Rapport", "Montant_Quittance", "mont_cie", "solde",
+    "MTVA_Devis", "MTVA_Facture", "MTVA_Rapport",
 }
+_quittance_column_ready = False
+
+
+def _ensure_quittance_column(db: Session) -> None:
+    """Adds "Montant_Quittance" (amount of the claim's quittance) when the legacy table does not have it yet."""
+    global _quittance_column_ready
+    if _quittance_column_ready:
+        return
+    try:
+        db.execute(text('ALTER TABLE dbo."Sinistre" ADD COLUMN IF NOT EXISTS "Montant_Quittance" double precision DEFAULT 0'))
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        return
+    _quittance_column_ready = True
 EDITABLE = set(TEXT_COLUMNS) | INT_COLUMNS | BOOL_COLUMNS | DATE_COLUMNS | FLOAT_COLUMNS
 
 # The client name and the risk, when the claim does not hold them, come from the client file and the policy.
@@ -326,6 +342,7 @@ def policy_for_claim(numero: str = Query(default="", max_length=20), immat: str 
 
 @router.get("/{numero}")
 def get_sinistre(numero: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    _ensure_quittance_column(db)
     row = db.execute(text('SELECT * FROM dbo."Sinistre" WHERE TRIM("Num_Sinistre_Agence") = :n'), {"n": numero.strip()}).mappings().first()
     if row is None:
         raise HTTPException(status_code=404, detail="Sinistre introuvable.")
@@ -334,6 +351,7 @@ def get_sinistre(numero: str, db: Session = Depends(get_db)) -> dict[str, Any]:
 
 @router.post("", status_code=201)
 def create_sinistre(payload: dict[str, Any], user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    _ensure_quittance_column(db)
     values = _clean_payload(payload)
     if not values.get("Date_Sinistre"):
         raise HTTPException(status_code=422, detail="La date du sinistre est obligatoire.")
@@ -369,6 +387,7 @@ def create_sinistre(payload: dict[str, Any], user: dict[str, Any] = Depends(requ
 
 @router.put("/{numero}")
 def update_sinistre(numero: str, payload: dict[str, Any], user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    _ensure_quittance_column(db)
     values = _clean_payload(payload)
     values.pop("Num_Sinistre_Agence", None)
     if "Date_Sinistre" in values and not values["Date_Sinistre"]:
