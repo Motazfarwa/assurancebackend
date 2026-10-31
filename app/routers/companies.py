@@ -1,7 +1,7 @@
 ﻿from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Response
-from sqlalchemy import MetaData, Table, select
+from sqlalchemy import MetaData, Table, func, select
 from sqlalchemy.exc import IntegrityError, NoSuchTableError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -46,6 +46,40 @@ def list_companies(db: Session = Depends(get_db)) -> dict[str, Any]:
     companies = table(db, settings.db_company_table)
     rows = db.execute(select(companies).order_by(companies.c[COMPANY_KEY])).mappings().all()
     return {"items": [row_dict(row) for row in rows]}
+
+
+@router.post("", status_code=201)
+def create_company(values: dict[str, Any], db: Session = Depends(get_db)) -> dict[str, Any]:
+    """A new company: its code is the one given, or the next free one."""
+    companies = table(db, settings.db_company_table)
+    name = str(values.get("nom_compagnie") or "").strip().upper()
+    if not name:
+        raise HTTPException(status_code=422, detail="Le libellé de la compagnie est obligatoire.")
+    if db.execute(select(companies.c[COMPANY_KEY]).where(func.upper(func.trim(companies.c.nom_compagnie)) == name)).first():
+        raise HTTPException(status_code=409, detail=f"La compagnie {name} existe déjà.")
+    code = values.get(COMPANY_KEY)
+    if code in (None, ""):
+        code = (db.execute(select(func.max(companies.c[COMPANY_KEY]))).scalar() or 0) + 1
+    try:
+        code = int(code)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="Le code compagnie doit être un nombre.") from exc
+    if not 0 < code < 32768:
+        raise HTTPException(status_code=422, detail="Le code compagnie doit être compris entre 1 et 32767.")
+    if db.execute(select(companies.c[COMPANY_KEY]).where(companies.c[COMPANY_KEY] == code)).first():
+        raise HTTPException(status_code=409, detail=f"Le code compagnie {code} est déjà utilisé.")
+    row = {key: value for key, value in values.items() if key in COMPANY_COLUMNS and key in companies.c}
+    row.update({COMPANY_KEY: code, "nom_compagnie": name})
+    try:
+        db.execute(companies.insert().values(**row))
+        db.commit()
+        return row_dict(db.execute(select(companies).where(companies.c[COMPANY_KEY] == code)).mappings().one())
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Ajout impossible : une valeur ne respecte pas les contraintes de la base.") from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(status_code=503, detail="Erreur lors de l'ajout de la compagnie.") from exc
 
 
 @router.put("/{company_code}")
