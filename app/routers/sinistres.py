@@ -349,9 +349,53 @@ def get_sinistre(numero: str, db: Session = Depends(get_db)) -> dict[str, Any]:
     return _plain(row)
 
 
+class ReglementIn(BaseModel):
+    """The settlement entered when "Réglé" is ticked: stored in TRegCli together with the claim."""
+    num_piece: str = Field(min_length=1, max_length=20)
+    date_reglement: date
+    code_banque: str = Field(min_length=1, max_length=15)
+
+
+def _settlement(payload: dict[str, Any]) -> ReglementIn | None:
+    raw = payload.pop("reglement", None)
+    if not raw:
+        return None
+    try:
+        return ReglementIn(**raw)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="Règlement : renseignez le N° pièce, la date de règlement et le compte banque.") from exc
+
+
+def _store_settlement(db: Session, reglement: ReglementIn, values: dict[str, Any], login: str) -> None:
+    """The claim's settlement as a client settlement (dbo."TRegCli"): the claim's client, the amount settled, the piece,
+    its date and the agency account (TBanque) it was paid into."""
+    client = (values.get("Code_Client") or "").strip()
+    montant = values.get("Montant_Reglement") or 0
+    piece, compte = reglement.num_piece.strip(), reglement.code_banque.strip()
+    if not client:
+        raise HTTPException(status_code=422, detail="Règlement : le code client du sinistre est obligatoire.")
+    if montant <= 0:
+        raise HTTPException(status_code=422, detail="Renseignez le montant du règlement.")
+    if db.execute(text('SELECT 1 FROM dbo."TBanque" WHERE TRIM(code_banque) = :c'), {"c": compte}).first() is None:
+        raise HTTPException(status_code=422, detail=f"Compte banque {compte} inconnu.")
+    if db.execute(text('SELECT 1 FROM dbo."TRegCli" WHERE TRIM(num_piece) = :n AND TRIM(code_client) = :c LIMIT 1'), {"n": piece, "c": client}).first():
+        raise HTTPException(status_code=409, detail=f"La pièce {piece} est déjà enregistrée comme règlement de ce client.")
+    # Settlements saved at the same time from several PCs get different numbers (lock held until the commit).
+    db.execute(text("SELECT pg_advisory_xact_lock(hashtext('dbo.TRegCli.num_reg_cli'))"))
+    numero = db.execute(text('SELECT COALESCE(MAX(num_reg_cli), 0) + 1 FROM dbo."TRegCli"')).scalar()
+    db.execute(
+        text(
+            'INSERT INTO dbo."TRegCli" (num_reg_cli, date_reg_cli, code_client, type_reg_cli, num_piece, mont_reg_cli, code_banque, "Fectif", "Create_User", "Create_Date") '
+            "VALUES (:numero, :date, :client, 'C', :piece, :montant, :compte, 'N', :user, now())"
+        ),
+        {"numero": numero, "date": reglement.date_reglement, "client": client[:8], "piece": piece, "montant": montant, "compte": compte, "user": login},
+    )
+
+
 @router.post("", status_code=201)
 def create_sinistre(payload: dict[str, Any], user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     _ensure_quittance_column(db)
+    reglement = _settlement(payload)
     values = _clean_payload(payload)
     if not values.get("Date_Sinistre"):
         raise HTTPException(status_code=422, detail="La date du sinistre est obligatoire.")
@@ -372,6 +416,8 @@ def create_sinistre(payload: dict[str, Any], user: dict[str, Any] = Depends(requ
         values["Num_Sinistre_Agence"] = chosen or _next_number(db, values["Date_Sinistre"].date())
         columns = ", ".join(f'"{key}"' for key in values)
         db.execute(text(f'INSERT INTO dbo."Sinistre" ({columns}) VALUES ({", ".join(f":{key}" for key in values)})'), values)
+        if reglement:
+            _store_settlement(db, reglement, values, login)
         # Like the legacy software, a new file starts its follow-up with the opening step(s) (Etape_Ouverture = 'O').
         for (code,) in db.execute(text('SELECT "Code_Etape" FROM dbo."TEtape_Siniste" WHERE "Etape_Ouverture" = \'O\' ORDER BY 1')).all():
             _insert_follow_up(db, "Sinistre_Suivi", {
@@ -388,6 +434,7 @@ def create_sinistre(payload: dict[str, Any], user: dict[str, Any] = Depends(requ
 @router.put("/{numero}")
 def update_sinistre(numero: str, payload: dict[str, Any], user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     _ensure_quittance_column(db)
+    reglement = _settlement(payload)
     values = _clean_payload(payload)
     values.pop("Num_Sinistre_Agence", None)
     if "Date_Sinistre" in values and not values["Date_Sinistre"]:
@@ -399,6 +446,8 @@ def update_sinistre(numero: str, payload: dict[str, Any], user: dict[str, Any] =
         if result.rowcount == 0:
             db.rollback()
             raise HTTPException(status_code=404, detail="Sinistre introuvable.")
+        if reglement:
+            _store_settlement(db, reglement, values, values["Update_User"])
         db.commit()
     except SQLAlchemyError as exc:
         db.rollback()
