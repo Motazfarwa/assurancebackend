@@ -211,9 +211,13 @@ def _check_reglement(db: Session, payload: ChequeIn) -> None:
 
 @router.get("/comptes")
 def list_accounts(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
-    """Agency bank accounts (TBanque, not archived) a piece "à verser" can be paid into."""
+    """Agency bank accounts (TBanque, not archived) a piece "à verser" can be paid into, with the company each one
+    collects for (Code_Compagnie, 0 = none) and its opening date (the newest account of a company is its default)."""
     rows = db.execute(
-        text('SELECT TRIM(code_banque) AS code_banque, TRIM(nom_banque) AS nom_banque FROM dbo."TBanque" WHERE COALESCE("Archive", FALSE) = FALSE ORDER BY code_banque')
+        text(
+            'SELECT TRIM(code_banque) AS code_banque, TRIM(nom_banque) AS nom_banque, "Code_Compagnie" AS code_compagnie, date_ini '
+            'FROM dbo."TBanque" WHERE COALESCE("Archive", FALSE) = FALSE ORDER BY code_banque'
+        )
     ).mappings().all()
     return [_plain(row) for row in rows]
 
