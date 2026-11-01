@@ -219,7 +219,10 @@ def unpaid_statement(
     (cheques / traites) en instance on a quittance are its RPiece rows whose TPiece is not settled yet (regle <> 'O').
     Both statements list the same quittances: `piece=sans` with their solde_quittance, `piece=avec` with
     solde_quittance less the pièces en instance. `date_debut` / `date_fin` bound the échéance; each row tells whether its
-    branch is automobile (TBranche.nom_branche holds "AUTO"), for the mise en demeure groups."""
+    policy is automobile, for the mise en demeure groups: its branch name holds "AUTO". Many policies carry no branch
+    code, or one their company does not list (LLOYD "200" for its "20", GAT "122" for its "012"); their branch is then
+    read from the policy number, which starts with it (GAT 011… AUTO PARTICULIER, LLOYD 20… AUTO), and failing that a
+    policy with a registration plate is automobile."""
     if date_debut and date_fin and date_debut > date_fin:
         raise HTTPException(status_code=422, detail="La date de début doit précéder la date de fin.")
     schema = settings.db_schema
@@ -245,7 +248,8 @@ def unpaid_statement(
         ),
         -- The latest version of each policy, read once (a per-row lookup on TRIM(num_int) cannot use an index).
         pol AS (
-            SELECT DISTINCT ON (TRIM(num_int)) TRIM(num_int) AS num_int, risque, code_compagnie, TRIM(code_branche) AS code_branche
+            SELECT DISTINCT ON (TRIM(num_int)) TRIM(num_int) AS num_int, risque, code_compagnie, TRIM(code_branche) AS code_branche,
+                   NULLIF(TRIM(num_imat), '') AS num_imat
             FROM "{schema}"."TPolice"
             WHERE TRIM(num_int) IN (SELECT TRIM(num_int) FROM q)
             ORDER BY TRIM(num_int), effet DESC NULLS LAST
@@ -257,13 +261,20 @@ def unpaid_statement(
                CASE WHEN :piece = 'avec' THEN q.solde_quittance - COALESCE(i.montant, 0) ELSE q.solde_quittance END AS solde,
                COALESCE(NULLIF(TRIM(p.risque), ''), '') AS risque, TRIM(q.observation) AS observation,
                p.code_compagnie, TRIM(k.nom_compagnie) AS nom_compagnie, TRIM(b.nom_branche) AS nom_branche,
-               COALESCE(b.nom_branche ILIKE '%AUTO%', FALSE) AS automobile
+               COALESCE(b.nom_branche ILIKE '%AUTO%', FALSE) OR (b.nom_branche IS NULL AND p.num_imat IS NOT NULL) AS automobile
         FROM q
         LEFT JOIN "{schema}"."TClient" c ON TRIM(c.code_client) = TRIM(q.code_client)
         LEFT JOIN instance i ON i.num_quittance = TRIM(q.num_quittance)
         LEFT JOIN pol p ON p.num_int = TRIM(q.num_int)
         LEFT JOIN "{schema}"."TCompagnie" k ON k.code_compagnie = p.code_compagnie
-        LEFT JOIN "{schema}"."TBranche" b ON b.code_compagnie = p.code_compagnie AND TRIM(b.code_branche) = p.code_branche
+        -- The policy's branch, else the company's longest branch code the policy number starts with.
+        LEFT JOIN LATERAL (
+            SELECT x.nom_branche FROM "{schema}"."TBranche" x
+            WHERE x.code_compagnie = p.code_compagnie
+              AND (TRIM(x.code_branche) = p.code_branche OR (LENGTH(TRIM(x.code_branche)) >= 2 AND p.num_int LIKE TRIM(x.code_branche) || '%'))
+            ORDER BY TRIM(x.code_branche) = COALESCE(p.code_branche, '') DESC, LENGTH(TRIM(x.code_branche)) DESC
+            LIMIT 1
+        ) b ON TRUE
         WHERE (:nom = '' OR c.nom_client ILIKE :nom_like)
           AND (:type_client = '' OR TRIM(c."Type_Client") = :type_client)
           AND (CAST(:compagnie AS integer) IS NULL OR p.code_compagnie = CAST(:compagnie AS integer))
