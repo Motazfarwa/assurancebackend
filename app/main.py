@@ -27,6 +27,8 @@ from app.routers.sync_status import router as sync_status_router
 from app.routers.journaux import router as journaux_router
 from app.routers.ristournes import router as ristournes_router
 from app.routers.frais_generaux import router as frais_generaux_router
+from app.routers.banques import router as banques_router
+from app.routers.access import router as access_router
 
 app = FastAPI(title="Assurance API", version="0.1.0")
 app.add_middleware(
@@ -61,6 +63,8 @@ app.include_router(sync_status_router)
 app.include_router(journaux_router)
 app.include_router(ristournes_router)
 app.include_router(frais_generaux_router)
+app.include_router(banques_router)
+app.include_router(access_router)
 
 
 @app.get("/health", tags=["Health"])

@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.auth import require_current_user
 from app.config import settings
 from app.database import get_db
+from app.routers.access import is_admin
 
 
 router = APIRouter(prefix="/api", tags=["Modification polices et quittances"], dependencies=[Depends(require_current_user)])
@@ -80,15 +81,30 @@ def _update_row(db: Session, table_name: str, key_column: str, key_value: str, v
         raise HTTPException(status_code=503, detail="Impossible d'enregistrer les modifications.") from exc
 
 
+def _employee_commission_only(db: Session, user: dict[str, Any], table_name: str, key_column: str, key_value: str, values: dict[str, Any]) -> None:
+    """Only the administrator modifies a policy / receipt; the other users may only correct a commission already set."""
+    if is_admin(user):
+        return
+    if set(values) - {"commission"}:
+        raise HTTPException(status_code=403, detail="Seul l’administrateur peut modifier ces informations ; vous pouvez seulement corriger la commission.")
+    current = db.execute(text(f'SELECT commission FROM dbo."{table_name}" WHERE TRIM({key_column}) = :k LIMIT 1'), {"k": key_value.strip()}).scalar()
+    if not current:
+        raise HTTPException(status_code=403, detail="Aucune commission à modifier sur cet enregistrement.")
+
+
 @router.put("/polices/{num_int}")
-def update_police(num_int: str, payload: PoliceUpdate, db: Session = Depends(get_db)) -> dict[str, str]:
-    _update_row(db, "TPolice", "num_int", num_int, payload.model_dump(exclude_unset=True))
+def update_police(num_int: str, payload: PoliceUpdate, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, str]:
+    values = payload.model_dump(exclude_unset=True)
+    _employee_commission_only(db, user, "TPolice", "num_int", num_int, values)
+    _update_row(db, "TPolice", "num_int", num_int, values)
     return {"num_int": num_int}
 
 
 @router.put("/quittances/{num_quittance}")
-def update_quittance(num_quittance: str, payload: QuittanceUpdate, db: Session = Depends(get_db)) -> dict[str, str]:
-    _update_row(db, "TQuittance", "num_quittance", num_quittance, payload.model_dump(exclude_unset=True), QUITTANCE_COLUMNS)
+def update_quittance(num_quittance: str, payload: QuittanceUpdate, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, str]:
+    values = payload.model_dump(exclude_unset=True)
+    _employee_commission_only(db, user, "TQuittance", "num_quittance", num_quittance, values)
+    _update_row(db, "TQuittance", "num_quittance", num_quittance, values, QUITTANCE_COLUMNS)
     return {"num_quittance": num_quittance}
 
 
