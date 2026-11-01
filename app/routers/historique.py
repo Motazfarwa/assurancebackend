@@ -1,0 +1,60 @@
+"""Historique des actions (administrator): reading dbo."TMouchard", the history written by app.audit
+and by the legacy software."""
+from datetime import date, timedelta
+from typing import Any
+
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from app.auth import require_admin
+from app.database import get_db
+
+router = APIRouter(prefix="/api/historique", tags=["Historique des actions"], dependencies=[Depends(require_admin)])
+
+
+@router.get("")
+def list_history(
+    du: date | None = None,
+    au: date | None = None,
+    utilisateur: str | None = Query(default=None, max_length=50),
+    mvt: str | None = Query(default=None, max_length=20),
+    q: str | None = Query(default=None, max_length=100),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=200, ge=1, le=1000),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    du = du or date.today()
+    au = au or du
+    where = ['dmvt >= :du', 'dmvt < :au']
+    params: dict[str, Any] = {"du": du, "au": au + timedelta(days=1), "offset": offset, "limit": limit}
+    if utilisateur:
+        where.append("utilisateur = :u")
+        params["u"] = utilisateur
+    if mvt:
+        where.append('"Mvt" = :m')
+        params["m"] = mvt
+    if q:
+        where.append("design ILIKE :q")
+        params["q"] = f"%{q.strip()}%"
+    clause = " AND ".join(where)
+    total = db.execute(text(f'SELECT COUNT(*) FROM dbo."TMouchard" WHERE {clause}'), params).scalar()
+    rows = db.execute(
+        text(
+            f'SELECT "N" AS n, utilisateur, "Mvt" AS mvt, dmvt, "Hmvt" AS hmvt, design, code FROM dbo."TMouchard" '
+            f'WHERE {clause} ORDER BY dmvt DESC, "Hmvt" DESC, "N" DESC OFFSET :offset LIMIT :limit'
+        ),
+        params,
+    ).mappings().all()
+    items = [{
+        "n": row["n"], "utilisateur": row["utilisateur"], "mvt": row["mvt"], "design": row["design"], "code": row["code"],
+        "date": row["dmvt"].date().isoformat() if row["dmvt"] else None,
+        "heure": row["hmvt"].strftime("%H:%M") if row["hmvt"] else None,
+    } for row in rows]
+    return {"total": total, "items": items}
+
+
+@router.get("/utilisateurs")
+def history_users(db: Session = Depends(get_db)) -> list[str]:
+    rows = db.execute(text('SELECT DISTINCT utilisateur FROM dbo."TMouchard" WHERE utilisateur IS NOT NULL ORDER BY utilisateur')).all()
+    return [row[0] for row in rows]

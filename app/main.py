@@ -29,8 +29,11 @@ from app.routers.ristournes import router as ristournes_router
 from app.routers.frais_generaux import router as frais_generaux_router
 from app.routers.banques import router as banques_router
 from app.routers.access import router as access_router
+from app.routers.historique import router as historique_router
+from app.audit import audit_middleware
 
 app = FastAPI(title="Assurance API", version="0.1.0")
+app.middleware("http")(audit_middleware)  # history of the users' actions (TMouchard)
 app.add_middleware(
     CORSMiddleware,
     # Sites allowed to call this API: the current ones, plus CORS_ORIGINS (for example the frontend's address on OVH).
@@ -65,6 +68,7 @@ app.include_router(ristournes_router)
 app.include_router(frais_generaux_router)
 app.include_router(banques_router)
 app.include_router(access_router)
+app.include_router(historique_router)
 
 
 @app.get("/health", tags=["Health"])
