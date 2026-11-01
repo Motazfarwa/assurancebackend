@@ -4,11 +4,12 @@ from datetime import date, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.auth import require_admin
 from app.database import get_db
+from app.routers.auth import users_table
 
 router = APIRouter(prefix="/api/historique", tags=["Historique des actions"], dependencies=[Depends(require_admin)])
 
@@ -56,5 +57,8 @@ def list_history(
 
 @router.get("/utilisateurs")
 def history_users(db: Session = Depends(get_db)) -> list[str]:
-    rows = db.execute(text('SELECT DISTINCT utilisateur FROM dbo."TMouchard" WHERE utilisateur IS NOT NULL ORDER BY utilisateur')).all()
-    return [row[0] for row in rows]
+    """The users who exist now (the users table), not every name found in the legacy history."""
+    table = users_table(db)
+    rows = db.execute(select(table.c.Nom_Utilisateur).where(table.c.Nom_Utilisateur.is_not(None)).order_by(table.c.Nom_Utilisateur)).all()
+    names = [str(row[0]).strip() for row in rows if str(row[0]).strip()]
+    return list(dict.fromkeys(["Admin", *(name for name in names if name.casefold() != "admin")]))  # the administrator's actions are logged too
