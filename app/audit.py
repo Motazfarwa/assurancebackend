@@ -3,6 +3,10 @@
 
 Every add / change / delete the API accepts is recorded by the middleware below; a refused one (403 / 409)
 is recorded as a "Tentative", as is a failed sign-in.
+
+What exactly was done is kept in dbo."TMouchardDetail" (same "N"): for a change, each field with its value before and
+after (the record is read before the change and again after it); for an addition, the values of the new record; for a
+deletion, the values of the deleted record; otherwise the data sent. Passwords and file contents are never kept.
 """
 import json
 import logging
@@ -11,12 +15,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 from starlette.background import BackgroundTask
 from sqlalchemy import text
 
 from app.auth import decode_access_token
 from app.database import SessionLocal
+from app.routers.auth import users_table
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +63,153 @@ SKIPPED = re.compile(r"^(auth/(refresh|logout)|assistant/|notifications|.*\b(ext
 # Where the number of the record is found in the request / response body.
 ID_KEYS = ("numero", "num_quittance", "nump", "num_int", "num_police", "code_client", "clientCode", "code_banque",
            "code_compagnie", "code_branche", "code_prestataire", "username", "id", "bordereau_id", "cmp")
+
+
+# Path after /api/ -> the record it acts on, read before and after the change (key values from the path, then the
+# request's query string and body). Most specific first.
+SNAPSHOTS = [
+    (r"^sinistres/(?P<n>[^/]+)/etapes/(?P<c>\d+)$", 'SELECT * FROM dbo."Sinistre_Suivi" WHERE TRIM("Num_Sinistre_Agence") = :n AND "Cmp" = CAST(:c AS integer)'),
+    (r"^sinistres/(?P<n>[^/]+)/appels/(?P<c>\d+)$", 'SELECT * FROM dbo."Sinistre_Appel" WHERE TRIM("Num_Sinistre_Agence") = :n AND "Cmp" = CAST(:c AS integer)'),
+    (r"^sinistres/(?P<n>[^/]+)$", 'SELECT * FROM dbo."Sinistre" WHERE TRIM("Num_Sinistre_Agence") = :n'),
+    (r"^clients/(?P<n>[^/]+)$", 'SELECT * FROM dbo."TClient" WHERE TRIM(code_client) = :n'),
+    (r"^polices/(?P<n>[^/]+)$", 'SELECT * FROM dbo."TPolice" WHERE TRIM(num_int) = :n ORDER BY date_creation DESC NULLS LAST'),
+    (r"^(?:quittances|ristournes)/(?P<n>[^/]+)$", 'SELECT * FROM dbo."TQuittance" WHERE TRIM(num_quittance) = :n'),
+    (r"^banques/(?P<n>[^/]+)$", 'SELECT * FROM dbo."TBanque" WHERE TRIM(code_banque) = :n'),
+    (r"^compagnies/(?P<c>[^/]+)/branches/(?P<n>[^/]+)$", 'SELECT * FROM dbo."TBranche" WHERE CAST(code_compagnie AS text) = :c AND TRIM(code_branche) = :n'),
+    (r"^compagnies/(?P<n>[^/]+)$", 'SELECT * FROM dbo."TCompagnie" WHERE CAST(code_compagnie AS text) = :n'),
+    (r"^prestataires/(?P<n>[^/]+)$", 'SELECT * FROM dbo."TPrestataire" WHERE CAST("Code_Prestataire" AS text) = :n'),
+    (r"^cheques/(?P<n>[^/]+)$", 'SELECT * FROM dbo."TPiece" WHERE TRIM(nump) = :n AND TRIM(code_client) = :code_client'),
+    (r"^frais-generaux/(?P<c>[^/]+)/(?P<n>[^/]+)$", 'SELECT * FROM dbo."TDepense" WHERE TRIM("Typ_dep") = :c AND CAST(num_dep AS text) = :n'),
+    (r"^access/users/(?P<n>[^/]+)$", 'SELECT * FROM dbo."TUserModules" WHERE "Nom_Utilisateur" = :n'),
+    (r"^admin/users/(?P<n>[^/]+)$", "USERS"),
+]
+# Never copied into the history.
+SECRET = re.compile(r"pass|pwd|^modp$|token|secret|base64|image|fichier_contenu", re.IGNORECASE)
+# Updated by the software itself on every save: not a change made by the user.
+TECHNICAL = {"date_m", "update_date", "update_user", "create_date", "create_user", "date_maj"}
+LABELS = {
+    "num_int": "N° dossier", "num_police": "N° police", "num_quittance": "N° quittance", "code_client": "Code client",
+    "nom_client": "Nom client", "code_compagnie": "Compagnie", "code_branche": "Branche", "prime_net": "Prime nette",
+    "prime_total": "Prime totale", "montant_quittance": "Montant quittance", "solde_quittance": "Solde quittance",
+    "num_imat": "Immatriculation", "obser": "Observation", "observation": "Observation", "date_emission": "Date émission",
+    "echeance": "Échéance", "effet": "Date effet", "etat": "État", "Taxe": "Taxe", "commission": "Commission",
+    "Nom": "Nom", "Prenom": "Prénom", "Nationnalite": "Nationalité", "code_locuteur": "Code de contact",
+    "nom_locuteur": "Nom du contact", "adresse": "Adresse", "ville": "Ville", "tel": "Téléphone", "adresse_email": "Email",
+    "Date_Sinistre": "Date sinistre", "Num_Sinistre_Agence": "N° sinistre", "Cloture": "Clôturé", "Regle": "Réglé",
+    "Montant_Reglement": "Montant réglé", "Montant_Devis": "Montant devis", "Code_Expert1": "Expert",
+    "nom_banque": "Nom banque", "num_compte_b": "N° compte", "credit_ini": "Crédit initial", "Modules": "Modules autorisés",
+}
+MAX_VALUE = 300
+
+
+def _label(column: str) -> str:
+    return LABELS.get(column) or column.replace("_", " ").strip().capitalize()
+
+
+def _value(value: Any) -> str:
+    """A value as shown in the history ('' for nothing)."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "Oui" if value else "Non"
+    if isinstance(value, datetime):
+        return value.strftime("%d/%m/%Y %H:%M") if (value.hour, value.minute) != (0, 0) else value.strftime("%d/%m/%Y")
+    if hasattr(value, "strftime"):
+        return value.strftime("%d/%m/%Y")
+    if isinstance(value, float) or value.__class__.__name__ == "Decimal":
+        number = float(value)
+        return f"{number:.3f}".rstrip("0").rstrip(".") if number != int(number) else str(int(number))
+    if isinstance(value, (dict, list)):
+        value = json.dumps(value, ensure_ascii=False, default=str)
+    text_value = str(value).strip()
+    return text_value if len(text_value) <= MAX_VALUE else text_value[:MAX_VALUE] + "…"
+
+
+def _clean_row(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    return None if row is None else {key: value for key, value in row.items() if not SECRET.search(key)}
+
+
+def _snapshot(rest: str, query: dict[str, str], body: Any) -> tuple[str, dict[str, Any] | None] | None:
+    """(table, the record as stored now) for a path of SNAPSHOTS, else None."""
+    for pattern, sql in SNAPSHOTS:
+        match = re.match(pattern, rest)
+        if not match:
+            continue
+        params = {key: value.strip() for key, value in match.groupdict().items()}
+        if ":code_client" in sql:  # a piece is keyed by its number and its client (query string on delete, body otherwise)
+            sent = body.get("code_client") if isinstance(body, dict) else None
+            params["code_client"] = str(query.get("code_client") or sent or "").strip()
+        db = SessionLocal()
+        try:
+            if sql == "USERS":
+                table = users_table(db)
+                row = db.execute(table.select().where(table.c.Nom_Utilisateur == params["n"]).limit(1)).mappings().first()
+                return "Utilisateur", _clean_row(dict(row) if row else None)
+            row = db.execute(text(sql + ("" if "LIMIT" in sql else " LIMIT 1")), params).mappings().first()
+            table_name = re.search(r'dbo\."([^"]+)"', sql).group(1)
+            return table_name, _clean_row(dict(row) if row else None)
+        except Exception:  # noqa: BLE001 - the history must never stop the action
+            logger.exception("Historique : lecture de %s impossible", rest)
+            return None
+        finally:
+            db.close()
+    return None
+
+
+def _diff(before: dict[str, Any], after: dict[str, Any]) -> list[dict[str, str]]:
+    changes = []
+    for key in after:
+        if key.lower() in TECHNICAL or key not in before:
+            continue
+        old, new = _value(before.get(key)), _value(after.get(key))
+        if old != new:
+            changes.append({"champ": _label(key), "avant": old, "apres": new})
+    return changes
+
+
+def _values(row: dict[str, Any]) -> list[dict[str, str]]:
+    return [{"champ": _label(key), "valeur": _value(value)} for key, value in row.items()
+            if key.lower() not in TECHNICAL and _value(value) != ""]
+
+
+def _sent(body: Any) -> list[dict[str, str]]:
+    """The data sent with the request (secrets left out)."""
+    if not isinstance(body, dict):
+        return []
+    return [{"champ": _label(key), "valeur": _value(value)} for key, value in body.items()
+            if not SECRET.search(key) and _value(value) != ""][:80]
+
+
+def details(method: str, rest: str, query: dict[str, str], request_body: Any, response_body: Any,
+            before: tuple[str, dict[str, Any] | None] | None, refused: bool) -> dict[str, Any] | None:
+    """What exactly was done, for dbo."TMouchardDetail"."""
+    password = isinstance(request_body, dict) and bool(request_body.get("password"))
+    if refused:
+        sent = _sent(request_body)
+        return {"type": "tentative", "valeurs": sent} if sent else None
+    if method == "DELETE":
+        if before and before[1]:
+            return {"type": "suppression", "table": before[0], "valeurs": _values(before[1])}
+        return None
+    after = None
+    if method == "POST":
+        number = ""
+        if isinstance(response_body, dict):
+            number = str(response_body.get("Cmp") or "") or _first_id(response_body)
+        found = _snapshot(f"{rest}/{number}", query, request_body) if number else None
+        if found and found[1]:
+            return {"type": "creation", "table": found[0], "valeurs": _values(found[1])}
+        sent = _sent(request_body)
+        return {"type": "donnees", "valeurs": sent} if sent else None
+    if before:
+        after = _snapshot(rest, query, request_body)
+    if before and before[1] and after and after[1]:
+        changes = _diff(before[1], after[1])
+        if password:
+            changes.append({"champ": "Mot de passe", "avant": "", "apres": "modifié"})
+        return {"type": "modification", "table": before[0], "changements": changes}
+    sent = _sent(request_body)
+    return {"type": "donnees", "valeurs": sent} if sent else None
 
 
 def _user(request: Request) -> str | None:
@@ -105,6 +258,8 @@ def describe(method: str, path: str, request_body: Any, response_body: Any, refu
     parts = rest.split("/")
     # The record's number: in the path (/quittances/341175, /sinistres/2026001/etapes/3), else in the bodies.
     path_id = next((part for part in parts[1:] if re.search(r"\d", part) and not part.isalpha()), "")
+    if not path_id and len(parts) == 2:
+        path_id = parts[1]  # a code without digits (banque ZZTEST…)
     if rest.startswith("compagnies/") and len(parts) > 1:
         path_id = parts[-1] if "branches" in parts and len(parts) > 3 else parts[1]
     if rest.startswith(("access/", "admin/users/")):
@@ -119,20 +274,40 @@ def describe(method: str, path: str, request_body: Any, response_body: Any, refu
     return verb, f"{action} {target}".strip()[:250]
 
 
-def record(user: str, move: str, design: str) -> None:
-    """Writes one line of history; a failure is logged and never breaks the user's action."""
+DETAIL_DDL = 'CREATE TABLE IF NOT EXISTS dbo."TMouchardDetail" ("N" integer PRIMARY KEY, "Details" jsonb NOT NULL)'
+_detail_ready = False
+
+
+def record(user: str, move: str, design: str, detail: Any = None) -> None:
+    """Writes one line of history (and what exactly was done); a failure is logged and never breaks the user's action.
+    `detail` is the details, or a function computing them (run here, after the answer was sent)."""
+    global _detail_ready
     now = datetime.now(TUNIS).replace(tzinfo=None)  # the server runs in UTC; the agency works in Tunisian time
+    try:
+        detail = detail() if callable(detail) else detail
+    except Exception:  # noqa: BLE001
+        logger.exception("Historique : détail non calculé pour %s", design)
+        detail = None
     db = SessionLocal()
     try:
+        if detail and not _detail_ready:
+            db.execute(text(DETAIL_DDL))
+            db.commit()
+            _detail_ready = True
         db.execute(text("SELECT pg_advisory_xact_lock(hashtext('dbo.TMouchard.N'))"))
-        db.execute(
+        number = db.execute(
             text(
                 'INSERT INTO dbo."TMouchard" ("N", utilisateur, "Mvt", dmvt, "Hmvt", design, code) '
-                'SELECT COALESCE(MAX("N"), 0) + 1, :u, :m, :d, :h, :design, :code FROM dbo."TMouchard"'
+                'SELECT COALESCE(MAX("N"), 0) + 1, :u, :m, :d, :h, :design, :code FROM dbo."TMouchard" RETURNING "N"'
             ),
             {"u": user[:50], "m": move, "d": now.replace(hour=0, minute=0, second=0, microsecond=0),
              "h": datetime(1900, 1, 1, now.hour, now.minute, now.second), "design": design, "code": MOVES[move]},
-        )
+        ).scalar()
+        if detail:
+            db.execute(
+                text('INSERT INTO dbo."TMouchardDetail" ("N", "Details") VALUES (:n, CAST(:d AS jsonb)) ON CONFLICT ("N") DO UPDATE SET "Details" = EXCLUDED."Details"'),
+                {"n": number, "d": json.dumps(detail, ensure_ascii=False, default=str)},
+            )
         db.commit()
     except Exception:  # noqa: BLE001
         db.rollback()
@@ -148,15 +323,23 @@ async def audit_middleware(request: Request, call_next):
     if "/api/" not in request.url.path:
         return await call_next(request)
     raw_request = await request.body()
+    request_body = _parse(raw_request)
+    rest = request.url.path.split("/api/", 1)[-1].strip("/")
+    query = dict(request.query_params)
+    # The record as it is before a change / deletion, to show afterwards what exactly was changed.
+    before = None
+    if method in ("PUT", "PATCH", "DELETE") and not SKIPPED.match(rest):
+        before = await run_in_threadpool(_snapshot, rest, query, request_body)
     response = await call_next(request)
     refused = response.status_code in (401, 403, 409) if request.url.path.endswith("/auth/login") else response.status_code in (403, 409)
     if not (200 <= response.status_code < 300 or refused):
         return response
     raw_response = b"".join([chunk async for chunk in response.body_iterator])
     rebuilt = Response(content=raw_response, status_code=response.status_code, headers=dict(response.headers), media_type=response.media_type)
-    request_body = _parse(raw_request)
-    described = describe(method, request.url.path, request_body, _parse(raw_response), refused)
+    response_body = _parse(raw_response)
+    described = describe(method, request.url.path, request_body, response_body, refused)
     user = _user(request) or (request_body.get("username") if isinstance(request_body, dict) else None)
     if described and user:
-        rebuilt.background = BackgroundTask(record, str(user), *described)  # written after the answer is sent
+        detail = None if rest == "auth/login" else (lambda: details(method, rest, query, request_body, response_body, before, refused))
+        rebuilt.background = BackgroundTask(record, str(user), *described, detail)  # written after the answer is sent
     return rebuilt

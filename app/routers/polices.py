@@ -10,6 +10,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from app.police_schemas import PoliceWithQuittanceCreate
+from app.routers.records_search import STATUT_SQL
 
 load_dotenv()
 
@@ -609,13 +610,8 @@ def search_polices(
             detail="Renseignez au moins un critère de recherche"
         )
 
-    # Status as in the legacy "Liste des polices": AN = in force, SS / RE / RV = suspended or terminated.
-    if statut == "vigueur":
-        conditions.append("UPPER(TRIM(p.etat)) = 'AN' AND (p.expiration IS NULL OR p.expiration >= CURRENT_DATE)")
-    elif statut == "expirees":
-        conditions.append("UPPER(TRIM(p.etat)) = 'AN' AND p.expiration < CURRENT_DATE")
-    elif statut == "susp":
-        conditions.append("UPPER(TRIM(p.etat)) IN ('SS', 'RE', 'RV')")
+    if statut in STATUT_SQL:
+        conditions.append(STATUT_SQL[statut])
 
     where_sql = " AND ".join("(" + condition + ")" for condition in conditions) or "TRUE"
     # Without `page` the answer is the plain list (max 100); with it, a page of results plus the total.

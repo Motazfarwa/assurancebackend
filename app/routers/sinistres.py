@@ -241,6 +241,7 @@ def list_sinistres(
     type_sinistre: str = Query(default="", max_length=50),
     code_expert: int | None = None,
     date_min: date | None = None,
+    numero: str = Query(default="", max_length=20),
     limit: int = Query(default=100, ge=1, le=2000),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
@@ -254,6 +255,9 @@ def list_sinistres(
     search, date, company, type, expert and period, how many files are not settled and not closed."""
     conditions = ["TRUE"]
     params: dict[str, Any] = {"limit": limit, "offset": offset}
+    if numero.strip():  # the "N° sinistre" dropdown: the claim numbers starting with what is typed
+        conditions.append('TRIM("Num_Sinistre_Agence") ILIKE :numero')
+        params["numero"] = numero.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
     if statut == "en_cours":
         conditions.append('COALESCE("Cloture", FALSE) = FALSE AND COALESCE("Regle", FALSE) = FALSE')
     elif statut == "regle":

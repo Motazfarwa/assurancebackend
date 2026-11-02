@@ -15,6 +15,14 @@ router = APIRouter(prefix="/api/records", tags=["Recherche polices et quittances
 
 BRANCH_EXPRESSION = "COALESCE(NULLIF(TRIM(q.code_branche), ''), TRIM(p.code_branche))"
 
+# Policy status as in the legacy "Liste des polices" (Tous / En vigueur / Susp. Rés. / Expirées):
+# AN = in force (expired once its expiration date is past), SS / RE / RV = suspended or terminated.
+STATUT_SQL = {
+    "vigueur": "UPPER(TRIM(p.etat)) = 'AN' AND (p.expiration IS NULL OR p.expiration >= CURRENT_DATE)",
+    "expirees": "UPPER(TRIM(p.etat)) = 'AN' AND p.expiration < CURRENT_DATE",
+    "susp": "UPPER(TRIM(p.etat)) IN ('SS', 'RE', 'RV')",
+}
+
 
 def _like(value: str) -> str:
     return f"%{value.strip()}%"
@@ -25,11 +33,14 @@ def search_policies(
     code_client: str | None = Query(default=None, max_length=8),
     nom_client: str | None = Query(default=None, max_length=60),
     num_police: str | None = Query(default=None, max_length=20),
+    statut: str | None = Query(default=None, pattern="^(tous|vigueur|susp|expirees)$"),
     limit: int = Query(default=200, ge=1, le=500),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     conditions = ["TRUE"]
     params: dict[str, Any] = {"limit": limit}
+    if statut in STATUT_SQL:
+        conditions.append(STATUT_SQL[statut])
     if code_client and code_client.strip():
         conditions.append("TRIM(p.code_client) = :code_client")
         params["code_client"] = code_client.strip()
