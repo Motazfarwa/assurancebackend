@@ -7,7 +7,7 @@ is recorded as a "Tentative", as is a failed sign-in.
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import Request
@@ -19,6 +19,9 @@ from app.auth import decode_access_token
 from app.database import SessionLocal
 
 logger = logging.getLogger(__name__)
+
+# Tunisia is UTC+1 all year (no daylight saving time).
+TUNIS = timezone(timedelta(hours=1))
 
 MOVES = {"Consultation": 1, "Ajout": 2, "Modification": 3, "Suppresion": 4, "Impression": 5, "Annulation": 6, "Tentative": 7}
 VERBS = {"POST": "Ajout", "PUT": "Modification", "PATCH": "Modification", "DELETE": "Suppresion"}
@@ -118,7 +121,7 @@ def describe(method: str, path: str, request_body: Any, response_body: Any, refu
 
 def record(user: str, move: str, design: str) -> None:
     """Writes one line of history; a failure is logged and never breaks the user's action."""
-    now = datetime.now()
+    now = datetime.now(TUNIS).replace(tzinfo=None)  # the server runs in UTC; the agency works in Tunisian time
     db = SessionLocal()
     try:
         db.execute(text("SELECT pg_advisory_xact_lock(hashtext('dbo.TMouchard.N'))"))
