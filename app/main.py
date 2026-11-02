@@ -1,6 +1,8 @@
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,8 +34,16 @@ from app.routers.access import router as access_router
 from app.routers.historique import router as historique_router
 from app.routers.notifications import router as notifications_router
 from app.audit import audit_middleware
+from app.repairs import run_repairs
 
-app = FastAPI(title="Assurance API", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await run_in_threadpool(run_repairs)  # corrects data left wrong by earlier versions
+    yield
+
+
+app = FastAPI(title="Assurance API", version="0.1.0", lifespan=lifespan)
 app.middleware("http")(audit_middleware)  # history of the users' actions (TMouchard)
 app.add_middleware(
     CORSMiddleware,
