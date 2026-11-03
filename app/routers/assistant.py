@@ -5,6 +5,7 @@ reflect the current data. Every query runs in a read-only transaction, and the u
 is never reachable.
 """
 import json
+import logging
 import re
 from typing import Any, Literal
 
@@ -184,6 +185,8 @@ GEMINI_TOOLS = [{
 
 
 _gemini_base = [""]  # the Gemini API that last accepted the key
+GEMINI_TIMEOUT = 170  # seconds allowed for Gemini's answer (a multi-page scan can take more than a minute)
+logger = logging.getLogger(__name__)
 
 
 def _gemini_generate(body: dict[str, Any]) -> dict[str, Any]:
@@ -204,9 +207,15 @@ def _gemini_generate(body: dict[str, Any]) -> dict[str, Any]:
     refusals: list[str] = []
     for base in bases:
         try:
-            reply = httpx.post(f"{base}/models/{settings.gemini_model}:generateContent", headers={"x-goog-api-key": key}, json=body, timeout=90)
+            # Reading a scanned PDF can take the model well over a minute: up to GEMINI_TIMEOUT seconds for the answer.
+            reply = httpx.post(f"{base}/models/{settings.gemini_model}:generateContent", headers={"x-goog-api-key": key}, json=body,
+                               timeout=httpx.Timeout(GEMINI_TIMEOUT, connect=15))
+        except httpx.TimeoutException as exc:
+            logger.warning("Gemini %s : pas de réponse en %s s (%s)", settings.gemini_model, GEMINI_TIMEOUT, exc.__class__.__name__)
+            raise HTTPException(status_code=504, detail=f"Le service IA ({settings.gemini_model}) n’a pas répondu en {GEMINI_TIMEOUT} secondes. Réessayez ; la saisie manuelle reste disponible.") from exc
         except httpx.HTTPError as exc:
-            raise HTTPException(status_code=503, detail="Service IA injoignable (pas de connexion internet ?). La saisie manuelle reste disponible.") from exc
+            logger.warning("Gemini injoignable : %r", exc)
+            raise HTTPException(status_code=503, detail=f"Service IA injoignable ({exc.__class__.__name__} : {str(exc)[:120] or 'connexion impossible'}). La saisie manuelle reste disponible.") from exc
         if reply.status_code not in (400, 401, 403, 404):
             _gemini_base[0] = base  # remembered: the next calls go straight to the API that accepts this key
             break
