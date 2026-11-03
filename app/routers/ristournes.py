@@ -5,6 +5,7 @@ ristourne nette = prime_net, décommission = commission, détaxe = Taxe, ristour
 (nette + détaxe) and solde = what is still to pay to the client (lowered by the rebate payments, TDepense).
 """
 import json
+import logging
 import re
 from datetime import date, datetime
 from typing import Any
@@ -22,6 +23,7 @@ from app.database import get_db
 from app.routers.assistant import FicheRequest, _gemini_generate, _ocr_space
 
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/ristournes", tags=["Ristournes"], dependencies=[Depends(require_current_user)])
 
 EPS = 0.0005
@@ -281,12 +283,30 @@ LINE_FIELDS = {
     "date_du": ("string", "Start of the period refunded (du / effet / date d'annulation), dd/mm/yyyy."),
     "date_au": ("string", "End of the period refunded (au / échéance), dd/mm/yyyy."),
     "date_document": ("string", "Date the document or the line was issued (date d'émission / date de l'avis), dd/mm/yyyy."),
-    "nette": ("number", "Ristourne nette: the net premium refunded (prime nette / prime HT ristournée), positive."),
-    "decommission": ("number", "Décommission: the commission taken back from the agent (commission / décommission), positive."),
-    "detaxe": ("number", "Détaxe: the taxes refunded (taxes / TVA / FG / détaxe; the total of the tax columns), positive."),
-    "totale": ("number", "Total refunded to the client (prime totale / TTC / montant de la ristourne), positive."),
+    "nette": ("number", "Only if a column / label literally named 'ristourne nette', 'prime nette' or 'prime HT' is printed: its value; else null."),
+    "decommission": ("number", "Commission / décommission printed (e.g. 'Commission : 2,177DT'), else null."),
+    "detaxe": ("number", "Only if a column literally named 'détaxe' or 'total taxes' is printed: its value; else null."),
+    "totale": ("number", "Total refunded printed (Prime Totale / TTC / montant de la ristourne)."),
+    # The columns of the companies' quittances de ristourne (CARTE, STAR…), copied one by one with their sign.
+    "prime_base": ("number", "Column 'Prime de Base' (or 'Prime RC'), with its sign as printed."),
+    "prime_annexe": ("number", "Column 'Prime Annexe' (or 'Primes garanties annexes'), with its sign as printed."),
+    "frais": ("number", "Column 'Frais' / 'Accessoires' / 'Coût de police', with its sign as printed (e.g. -50,000DT -> -50)."),
+    "taxe_base": ("number", "Column 'Taxe Base' (taxe sur la prime de base), with its sign as printed (e.g. -4,188DT -> -4.188)."),
+    "taxes_annexes": ("number", "Column 'Taxes Annexes', with its sign as printed."),
+    "fpcsr": ("number", "Column 'F.P.C.S.R' when a value is printed in it, else null."),
+    "fpac": ("number", "Column 'FPAC' when a value is printed in it, else null."),
+    "fga": ("number", "Column 'FGA' when a value is printed in it, else null."),
+    "timbre": ("number", "Column 'Timbre' when printed, else null."),
+    "immatriculation": ("string", "Vehicle registration (Immatriculation) as printed, else null."),
     "motif": ("string", "Reason printed (annulation, résiliation, suspension, réduction de garantie, vente du véhicule…)."),
     "remarque": ("string", "Anything on this line that is unclear, crossed out, handwritten or hard to read; null when all is clear."),
+}
+# Columns that make up the ristourne nette (the premium and costs) and the détaxe (the taxes and funds).
+NET_COLUMNS = ("prime_base", "prime_annexe", "frais")
+TAX_COLUMNS = ("taxe_base", "taxes_annexes", "fpcsr", "fpac", "fga", "timbre")
+COLUMN_LABELS = {
+    "prime_base": "Prime de base", "prime_annexe": "Prime annexe", "frais": "Frais", "taxe_base": "Taxe base",
+    "taxes_annexes": "Taxes annexes", "fpcsr": "F.P.C.S.R", "fpac": "FPAC", "fga": "FGA", "timbre": "Timbre",
 }
 DOC_FIELDS = {
     "compagnie": "Insurance company that issued the document (STAR, COMAR, GAT, ASTREE, MAGHREBIA, CARTE, BIAT ASSURANCES, LLOYD, AMI, ZITOUNA TAKAFUL…).",
@@ -298,10 +318,13 @@ EXTRACT_PROMPT = (
     "premiums refunded to clients after a cancellation, a suspension or a reduction (avis de ristourne, bordereau de ristournes, "
     "avenant d'annulation, relevé). Analyse the WHOLE document carefully, every page and every table row, including rows that "
     "continue on the next page. Return one item per ristourne / policy line; do not merge lines and do not skip any. "
-    "Do not return sub-total or grand-total rows as items.\n"
-    "Rules: copy every value exactly as printed. Never compute, deduce or guess a value: if an amount is not printed for a line, "
-    "use null (do not derive it from other columns). Amounts are in Tunisian dinars with 3 decimals: '1.234,567' or '1 234,567' "
-    "means 1234.567; give them as plain positive numbers. Dates as dd/mm/yyyy. Use 'remarque' to report anything uncertain."
+    "Do not return sub-total or grand-total rows as items. The same ristourne printed twice on a page (for example the "
+    "'QUITTANCE DE RISTOURNE' and its 'AVIS D'ENCAISSEMENT' with the same number) is ONE item: take the commission from "
+    "whichever copy prints it.\n"
+    "Rules: copy every value exactly as printed, into the field whose description matches the printed column name. Never "
+    "compute, deduce or guess a value: an empty cell or a value that is not printed is null. Amounts are in Tunisian dinars "
+    "with 3 decimals: '1.234,567', '1 234,567' or '20,087DT' means 1234.567 / 20.087; keep the minus sign of negative "
+    "amounts. Dates as dd/mm/yyyy. Use 'remarque' to report anything uncertain."
 )
 
 
@@ -343,21 +366,30 @@ def _extract_lines(request: FicheRequest) -> dict[str, Any]:
     return json.loads("".join(part.get("text", "") for part in parts))
 
 
-def _amount(value: Any) -> float | None:
-    """A printed amount: 1234.567, '1 234,567', '1.234,567' -> 1234.567; anything unreadable -> None."""
+def _signed(value: Any) -> float | None:
+    """A printed amount with its sign: 1234.567, '1 234,567', '-50,000DT' -> 1234.567 / -50.0; unreadable -> None."""
     if value in (None, ""):
         return None
     if isinstance(value, (int, float)):
-        return round(abs(float(value)), 3)
-    textual = re.sub(r"[^\d,.]", "", str(value))
+        return round(float(value), 3)
+    textual = str(value).strip()
+    negative = textual.startswith("-") or textual.endswith("-") or (textual.startswith("(") and textual.endswith(")"))
+    textual = re.sub(r"[^\d,.]", "", textual)
     if "," in textual:
         textual = textual.replace(".", "").replace(",", ".")
     elif textual.count(".") > 1:
         textual = textual.replace(".", "")
     try:
-        return round(float(textual), 3)
+        number = round(float(textual), 3)
     except ValueError:
         return None
+    return -number if negative else number
+
+
+def _amount(value: Any) -> float | None:
+    """A printed amount as a positive value (the form's amounts are positive)."""
+    number = _signed(value)
+    return None if number is None else abs(number)
 
 
 def _iso(value: Any) -> str | None:
@@ -403,11 +435,25 @@ def _check_line(db: Session, raw: dict[str, Any]) -> dict[str, Any]:
         "date_du": _iso(raw.get("date_du")), "date_au": _iso(raw.get("date_au")), "date_document": _iso(raw.get("date_document")),
         "nette": _amount(raw.get("nette")), "decommission": _amount(raw.get("decommission")),
         "detaxe": _amount(raw.get("detaxe")), "totale": _amount(raw.get("totale")),
+        "immatriculation": _clean(raw.get("immatriculation")),
         "motif": _clean(raw.get("motif")), "remarque": _clean(raw.get("remarque")),
     }
     warnings: list[str] = []
     if line["remarque"]:
         warnings.append(f"Lecture incertaine : {line['remarque']}")
+    # The columns printed on the document, kept as they are (sign included) to be shown with the line.
+    columns = {key: _signed(raw.get(key)) for key in (*NET_COLUMNS, *TAX_COLUMNS)}
+    line["colonnes"] = [{"libelle": COLUMN_LABELS[key], "valeur": value} for key, value in columns.items() if value is not None]
+    # No "ristourne nette" / "détaxe" printed as such (CARTE, STAR… quittances): their sums of the printed columns.
+    computed: list[str] = []
+    if line["nette"] is None and any(columns[key] is not None for key in NET_COLUMNS):
+        line["nette"] = abs(round(sum(columns[key] or 0 for key in NET_COLUMNS), 3))
+        computed.append(f"nette = {' + '.join(COLUMN_LABELS[key] for key in NET_COLUMNS if columns[key] is not None)}")
+    if line["detaxe"] is None and any(columns[key] is not None for key in TAX_COLUMNS):
+        line["detaxe"] = abs(round(sum(columns[key] or 0 for key in TAX_COLUMNS), 3))
+        computed.append(f"détaxe = {' + '.join(COLUMN_LABELS[key] for key in TAX_COLUMNS if columns[key] is not None)}")
+    if computed:
+        warnings.append("Calculé à partir des colonnes du document : " + " ; ".join(computed) + ".")
     found = _find_policies(db, line["num_police"]) if line["num_police"] else []
     policy = _pick_policy(found, line["client"])
     if not line["num_police"]:
@@ -447,11 +493,65 @@ def _ocr_lines(db: Session, request: FicheRequest) -> dict[str, Any]:
         if value:
             texts.append(value)
     if not texts:
-        raise HTTPException(status_code=503, detail="Lecture du document impossible (service OCR indisponible ou texte illisible).")
-    found = re.findall(r"[A-Z0-9][A-Z0-9/.-]{4,19}", "\n".join(texts).upper())
+        raise HTTPException(status_code=503, detail="le service OCR de secours (ocr.space) est indisponible")
+    raw = "\n".join(texts)
+    quittance = _parse_quittance(raw)
+    if quittance:
+        return {"compagnie": quittance.pop("compagnie", None), "type_document": "Quittance de ristourne", "date_document": quittance.get("date_document"), "lignes": [quittance]}
+    found = re.findall(r"[A-Z0-9][A-Z0-9/.-]{4,19}", raw.upper())
     tokens = dict.fromkeys(token for token in found if sum(ch.isdigit() for ch in token) >= 4)
     lines = [{"num_police": token, "remarque": "Lu par OCR : montants et dates à saisir."} for token in tokens if _find_policies(db, token)]
     return {"compagnie": None, "type_document": None, "date_document": None, "lignes": lines}
+
+
+def _parse_quittance(raw: str) -> dict[str, Any] | None:
+    """OCR text of one company "QUITTANCE DE RISTOURNE N° …" (CARTE layout): its labelled values and its row of amounts."""
+    flat = re.sub(r"[ \t]+", " ", raw)
+    number = re.search(r"RISTOURNE\s*N[°o]?\s*[:.]?\s*(\d{6,})", flat, re.IGNORECASE)
+    if not number:
+        return None
+    pick = lambda pattern: (re.search(pattern, flat, re.IGNORECASE) or [None, None])[1]  # noqa: E731
+    line: dict[str, Any] = {
+        "num_ristourne": number.group(1),
+        "num_police": pick(r"N[°o]?\s*CONTRAT\s*[:.]?\s*([A-Z0-9/.-]{5,20})"),
+        "client": (pick(r"ASSURE\s*[:.]?\s*([^\n]{2,60})") or pick(r"SOUSCRIPTEUR\s*[:.]?\s*([^\n]{2,60})") or "").strip() or None,
+        "date_du": pick(r"EFFET\s*DU\s*[:.]?\s*(\d{1,2}/\d{1,2}/\d{2,4})"),
+        "date_au": pick(r"JUSQU.?AU\s*[:.]?\s*(\d{1,2}/\d{1,2}/\d{2,4})"),
+        "date_document": pick(r"\bLE\s+(\d{1,2}/\d{1,2}/\d{2,4})"),
+        "decommission": pick(r"Commission\s*[:.]?\s*(-?[\d .]+,\d{3})"),
+        "immatriculation": (pick(r"Immatriculation\s*[:.]?\s*([^\n]{3,20})") or "").strip() or None,
+        "remarque": "Lu par OCR (service IA indisponible) : vérifiez chaque montant avec le document.",
+    }
+    if re.search(r"\bCARTE\b", flat):
+        line["compagnie"] = "CARTE"
+    # The row of amounts under "Prime de Base … Prime Totale": with 6 amounts, the FPCSR / FPAC / FGA cells are empty.
+    amounts = re.findall(r"(-?\d[\d .]*,\d{3})\s*DT", flat)
+    if len(amounts) >= 6:
+        row = amounts[:6]
+        line.update(dict(zip(("prime_base", "prime_annexe", "frais", "taxe_base", "taxes_annexes", "totale"), row)))
+    return line
+
+
+def _dedupe(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One line per ristourne: a quittance and its avis d'encaissement (same number, same policy) are the same ristourne;
+    the copy that prints more values is kept, completed with what only the other one prints (the commission)."""
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
+    order: list[tuple[str, str] | int] = []
+    for index, raw in enumerate(lines):
+        key = (str(raw.get("num_ristourne") or "").strip(), str(raw.get("num_police") or "").strip())
+        if not key[0]:
+            order.append(index)
+            merged[(str(index), "")] = raw
+            continue
+        if key not in merged:
+            merged[key] = dict(raw)
+            order.append(key)
+        else:
+            kept = merged[key]
+            for field, value in raw.items():
+                if kept.get(field) in (None, "") and value not in (None, ""):
+                    kept[field] = value
+    return [merged[(str(item), "")] if isinstance(item, int) else merged[item] for item in order]
 
 
 @router.post("/extract")
@@ -460,16 +560,30 @@ def extract_ristournes(request: FicheRequest, db: Session = Depends(get_db)) -> 
     the user loads a line into the form, checks it and saves it."""
     source = "ai"
     document: dict[str, Any] | None = None
+    ai_problem = "aucune clé de service IA n’est configurée sur le serveur (ANTHROPIC_API_KEY ou GEMINI_API_KEY)"
     if settings.anthropic_api_key or settings.gemini_api_key:
         try:
             document = _extract_lines(request)
-        except (HTTPException, anthropic.APIError, ValueError):
-            document = None  # the AI service is unavailable: fall back on OCR
+        except HTTPException as exc:  # the AI service refused or is unreachable: fall back on OCR
+            ai_problem = f"service IA : {exc.detail}"
+        except anthropic.APIError as exc:
+            ai_problem = f"service IA : {getattr(exc, 'message', None) or exc.__class__.__name__}"[:300]
+        except ValueError:
+            ai_problem = "service IA : réponse illisible"
+        if document is not None:
+            logger.info("Ristournes : document lu par l'IA")
+        else:
+            logger.warning("Ristournes : lecture IA impossible (%s), essai OCR", ai_problem)
     try:
         if document is None:
             source = "ocr"
-            document = _ocr_lines(db, request)
-        lines = [_check_line(db, raw) for raw in (document.get("lignes") or []) if isinstance(raw, dict)]
+            try:
+                document = _ocr_lines(db, request)
+            except HTTPException as exc:
+                # Both readings failed: say why, so the cause can be fixed (key, quota, service down).
+                raise HTTPException(status_code=503, detail=f"Lecture du document impossible : {ai_problem} ; {exc.detail}. Réessayez dans un moment ou saisissez la ristourne.") from exc
+        raw_lines = _dedupe([raw for raw in (document.get("lignes") or []) if isinstance(raw, dict)])
+        lines = [_check_line(db, raw) for raw in raw_lines]
     except SQLAlchemyError as exc:
         raise _fail(exc) from exc
     lines = [line for line in lines if any(line[key] for key in ("num_ristourne", "num_police", "nette", "totale"))]
