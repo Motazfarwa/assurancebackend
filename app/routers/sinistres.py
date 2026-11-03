@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from app.auth import require_current_user
 from app.config import settings
 from app.database import get_db
+from app.text_fields import label_values
 from app.routers.assistant import FicheRequest, _gemini_generate, _ocr_space
 
 
@@ -810,4 +811,4 @@ def extract_sinistre_from_text(payload: SinistreTextIn, db: Session = Depends(ge
     """The same reading from the text of the constat / déclaration recognised by OCR in the browser (no AI)."""
     fields = _parse_text(payload.text)
     sinistre, policy, side = _suggest(db, fields)
-    return {"source": "ocr", "fields": fields, "sinistre": sinistre, "police": policy, "vehicule_assure": side}
+    return {"source": "ocr", "fields": fields, "sinistre": sinistre, "police": policy, "vehicule_assure": side, "infos": label_values(payload.text)}

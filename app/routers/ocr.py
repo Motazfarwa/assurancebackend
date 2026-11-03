@@ -41,7 +41,8 @@ def read_text(request: FicheRequest) -> dict[str, Any]:
     headers = {"Ocp-Apim-Subscription-Key": settings.azure_vision_key, "Content-Type": "application/octet-stream"}
     started = time.monotonic()
     try:
-        submitted = httpx.post(f"{endpoint}/vision/v3.2/read/analyze", headers=headers,
+        # readingOrder=natural: lines in the order a person reads the page (left box then right box of a form).
+        submitted = httpx.post(f"{endpoint}/vision/v3.2/read/analyze?readingOrder=natural", headers=headers,
                                content=base64.b64decode(request.image_base64), timeout=30)
         if submitted.status_code != 202:
             raise HTTPException(status_code=502, detail=f"OCR Azure ({submitted.status_code}) : {_reason(submitted)}")

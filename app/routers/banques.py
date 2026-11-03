@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from app.auth import require_current_user
 from app.config import settings
 from app.database import get_db
+from app.text_fields import label_values
 from app.routers.assistant import FicheRequest, _gemini_generate, _ocr_space
 
 router = APIRouter(prefix="/api/banques", tags=["Gestion des banques"], dependencies=[Depends(require_current_user)])
@@ -262,4 +263,4 @@ class TextIn(BaseModel):
 @router.post("/extract-text")
 def extract_banque_from_text(payload: TextIn) -> dict[str, Any]:
     """The same reading from the text of the RIB / relevé recognised by OCR in the browser (no AI)."""
-    return {"source": "ocr", "fields": _finish(_parse_text(payload.text))}
+    return {"source": "ocr", "fields": _finish(_parse_text(payload.text)), "infos": label_values(payload.text)}

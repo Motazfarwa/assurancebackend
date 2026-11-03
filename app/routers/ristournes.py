@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from app.auth import require_current_user
 from app.config import settings
 from app.database import get_db
+from app.text_fields import label_values
 from app.routers.assistant import FicheRequest, _gemini_generate, _ocr_space
 
 
@@ -621,6 +622,6 @@ def extract_ristournes_from_text(payload: TextIn, db: Session = Depends(get_db))
             found = re.findall(r"[A-Z0-9][A-Z0-9/.-]{4,19}", payload.text.upper())
             tokens = dict.fromkeys(token for token in found if sum(ch.isdigit() for ch in token) >= 4)
             document = {"lignes": [{"num_police": token, "remarque": "Lu par OCR : montants et dates à saisir."} for token in tokens if _find_policies(db, token)]}
-        return _answer(db, "ocr-local", document)
+        return {**_answer(db, "ocr-local", document), "infos": label_values(payload.text)}
     except SQLAlchemyError as exc:
         raise _fail(exc) from exc
