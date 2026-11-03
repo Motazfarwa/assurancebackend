@@ -7,6 +7,7 @@ is never reachable.
 import json
 import logging
 import re
+import time
 from typing import Any, Literal
 
 import anthropic
@@ -185,7 +186,10 @@ GEMINI_TOOLS = [{
 
 
 _gemini_base = [""]  # the Gemini API that last accepted the key
+_gemini_thinking = [True]  # False once the model refused the thinking setting
 GEMINI_TIMEOUT = 170  # seconds allowed for Gemini's answer (a multi-page scan can take more than a minute)
+BUSY = (429, 500, 502, 503, 504)  # Google overloaded or briefly unavailable: worth asking again
+GEMINI_RETRY_PAUSES = (3, 8, 15)  # seconds before each new try
 logger = logging.getLogger(__name__)
 
 
@@ -203,13 +207,39 @@ def _gemini_generate(body: dict[str, Any]) -> dict[str, Any]:
         except ValueError:
             return "erreur"
 
+    # Reading a document needs no long reasoning: the newer models think at length by default (minutes on a scan),
+    # so a low level is asked for; a model that does not take the setting is asked again without it.
+    fast = {**body, "generationConfig": {**body.get("generationConfig", {}), "thinkingConfig": {"thinkingLevel": "low"}}}
+
+    def post(base: str, model: str, payload: dict[str, Any]) -> httpx.Response:
+        # A scanned PDF can still take the model a while: up to GEMINI_TIMEOUT seconds for the answer.
+        return httpx.post(f"{base}/models/{model}:generateContent", headers={"x-goog-api-key": key}, json=payload,
+                          timeout=httpx.Timeout(GEMINI_TIMEOUT, connect=15))
+
+    def ask(base: str) -> httpx.Response:
+        """The model's answer; when Google is momentarily overloaded ("high demand", 503…) it is asked again after a
+        short pause, then the backup model (GEMINI_FALLBACK_MODEL) is asked, if one is set."""
+        models = [settings.gemini_model, *([settings.gemini_fallback_model] if settings.gemini_fallback_model else [])]
+        answer = None
+        for model in models:
+            for pause in (*GEMINI_RETRY_PAUSES, None):
+                answer = post(base, model, fast if _gemini_thinking[0] else body)
+                if answer.status_code == 400 and _gemini_thinking[0] and "thinking" in reason_of(answer).lower():
+                    _gemini_thinking[0] = False  # this model has no thinking setting: plain requests from now on
+                    answer = post(base, model, body)
+                if answer.status_code not in BUSY or pause is None:
+                    break
+                logger.info("Gemini %s occupé (%s), nouvel essai dans %s s", model, answer.status_code, pause)
+                time.sleep(pause)
+            if answer.status_code not in BUSY:
+                return answer
+        return answer
+
     reply = None
     refusals: list[str] = []
     for base in bases:
         try:
-            # Reading a scanned PDF can take the model well over a minute: up to GEMINI_TIMEOUT seconds for the answer.
-            reply = httpx.post(f"{base}/models/{settings.gemini_model}:generateContent", headers={"x-goog-api-key": key}, json=body,
-                               timeout=httpx.Timeout(GEMINI_TIMEOUT, connect=15))
+            reply = ask(base)
         except httpx.TimeoutException as exc:
             logger.warning("Gemini %s : pas de réponse en %s s (%s)", settings.gemini_model, GEMINI_TIMEOUT, exc.__class__.__name__)
             raise HTTPException(status_code=504, detail=f"Le service IA ({settings.gemini_model}) n’a pas répondu en {GEMINI_TIMEOUT} secondes. Réessayez ; la saisie manuelle reste disponible.") from exc
@@ -221,11 +251,13 @@ def _gemini_generate(body: dict[str, Any]) -> dict[str, Any]:
             break
         refusals.append(f"{'Google AI Studio' if base == studio else 'Vertex AI'} ({reply.status_code}) : {reason_of(reply)}")
     if reply.status_code == 429:
-        raise HTTPException(status_code=429, detail="Quota gratuit atteint, réessayez dans une minute.")
+        raise HTTPException(status_code=429, detail="Quota gratuit Gemini atteint, réessayez dans une minute.")
+    if reply.status_code in BUSY:
+        raise HTTPException(status_code=503, detail=f"Le service IA de Google est momentanément surchargé ({reply.status_code}), malgré plusieurs essais. Réessayez dans quelques minutes.")
     if reply.status_code >= 400:
         # Both APIs refused the key: both reasons are given (the AI Studio one is the one to fix for a free key).
         detail = " ; ".join(refusals) if refusals else f"Service IA ({reply.status_code}) : {reason_of(reply)}"
-        raise HTTPException(status_code=503 if reply.status_code in (400, 401, 403, 404) else 502, detail=f"Clé Gemini refusée — {detail}")
+        raise HTTPException(status_code=503 if reply.status_code in (400, 401, 403, 404) else 502, detail=f"Clé Gemini refusée — {detail}" if refusals else detail)
     try:
         return reply.json()
     except ValueError as exc:

@@ -519,7 +519,8 @@ def _parse_quittance(raw: str) -> dict[str, Any] | None:
         "date_au": pick(r"JUSQU.?AU\s*[:.]?\s*(\d{1,2}/\d{1,2}/\d{2,4})"),
         "date_document": pick(r"\bLE\s+(\d{1,2}/\d{1,2}/\d{2,4})"),
         "decommission": pick(r"Commission\s*[:.]?\s*(-?[\d .]+,\d{3})"),
-        "immatriculation": (pick(r"Immatriculation\s*[:.]?\s*([^\n]{3,20})") or "").strip() or None,
+        # A Tunisian plate (4637 TU 86, RS 283583), else the few characters before the next label.
+        "immatriculation": (pick(r"Immatriculation\s*[:.]?\s*(\d{1,4}\s*TU\s*\d{1,4}|RS\s*\d{3,7}|[^\n]{3,12}?)(?=\s{2,}|\s+(?:TUNIS|Marque|Type)\b|\n|$)") or "").strip() or None,
         "remarque": "Lu par OCR (service IA indisponible) : vérifiez chaque montant avec le document.",
     }
     if re.search(r"\bCARTE\b", flat):
@@ -582,15 +583,41 @@ def extract_ristournes(request: FicheRequest, db: Session = Depends(get_db)) -> 
             except HTTPException as exc:
                 # Both readings failed: say why, so the cause can be fixed (key, quota, service down).
                 raise HTTPException(status_code=503, detail=f"Lecture du document impossible : {ai_problem} ; {exc.detail}. Réessayez dans un moment ou saisissez la ristourne.") from exc
-        raw_lines = _dedupe([raw for raw in (document.get("lignes") or []) if isinstance(raw, dict)])
-        lines = [_check_line(db, raw) for raw in raw_lines]
+        return _answer(db, source, document)
     except SQLAlchemyError as exc:
         raise _fail(exc) from exc
-    lines = [line for line in lines if any(line[key] for key in ("num_ristourne", "num_police", "nette", "totale"))]
+
+
+def _answer(db: Session, source: str, document: dict[str, Any]) -> dict[str, Any]:
+    """The lines of a document read (one per ristourne), each checked against the database."""
+    raw_lines = _dedupe([raw for raw in (document.get("lignes") or []) if isinstance(raw, dict)])
+    lines = [_check_line(db, raw) for raw in raw_lines]
     return {
         "source": source,
         "compagnie": _clean(document.get("compagnie")),
         "type_document": _clean(document.get("type_document")),
         "date_document": _iso(document.get("date_document")),
-        "lignes": lines,
+        "lignes": [line for line in lines if any(line[key] for key in ("num_ristourne", "num_police", "nette", "totale"))],
     }
+
+
+class TextIn(BaseModel):
+    text: str = Field(min_length=20, max_length=300_000)
+
+
+@router.post("/extract-text")
+def extract_ristournes_from_text(payload: TextIn, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """The same reading from the text of the document recognised in the browser (when no AI service answers):
+    the company's quittance de ristourne (CARTE layout), else the policy numbers found in the database."""
+    try:
+        quittance = _parse_quittance(payload.text)
+        if quittance:
+            document = {"compagnie": quittance.pop("compagnie", None), "type_document": "Quittance de ristourne",
+                        "date_document": quittance.get("date_document"), "lignes": [quittance]}
+        else:
+            found = re.findall(r"[A-Z0-9][A-Z0-9/.-]{4,19}", payload.text.upper())
+            tokens = dict.fromkeys(token for token in found if sum(ch.isdigit() for ch in token) >= 4)
+            document = {"lignes": [{"num_police": token, "remarque": "Lu par OCR : montants et dates à saisir."} for token in tokens if _find_policies(db, token)]}
+        return _answer(db, "ocr-local", document)
+    except SQLAlchemyError as exc:
+        raise _fail(exc) from exc

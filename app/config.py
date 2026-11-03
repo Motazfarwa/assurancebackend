@@ -33,6 +33,8 @@ class Settings(BaseSettings):
     # Free alternative for reading scanned files only (Google AI Studio key); GEMINI_MODEL can be changed if Google renames it.
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-3.8-flash"  # gemini-2.5-flash is closed to new keys (Google's advice: gemini-3.8-flash)
+    # Optional second model, asked when the first one stays overloaded ("high demand") after the retries.
+    gemini_fallback_model: str | None = None
     # Free OCR (https://ocr.space/ocrapi/freekey): "helloworld" is a shared test key, set OCR_SPACE_API_KEY for your own.
     ocr_space_api_key: str = "helloworld"
     assistant_model: str = "claude-opus-5-5"
