@@ -59,7 +59,7 @@ ENTITIES = [
     (r"^sync", "Synchronisation", ""),
 ]
 # Not user actions: reading a scan, the assistant, session refresh, reading the notifications.
-SKIPPED = re.compile(r"^(auth/(refresh|logout)|assistant/|notifications|.*\b(extract|ocr)[\w-]*$|records/)")
+SKIPPED = re.compile(r"^(auth/(refresh|logout)|assistant/|notifications|ocr/|.*\b(extract|ocr)[\w-]*$|records/)")
 # Where the number of the record is found in the request / response body.
 ID_KEYS = ("numero", "num_quittance", "nump", "num_int", "num_police", "code_client", "clientCode", "code_banque",
            "code_compagnie", "code_branche", "code_prestataire", "username", "id", "bordereau_id", "cmp")
