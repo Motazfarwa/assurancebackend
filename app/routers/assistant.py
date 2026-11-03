@@ -183,23 +183,40 @@ GEMINI_TOOLS = [{
 }]
 
 
+_gemini_base = [""]  # the Gemini API that last accepted the key
+
+
 def _gemini_generate(body: dict[str, Any]) -> dict[str, Any]:
     """One Gemini call (Google AI Studio key, free tier). Errors become readable HTTP errors."""
-    key = settings.gemini_api_key or ""
-    # "AIza..." keys use the Generative Language API; "AQ." keys are Vertex AI express keys.
-    base = "https://aiplatform.googleapis.com/v1/publishers/google" if key.startswith("AQ.") else "https://generativelanguage.googleapis.com/v1beta"
-    try:
-        reply = httpx.post(f"{base}/models/{settings.gemini_model}:generateContent", headers={"x-goog-api-key": key}, json=body, timeout=90)
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=503, detail="Service IA injoignable (pas de connexion internet ?). La saisie manuelle reste disponible.") from exc
-    if reply.status_code >= 400:
+    key = (settings.gemini_api_key or "").strip()
+    # Google AI Studio keys start with "AIza..." or, the newer ones, "AQ."; Vertex AI express keys also start with "AQ.":
+    # the AI Studio API is tried first, then Vertex AI when the key is refused there.
+    studio = "https://generativelanguage.googleapis.com/v1beta"
+    vertex = "https://aiplatform.googleapis.com/v1/publishers/google"
+    bases = sorted([studio, vertex], key=lambda base: base != _gemini_base[0])  # the one that worked last time first
+    def reason_of(answer: httpx.Response) -> str:
         try:
-            reason = str(reply.json().get("error", {}).get("message", ""))[:200]
+            return str(answer.json().get("error", {}).get("message", ""))[:200] or "erreur"
         except ValueError:
-            reason = ""
-        if reply.status_code == 429:
-            raise HTTPException(status_code=429, detail="Quota gratuit atteint, réessayez dans une minute.")
-        raise HTTPException(status_code=503 if reply.status_code in (400, 401, 403, 404) else 502, detail=f"Service IA ({reply.status_code}) : {reason or 'erreur'}")
+            return "erreur"
+
+    reply = None
+    refusals: list[str] = []
+    for base in bases:
+        try:
+            reply = httpx.post(f"{base}/models/{settings.gemini_model}:generateContent", headers={"x-goog-api-key": key}, json=body, timeout=90)
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=503, detail="Service IA injoignable (pas de connexion internet ?). La saisie manuelle reste disponible.") from exc
+        if reply.status_code not in (400, 401, 403, 404):
+            _gemini_base[0] = base  # remembered: the next calls go straight to the API that accepts this key
+            break
+        refusals.append(f"{'Google AI Studio' if base == studio else 'Vertex AI'} ({reply.status_code}) : {reason_of(reply)}")
+    if reply.status_code == 429:
+        raise HTTPException(status_code=429, detail="Quota gratuit atteint, réessayez dans une minute.")
+    if reply.status_code >= 400:
+        # Both APIs refused the key: both reasons are given (the AI Studio one is the one to fix for a free key).
+        detail = " ; ".join(refusals) if refusals else f"Service IA ({reply.status_code}) : {reason_of(reply)}"
+        raise HTTPException(status_code=503 if reply.status_code in (400, 401, 403, 404) else 502, detail=f"Clé Gemini refusée — {detail}")
     try:
         return reply.json()
     except ValueError as exc:
@@ -380,27 +397,9 @@ def _extract_fiche_gemini(request: FicheRequest) -> dict[str, Any]:
         ]}],
         "generationConfig": {"response_mime_type": "application/json", "response_schema": schema, "temperature": 0},
     }
-    # Google AI Studio keys ("AIza...") use the Generative Language API; keys starting with "AQ." are Vertex AI
-    # express-mode keys and only work on the Vertex endpoint.
-    key = settings.gemini_api_key or ""
-    if key.startswith("AQ."):
-        url = f"https://aiplatform.googleapis.com/v1/publishers/google/models/{settings.gemini_model}:generateContent"
-    else:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{settings.gemini_model}:generateContent"
+    data = _gemini_generate(body)  # whichever Gemini API accepts the key (AI Studio first, then Vertex AI)
     try:
-        reply = httpx.post(url, headers={"x-goog-api-key": key}, json=body, timeout=90)
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=503, detail="Service de lecture injoignable (pas de connexion internet ?). La saisie manuelle reste disponible.") from exc
-    if reply.status_code >= 400:
-        try:
-            reason = str(reply.json().get("error", {}).get("message", ""))[:200]
-        except ValueError:
-            reason = ""
-        if reply.status_code == 429:
-            raise HTTPException(status_code=429, detail="Quota gratuit atteint, réessayez plus tard.")
-        raise HTTPException(status_code=503 if reply.status_code in (400, 401, 403, 404) else 502, detail=f"Service de lecture ({reply.status_code}) : {reason or 'erreur'}")
-    try:
-        parts = reply.json()["candidates"][0]["content"]["parts"]
+        parts = data["candidates"][0]["content"]["parts"]
         data = json.loads("".join(part.get("text", "") for part in parts))
     except (KeyError, IndexError, ValueError) as exc:
         raise HTTPException(status_code=502, detail="Réponse illisible du service de lecture.") from exc
