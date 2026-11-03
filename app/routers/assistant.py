@@ -451,6 +451,10 @@ def _extract_fiche_gemini(request: FicheRequest) -> dict[str, Any]:
 
 
 def _ocr_space(image_base64: str, media_type: str, language: str, engine: int) -> str:
+    if not settings.ocr_space_api_key or settings.ocr_space_api_key == "helloworld":
+        # ocr.space's shared demo key is nearly always refused (429): no waiting for it; the document is then read
+        # by OCR in the browser. A personal key (OCR_SPACE_API_KEY) makes this server OCR available again.
+        raise ValueError("pas de clé OCR.space personnelle (OCR_SPACE_API_KEY)")
     response = httpx.post(
         "https://api.ocr.space/parse/image",
         headers={"apikey": settings.ocr_space_api_key},

@@ -619,13 +619,22 @@ def delete_appel(numero: str, cmp: int, db: Session = Depends(get_db)) -> None:
 # Reading a scanned constat amiable / déclaration de sinistre (JPG, PNG or PDF)
 # ---------------------------------------------------------------------------------------------
 _VEHICLE = {
-    "nom_assure": "name of the insured (assuré / souscripteur)",
-    "conducteur": "name of the driver",
-    "compagnie": "insurance company name (e.g. GAT, STAR, COMAR, ASTREE, LLOYD, MAGHREBIA, CARTE, BIAT, AMI, BH)",
-    "num_police": "policy / contract number, digits exactly as printed",
-    "immatriculation": "registration plate exactly as printed (e.g. '209 TU 2222', 'RS 209848')",
+    "nom_assure": "name of the insured (assuré / souscripteur: Nom + Prénom, or the company name)",
+    "adresse_assure": "address of the insured",
+    "telephone_assure": "phone number of the insured",
+    "conducteur": "name of the driver (Nom + Prénom)",
+    "adresse_conducteur": "address of the driver",
+    "permis": "driving licence number and its date of issue (e.g. '07733323 du 25/01/2013')",
+    "compagnie": "insurance company name (e.g. GAT, STAR, COMAR, ASTREE, LLOYD, MAGHREBIA, CARTE, BIAT, AMI, BH, EL AMANA TAKAFUL)",
+    "num_police": "policy / contract number, digits exactly as written",
+    "agence": "insurance agency (Agence) number or name",
+    "attestation": "insurance certificate validity, 'du dd/mm/yyyy au dd/mm/yyyy'",
+    "immatriculation": "registration plate exactly as written (e.g. '209 TU 2222', 'RS 209848')",
     "marque": "make and model of the vehicle",
-    "degats": "visible damage / point of impact (damaged parts), short",
+    "trajet": "direction: 'sens suivi', 'venant de' and 'allant à', short",
+    "cases": "circumstances boxes ticked for this vehicle (numbers and their printed labels, e.g. '1 en stationnement')",
+    "degats": "visible damage / point of impact (dégâts apparents), the damaged parts",
+    "observations": "this driver's own observations (box 14), as written",
 }
 SINISTRE_FIELDS: dict[str, str] = {
     "type_document": "'constat' for a constat amiable d'accident automobile, 'declaration' for a déclaration de sinistre, otherwise 'autre'.",
@@ -636,13 +645,17 @@ SINISTRE_FIELDS: dict[str, str] = {
     **{f"a_{key}": f"Vehicle A: {hint}." for key, hint in _VEHICLE.items()},
     **{f"b_{key}": f"Vehicle B: {hint}." for key, hint in _VEHICLE.items()},
     "num_sinistre_compagnie": "Claim number given by an insurance company, when printed.",
-    "circonstances": "Short summary of the circumstances and observations, at most 200 characters.",
+    "degats_autres": "'oui' / 'non': material damage to other things than vehicles A and B (box 4).",
+    "temoins": "Witnesses: names, addresses, phones (box 5), as written.",
+    "circonstances": "Short summary of what happened (from the boxes ticked, the sketch and the observations), at most 200 characters.",
 }
 SINISTRE_PROMPT = (
     "This document is a scanned or photographed Tunisian insurance claim: usually a 'constat amiable d'accident automobile' "
-    "(two vehicles A and B) or a 'déclaration de sinistre', in French and/or Arabic. Read it and fill the requested fields. "
-    "Copy values exactly as printed; use null for anything not visible or not certain, never guess. "
-    "A déclaration with a single insured goes in the vehicle A fields. Dates as dd/mm/yyyy."
+    "(two vehicles A and B) or a 'déclaration de sinistre', in French and/or Arabic. Most values are HANDWRITTEN in the boxes "
+    "of a printed form: read the handwriting carefully, box by box, for vehicle A (left, yellow) and vehicle B (right, green). "
+    "Fill every requested field that is written on the document. Copy values as written; use null for a box that is empty, "
+    "unreadable or not certain, never guess. A déclaration with a single insured goes in the vehicle A fields. "
+    "Dates as dd/mm/yyyy, times as hh:mm."
 )
 
 
@@ -657,7 +670,7 @@ def _extract_ai(request: FicheRequest) -> dict[str, Any]:
         }
         response = client.messages.create(
             model=settings.assistant_model,
-            max_tokens=4000,
+            max_tokens=8000,
             output_config={"format": {"type": "json_schema", "schema": schema}, "effort": "medium"},
             messages=[{
                 "role": "user",
