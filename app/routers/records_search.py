@@ -52,8 +52,9 @@ def search_policies(
         params["num_police"] = _like(num_police)
     rows = db.execute(
         text(
-            'SELECT p.*, TRIM(c.nom_client) AS nom_client FROM dbo."TPolice" p '
+            'SELECT p.*, TRIM(c.nom_client) AS nom_client, TRIM(co.nom_compagnie) AS nom_compagnie FROM dbo."TPolice" p '
             'LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(p.code_client) '
+            'LEFT JOIN dbo."TCompagnie" co ON co.code_compagnie = p.code_compagnie '
             f"WHERE {' AND '.join(conditions)} ORDER BY p.effet DESC NULLS LAST, p.num_police LIMIT :limit"
         ),
         params,
