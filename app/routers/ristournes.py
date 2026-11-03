@@ -546,18 +546,45 @@ def _parse_quittance(raw: str) -> dict[str, Any] | None:
     # The row of amounts under "Prime de Base | Prime Annexe | Frais | Taxe Base | Taxes Annexes | F.P.C.S.R | FPAC |
     # FGA | Prime Totale": its first five amounts, then the LAST one is the Prime Totale; amounts in between are
     # the FPCSR / FPAC / FGA cells that are filled (usually empty).
-    amount = r"-?\d[\d .]*,\d{3}\s*DT"
+    amount = r"-?\s?\d[\d .]*,\d{3}\s*D\s?T"
+    every = [re.sub(r"\s*D\s?T$", "", cell).replace(" ", "") for cell in re.findall(f"({amount})", raw)]
+    checked = _consistent_row(every)
+    if checked:
+        # The row whose amounts add up: Base + Annexe + Frais + Taxe Base + Taxes Annexes (+ FPCSR / FPAC / FGA) = Totale.
+        line.update(checked)
+        return line
     rows = [re.findall(f"({amount})", row) for row in raw.splitlines()]
     row = next((cells for cells in rows if len(cells) >= 6), None)
     if row is None:  # the cells were read on separate lines: the amounts in order of the whole text
-        every = re.findall(f"({amount})", flat)
         row = every[:6] if len(every) >= 6 else None
     if row:
-        cells = [re.sub(r"\s*DT$", "", cell) for cell in row[:9]]
+        cells = [re.sub(r"\s*D\s?T$", "", cell).replace(" ", "") for cell in row[:9]]
         line.update(dict(zip(("prime_base", "prime_annexe", "frais", "taxe_base", "taxes_annexes"), cells[:5])))
         line.update(dict(zip(("fpcsr", "fpac", "fga"), cells[5:-1])))
         line["totale"] = cells[-1]
     return line
+
+
+def _consistent_row(amounts: list[str]) -> dict[str, Any] | None:
+    """Among the amounts read in order, the row of the quittance's table whose cells add up to its Prime Totale.
+    The OCR often drops the minus sign of Frais and Taxe Base (refunds are negative there): both signs are tried."""
+    values = [_signed(value) for value in amounts]
+    for width in (6, 7, 8, 9):  # 5 cells + Prime Totale, plus up to 3 filled FPCSR / FPAC / FGA cells
+        for start in range(0, len(values) - width + 1):
+            window = values[start:start + width]
+            if any(value is None for value in window):
+                continue
+            *parts, total = window
+            for frais_sign in (1, -1):
+                for taxe_sign in (1, -1):
+                    cells = list(parts)
+                    cells[2] = abs(cells[2]) * frais_sign if frais_sign == -1 or cells[2] >= 0 else cells[2]
+                    cells[3] = abs(cells[3]) * taxe_sign if taxe_sign == -1 or cells[3] >= 0 else cells[3]
+                    if total > 0 and abs(sum(cells) - total) <= 0.011:
+                        row = dict(zip(("prime_base", "prime_annexe", "frais", "taxe_base", "taxes_annexes"), cells[:5]))
+                        row.update(dict(zip(("fpcsr", "fpac", "fga"), cells[5:])))
+                        return {**row, "totale": total}
+    return None
 
 
 def _dedupe(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
