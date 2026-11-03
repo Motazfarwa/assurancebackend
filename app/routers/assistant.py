@@ -213,8 +213,11 @@ def _gemini_generate(body: dict[str, Any]) -> dict[str, Any]:
 
     def post(base: str, model: str, payload: dict[str, Any]) -> httpx.Response:
         # A scanned PDF can still take the model a while: up to GEMINI_TIMEOUT seconds for the answer.
-        return httpx.post(f"{base}/models/{model}:generateContent", headers={"x-goog-api-key": key}, json=payload,
-                          timeout=httpx.Timeout(GEMINI_TIMEOUT, connect=15))
+        started = time.monotonic()
+        answer = httpx.post(f"{base}/models/{model}:generateContent", headers={"x-goog-api-key": key}, json=payload,
+                            timeout=httpx.Timeout(GEMINI_TIMEOUT, connect=15))
+        logger.info("Gemini %s : réponse %s en %.1f s", model, answer.status_code, time.monotonic() - started)
+        return answer
 
     def ask(base: str) -> httpx.Response:
         """The model's answer; when Google is momentarily overloaded ("high demand", 503…) it is asked again after a

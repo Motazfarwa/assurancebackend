@@ -484,6 +484,9 @@ def _check_line(db: Session, raw: dict[str, Any]) -> dict[str, Any]:
 
 def _ocr_lines(db: Session, request: FicheRequest) -> dict[str, Any]:
     """Without an AI service: OCR the document and keep only the policy numbers found in the database (amounts are not read)."""
+    if not settings.ocr_space_api_key or settings.ocr_space_api_key == "helloworld":
+        # ocr.space's shared demo key is nearly always refused (429): no waiting for it, the browser reads the document.
+        raise HTTPException(status_code=503, detail="pas de clé OCR.space personnelle (OCR_SPACE_API_KEY)")
     texts: list[str] = []
     for language, engine in (("fre", 2), ("ara", 1)):
         try:

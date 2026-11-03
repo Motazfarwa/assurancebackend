@@ -786,3 +786,15 @@ def extract_sinistre(request: FicheRequest, db: Session = Depends(get_db)) -> di
         fields = _parse_text("\n".join(texts))
     sinistre, policy, side = _suggest(db, fields)
     return {"source": source, "fields": fields, "sinistre": sinistre, "police": policy, "vehicule_assure": side}
+
+
+class SinistreTextIn(BaseModel):
+    text: str = Field(min_length=10, max_length=300_000)
+
+
+@router.post("/extract-text")
+def extract_sinistre_from_text(payload: SinistreTextIn, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """The same reading from the text of the constat / déclaration recognised by OCR in the browser (no AI)."""
+    fields = _parse_text(payload.text)
+    sinistre, policy, side = _suggest(db, fields)
+    return {"source": "ocr", "fields": fields, "sinistre": sinistre, "police": policy, "vehicule_assure": side}

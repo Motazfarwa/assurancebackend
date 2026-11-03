@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -35,6 +36,10 @@ from app.routers.historique import router as historique_router
 from app.routers.notifications import router as notifications_router
 from app.audit import audit_middleware
 from app.repairs import run_repairs
+
+# The application's own messages (readings, repairs, history) appear in the server logs; other libraries stay at warnings.
+logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+logging.getLogger("app").setLevel(logging.INFO)
 
 
 @asynccontextmanager

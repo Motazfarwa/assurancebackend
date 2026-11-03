@@ -242,9 +242,24 @@ def extract_banque(request: FicheRequest) -> dict[str, Any]:
         if not texts:
             raise HTTPException(status_code=503, detail="Lecture du document impossible (service OCR indisponible ou texte illisible).")
         fields = _parse_text("\n".join(texts))
+    return {"source": source, "fields": _finish(fields)}
+
+
+def _finish(fields: dict[str, Any]) -> dict[str, Any]:
+    """The values read, cleaned: the RIB as its 20 digits, the bank deduced from the RIB when not printed."""
     fields = {key: (str(fields.get(key)).strip() if fields.get(key) not in (None, "") else None) for key in BANK_FIELDS}
     rib = re.sub(r"\D", "", fields["rib"] or "")
     fields["rib"] = rib if len(rib) == 20 else (fields["rib"] or None)
     if not fields["banque"] and len(rib) == 20:
         fields["banque"] = RIB_BANKS.get(rib[:2])
-    return {"source": source, "fields": fields}
+    return fields
+
+
+class TextIn(BaseModel):
+    text: str = Field(min_length=10, max_length=300_000)
+
+
+@router.post("/extract-text")
+def extract_banque_from_text(payload: TextIn) -> dict[str, Any]:
+    """The same reading from the text of the RIB / relevé recognised by OCR in the browser (no AI)."""
+    return {"source": "ocr", "fields": _finish(_parse_text(payload.text))}
