@@ -86,6 +86,9 @@ class RistournePayload(BaseModel):
     nette: float = 0
     decommission: float = 0
     detaxe: float = 0
+    # The Prime Totale printed on the company's quittance, when the ristourne comes from one: kept as printed
+    # (nette + détaxe may differ from it by a rounding millime). Otherwise the total is nette + détaxe.
+    totale: float | None = None
     observation: str | None = Field(default=None, max_length=50)
     informations: str | None = Field(default=None, max_length=200)
 
@@ -140,7 +143,14 @@ def _amounts(payload: RistournePayload) -> dict[str, Any]:
         raise HTTPException(status_code=422, detail="Les montants de la ristourne doivent être positifs.")
     if payload.date_du and payload.date_au and payload.date_au < payload.date_du:
         raise HTTPException(status_code=422, detail="La date « Au » précède la date « Du ».")
-    return {"totale": round(payload.nette + payload.detaxe, 3)}
+    computed = round(payload.nette + payload.detaxe, 3)
+    if payload.totale is None:
+        return {"totale": computed}
+    if payload.totale < 0:
+        raise HTTPException(status_code=422, detail="La ristourne totale doit être positive.")
+    if abs(payload.totale - computed) > 1:
+        raise HTTPException(status_code=422, detail=f"La ristourne totale ({payload.totale:.3f}) ne correspond pas à nette + détaxe ({computed:.3f}).")
+    return {"totale": round(payload.totale, 3)}
 
 
 @router.get("")
@@ -303,8 +313,12 @@ LINE_FIELDS = {
     "remarque": ("string", "Anything on this line that is unclear, crossed out, handwritten or hard to read; null when all is clear."),
 }
 # Columns that make up the ristourne nette (the premium and costs) and the détaxe (the taxes and funds).
+# The agency's rule for a company's quittance de ristourne:
+#   Ristourne nette = Prime de Base + Prime Annexe + Frais ; Détaxe = Taxe Base + Taxes Annexes ;
+#   Ristourne totale = Prime Totale (as printed). FPCSR / FPAC / FGA / Timbre are shown, not added.
 NET_COLUMNS = ("prime_base", "prime_annexe", "frais")
-TAX_COLUMNS = ("taxe_base", "taxes_annexes", "fpcsr", "fpac", "fga", "timbre")
+TAX_COLUMNS = ("taxe_base", "taxes_annexes")
+OTHER_COLUMNS = ("fpcsr", "fpac", "fga", "timbre")
 COLUMN_LABELS = {
     "prime_base": "Prime de base", "prime_annexe": "Prime annexe", "frais": "Frais", "taxe_base": "Taxe base",
     "taxes_annexes": "Taxes annexes", "fpcsr": "F.P.C.S.R", "fpac": "FPAC", "fga": "FGA", "timbre": "Timbre",
@@ -443,7 +457,7 @@ def _check_line(db: Session, raw: dict[str, Any]) -> dict[str, Any]:
     if line["remarque"]:
         warnings.append(f"Lecture incertaine : {line['remarque']}")
     # The columns printed on the document, kept as they are (sign included) to be shown with the line.
-    columns = {key: _signed(raw.get(key)) for key in (*NET_COLUMNS, *TAX_COLUMNS)}
+    columns = {key: _signed(raw.get(key)) for key in (*NET_COLUMNS, *TAX_COLUMNS, *OTHER_COLUMNS)}
     line["colonnes"] = [{"libelle": COLUMN_LABELS[key], "valeur": value} for key, value in columns.items() if value is not None]
     # No "ristourne nette" / "détaxe" printed as such (CARTE, STAR… quittances): their sums of the printed columns.
     computed: list[str] = []
@@ -529,11 +543,20 @@ def _parse_quittance(raw: str) -> dict[str, Any] | None:
     }
     if re.search(r"\bCARTE\b", flat):
         line["compagnie"] = "CARTE"
-    # The row of amounts under "Prime de Base … Prime Totale": with 6 amounts, the FPCSR / FPAC / FGA cells are empty.
-    amounts = re.findall(r"(-?\d[\d .]*,\d{3})\s*DT", flat)
-    if len(amounts) >= 6:
-        row = amounts[:6]
-        line.update(dict(zip(("prime_base", "prime_annexe", "frais", "taxe_base", "taxes_annexes", "totale"), row)))
+    # The row of amounts under "Prime de Base | Prime Annexe | Frais | Taxe Base | Taxes Annexes | F.P.C.S.R | FPAC |
+    # FGA | Prime Totale": its first five amounts, then the LAST one is the Prime Totale; amounts in between are
+    # the FPCSR / FPAC / FGA cells that are filled (usually empty).
+    amount = r"-?\d[\d .]*,\d{3}\s*DT"
+    rows = [re.findall(f"({amount})", row) for row in raw.splitlines()]
+    row = next((cells for cells in rows if len(cells) >= 6), None)
+    if row is None:  # the cells were read on separate lines: the amounts in order of the whole text
+        every = re.findall(f"({amount})", flat)
+        row = every[:6] if len(every) >= 6 else None
+    if row:
+        cells = [re.sub(r"\s*DT$", "", cell) for cell in row[:9]]
+        line.update(dict(zip(("prime_base", "prime_annexe", "frais", "taxe_base", "taxes_annexes"), cells[:5])))
+        line.update(dict(zip(("fpcsr", "fpac", "fga"), cells[5:-1])))
+        line["totale"] = cells[-1]
     return line
 
 

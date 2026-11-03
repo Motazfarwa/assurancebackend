@@ -242,26 +242,32 @@ def confrontation(
     periode: str = Query(pattern=r"^[0-9]{2}/[0-9]{4}$"),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Compares the stored bordereau with the agency's policies and receipts for the same company and period."""
+    """Compares the stored bordereau with the agency's policies and receipts for the same company and period.
+    The bordereau is the one of dbo."TBordereau" (the agency's bordereaux, as in the legacy software); a bordereau
+    only imported in this application (dbo."TBordereauCie", e.g. a comptant one) is used when TBordereau has none."""
     _ensure_tables(db)
-    header = db.execute(
-        text(
-            'SELECT b.*, c.nom_compagnie FROM dbo."TBordereauCie" b LEFT JOIN dbo."TCompagnie" c ON c.code_compagnie = b.code_compagnie '
-            "WHERE b.code_compagnie = :c AND b.tc = :t AND b.periode = :p"
-        ),
-        {"c": code_compagnie, "t": tc, "p": periode},
-    ).mappings().first()
-    if not header:
-        raise HTTPException(status_code=404, detail="Aucun bordereau reçu pour cette compagnie et cette période. Importez-le d'abord (Réception terme ou Réception comptant).")
+    legacy = _legacy_bordereau(db, code_compagnie, tc, periode)
+    if legacy:
+        header, lines = legacy
+    else:
+        header = db.execute(
+            text(
+                'SELECT b.*, c.nom_compagnie FROM dbo."TBordereauCie" b LEFT JOIN dbo."TCompagnie" c ON c.code_compagnie = b.code_compagnie '
+                "WHERE b.code_compagnie = :c AND b.tc = :t AND b.periode = :p"
+            ),
+            {"c": code_compagnie, "t": tc, "p": periode},
+        ).mappings().first()
+        if not header:
+            raise HTTPException(status_code=404, detail="Aucun bordereau reçu pour cette compagnie et cette période. Importez-le d'abord (Réception terme ou Réception comptant).")
+        header = {**dict(header), "source": "TBordereauCie"}
+        lines = [dict(row) for row in db.execute(
+            text(f'SELECT {LINE_COLUMNS} FROM dbo."TBordereauLigne" WHERE id_bordereau = :i ORDER BY ligne'),
+            {"i": header["id_bordereau"]},
+        ).mappings().all()]
 
     month, year = int(periode[:2]), int(periode[3:])
     first_day = date(year, month, 1)
     next_first = date(year + (month == 12), month % 12 + 1, 1)
-
-    lines = [dict(row) for row in db.execute(
-        text(f'SELECT {LINE_COLUMNS} FROM dbo."TBordereauLigne" WHERE id_bordereau = :i ORDER BY ligne'),
-        {"i": header["id_bordereau"]},
-    ).mappings().all()]
 
     policy_select = (
         'SELECT TRIM(p.num_int) AS num_int, TRIM(p.num_police) AS num_police, TRIM(p.code_client) AS code_client, c.nom_client, '
@@ -308,7 +314,7 @@ def confrontation(
     for start in range(0, len(quittance_numbers), 1000):
         chunk = quittance_numbers[start:start + 1000]
         statement = text(
-            'SELECT TRIM(num_quittance) AS num_quittance, TRIM(num_int) AS num_int, prime_net, commission, prime_total FROM dbo."TQuittance" '
+            'SELECT TRIM(num_quittance) AS num_quittance, TRIM(num_int) AS num_int, prime_net, commission, prime_total, COALESCE(frais_quit, 0) AS frais_quit FROM dbo."TQuittance" '
             "WHERE TRIM(num_quittance) IN :numbers"
         ).bindparams(bindparam("numbers", expanding=True))
         for row in db.execute(statement, {"numbers": chunk}).mappings().all():
@@ -318,7 +324,7 @@ def confrontation(
     for start in range(0, len(internal_ids), 1000):
         chunk = internal_ids[start:start + 1000]
         statement = text(
-            'SELECT TRIM(num_quittance) AS num_quittance, TRIM(num_int) AS num_int, prime_net, commission, prime_total FROM dbo."TQuittance" '
+            'SELECT TRIM(num_quittance) AS num_quittance, TRIM(num_int) AS num_int, prime_net, commission, prime_total, COALESCE(frais_quit, 0) AS frais_quit FROM dbo."TQuittance" '
             "WHERE TRIM(num_int) IN :ids AND echeance >= :first_day AND echeance < :next_first ORDER BY echeance DESC"
         ).bindparams(bindparam("ids", expanding=True))
         for row in db.execute(statement, {"ids": chunk, "first_day": first_day, "next_first": next_first}).mappings().all():
@@ -361,8 +367,13 @@ def confrontation(
             receipt = receipts_by_number.get(_clean_number(line["num_quittance"])) if line["num_quittance"] else None
             receipt = receipt or receipts_by_policy.get(str(policy["num_int"]).strip())
             if receipt:
+                # The companies' bordereaux give the net premium WITH the quittance's fees (frais_quit: 5, 10, 20 DT…):
+                # it matches when it equals our net premium, or our net premium + those fees.
+                fees = float(receipt["frais_quit"] or 0)
+                if differs(line["prime_net"], receipt["prime_net"]) and differs(line["prime_net"], float(receipt["prime_net"] or 0) + fees):
+                    ours = f"{float(receipt['prime_net']):.3f}" + (f" + frais {fees:.3f}" if fees else "")
+                    reasons.append(f"Prime nette différente (bordereau {float(line['prime_net']):.3f} / chez nous {ours})")
                 for label, theirs, ours in (
-                    ("Prime nette", line["prime_net"], receipt["prime_net"]),
                     ("Commission", line["commission"], receipt["commission"]),
                     ("Prime totale", line["prime_total"], receipt["prime_total"]),
                 ):
@@ -427,6 +438,91 @@ def confrontation(
         "non_parvenus": not_received,
         "branches": sorted(branches.values(), key=lambda entry: entry["code_branche"]),
     }
+
+
+LEGACY_KEY = 'b."Code_Compagnie" = :c AND b.tc = :t AND TRIM(b."Periode") = :p'
+
+
+def _legacy_bordereau(db: Session, code_compagnie: int, tc: str, periode: str) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+    """(header, lines) of the bordereau stored in dbo."TBordereau" (one row per quittance), or None when it has none.
+    Its lines are given the shape of the imported ones: the policy is the internal number (num_int)."""
+    rows = db.execute(
+        text(
+            'SELECT b."Num_Ligne" AS ligne, TRIM(b.num_int) AS num_police, TRIM(b.code_client) AS code_client, TRIM(c.nom_client) AS nom_client, '
+            'b.echeance, TRIM(b.num_quittance) AS num_quittance, b.prime_net, b.commission, b.prime_total, '
+            'b."Fusion" AS fusion, b."Date_Bordereau" AS date_bordereau, b."Total_Bordereau" AS total_bordereau, '
+            'b."Solde_Bordereau" AS solde_bordereau, b."Update_User" AS update_user, b."Update_Date" AS update_date '
+            'FROM dbo."TBordereau" b LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(b.code_client) '
+            f'WHERE {LEGACY_KEY} ORDER BY b."Num_Ligne"'
+        ),
+        {"c": code_compagnie, "t": tc, "p": periode},
+    ).mappings().all()
+    if not rows:
+        return None
+    company = db.execute(text('SELECT TRIM(nom_compagnie) FROM dbo."TCompagnie" WHERE code_compagnie = :c'), {"c": code_compagnie}).scalar()
+    fused = all((row["fusion"] or "").strip().upper() == "O" for row in rows)
+    first = rows[0]
+    header = {
+        "id_bordereau": None, "source": "TBordereau", "code_compagnie": code_compagnie, "nom_compagnie": company, "tc": tc,
+        "periode": periode, "date_reception": first["date_bordereau"], "nb_lignes": len(rows),
+        "total_prime": float(first["total_bordereau"] or 0) or sum(float(row["prime_total"] or 0) for row in rows),
+        "solde_bordereau": first["solde_bordereau"],
+        "fusionne": "O" if fused else "N",
+        "nb_lignes_fusionnees": sum(1 for row in rows if (row["fusion"] or "").strip().upper() == "O"),
+        "date_fusion": max((row["update_date"] for row in rows if row["update_date"]), default=None) if fused else None,
+        "fusion_par": (first["update_user"] or "").strip() or None if fused else None,
+    }
+    keys = ("ligne", "num_police", "code_client", "nom_client", "echeance", "num_quittance", "prime_net", "commission", "prime_total")
+    return header, [{key: row[key] for key in keys} for row in rows]
+
+
+class PeriodFusionIn(BaseModel):
+    code_compagnie: int
+    tc: str = Field(default="T", pattern="^[TC]$")
+    periode: str = Field(pattern=r"^[0-9]{2}/[0-9]{4}$")
+    forcer: bool = False  # merge even though the confrontation found differences (the user confirmed them)
+
+
+@router.post("/fusion-periode")
+def fuse_period(payload: PeriodFusionIn, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Fuses the bordereau of dbo."TBordereau" for a company, T/C and period: its lines are marked "Fusion" = 'O'
+    (as the legacy software did); the agency's policies and quittances are not changed."""
+    if not _legacy_bordereau(db, payload.code_compagnie, payload.tc, payload.periode):
+        raise HTTPException(status_code=404, detail="Aucun bordereau dans TBordereau pour cette compagnie et cette période.")
+    result = confrontation(code_compagnie=payload.code_compagnie, tc=payload.tc, periode=payload.periode, db=db)
+    summary = result["resume"]
+    if summary["fusionne"]:
+        raise HTTPException(status_code=409, detail="Ce bordereau est déjà fusionné.")
+    if not summary["fusion"] and not payload.forcer:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{summary['nb_ecarts']} écart(s), {summary['nb_inconnues']} police(s) inconnue(s), "
+                f"{summary['nb_non_parvenus']} terme(s) non parvenu(s) : consultez la confrontation ou confirmez la fusion."
+            ),
+        )
+    db.execute(
+        text(f'UPDATE dbo."TBordereau" b SET "Fusion" = \'O\', "Update_User" = :u, "Update_Date" = now() WHERE {LEGACY_KEY}'),
+        {"c": payload.code_compagnie, "t": payload.tc, "p": payload.periode, "u": str(user.get("sub", ""))[:50]},
+    )
+    db.commit()
+    return {**summary, "fusionne": True}
+
+
+@router.delete("/fusion-periode", status_code=204)
+def cancel_period_fusion(
+    code_compagnie: int,
+    tc: str = Query(default="T", pattern="^[TC]$"),
+    periode: str = Query(pattern=r"^[0-9]{2}/[0-9]{4}$"),
+    user: dict[str, Any] = Depends(require_current_user),
+    db: Session = Depends(get_db),
+) -> None:
+    """Cancels the fusion of the bordereau of dbo."TBordereau": its lines go back to "Fusion" = 'N'."""
+    db.execute(
+        text(f'UPDATE dbo."TBordereau" b SET "Fusion" = \'N\', "Update_User" = :u, "Update_Date" = now() WHERE {LEGACY_KEY}'),
+        {"c": code_compagnie, "t": tc, "p": periode, "u": str(user.get("sub", ""))[:50]},
+    )
+    db.commit()
 
 
 @router.get("/{bordereau_id}")
