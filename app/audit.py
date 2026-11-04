@@ -2,7 +2,9 @@
 1 Consultation, 2 Ajout, 3 Modification, 4 Suppresion, 5 Impression, 6 Annulation, 7 Tentative.
 
 Every add / change / delete the API accepts is recorded by the middleware below; a refused one (403 / 409)
-is recorded as a "Tentative", as is a failed sign-in.
+is recorded as a "Tentative", as is a failed sign-in. As in the legacy software, opening a record is a "Consultation"
+and showing an état (aperçu / impression) an "Impression" (READS below; typing in a search list is not recorded, and
+the same consultation repeated within a few minutes is recorded once).
 
 What exactly was done is kept in dbo."TMouchardDetail" (same "N"): for a change, each field with its value before and
 after (the record is read before the change and again after it); for an addition, the values of the new record; for a
@@ -69,6 +71,73 @@ SKIPPED = re.compile(r"^(auth/(refresh|logout)|assistant/|notifications|ocr/|.*\
 # Where the number of the record is found in the request / response body.
 ID_KEYS = ("numero", "num_quittance", "nump", "num_int", "num_police", "code_client", "clientCode", "code_banque",
            "code_compagnie", "code_branche", "code_prestataire", "username", "id", "bordereau_id", "cmp")
+
+
+# Consultations and états: path after /api/ -> (move, wording built from the path groups and the query string).
+def _period(query: dict[str, str]) -> str:
+    def fr(value: str) -> str:
+        return "/".join(reversed(value[:10].split("-"))) if value else ""
+    debut = fr(query.get("debut") or query.get("du") or query.get("date_debut") or "")
+    fin = fr(query.get("fin") or query.get("au") or query.get("date_fin") or "")
+    if debut and fin:
+        return f" du {debut} au {fin}"
+    return f" du {debut or fin}" if debut or fin else ""
+
+
+def _company(query: dict[str, str]) -> str:
+    return query.get("compagnie") or query.get("code_compagnie") or ""
+
+
+KINDS = {"police": "polices", "quittance": "quittances", "technique": "technique", "divers": "divers", "moins": "moins perçus", "trop": "trop perçus"}
+READS: list[tuple[str, str, Any]] = [
+    (r"^clients/(?P<c>(?!next-code$)[^/]+)$", "Consultation", lambda g, q: f"Consultation du client N° {g['c']}"),
+    (r"^clients/(?P<c>[^/]+)/policies$", "Consultation", lambda g, q: f"Consultation des polices du client N° {g['c']}"),
+    (r"^clients/(?P<c>[^/]+)/receipts$", "Consultation", lambda g, q: f"Consultation des quittances du client N° {g['c']}"),
+    (r"^clients/(?P<c>[^/]+)/claims$", "Consultation", lambda g, q: f"Consultation des sinistres du client N° {g['c']}"),
+    (r"^polices/detail$", "Consultation", lambda g, q: f"Consultation de la police N° {q['num_police']}" if q.get("num_police")
+        else f"Consultation des polices du client N° {q.get('code_client', '')}"),
+    (r"^polices/client/(?P<c>[^/]+)$", "Consultation", lambda g, q: f"Consultation des polices du client N° {g['c']}"),
+    (r"^records/policies$", "Consultation", lambda g, q: f"Consultation des polices du client N° {q['code_client']}" if q.get("code_client")
+        else f"Consultation de la police N° {q['num_police']}" if q.get("num_police") else None),
+    (r"^records/receipts$", "Consultation", lambda g, q: f"Consultation des quittances de la police N° {q['num_int']}" if q.get("num_int") else None),
+    (r"^sinistres/(?P<n>\d+)$", "Consultation", lambda g, q: f"Consultation du sinistre N° {g['n']}"),
+    (r"^ristournes/(?P<n>(?!police$)[^/]+)$", "Consultation", lambda g, q: f"Consultation de la ristourne N° {g['n']}"),
+    (r"^flotte/(?P<n>[^/]+)$", "Consultation", lambda g, q: f"Consultation de la flotte police N° {g['n']}"),
+    (r"^flotte/(?P<n>[^/]+)/vehicules/(?P<o>[^/]+)/sinistres$", "Consultation",
+     lambda g, q: f"Consultation des sinistres du véhicule {g['o']} de la flotte police N° {g['n']}"),
+    (r"^reglements-clients/client/(?P<c>[^/]+)$", "Consultation", lambda g, q: f"Consultation des règlements du client N° {g['c']}"),
+    (r"^reglements-clients/(?P<n>\d+)$", "Consultation", lambda g, q: f"Consultation du règlement N° {g['n']}"),
+    (r"^cheques/client/(?P<c>[^/]+)$", "Consultation", lambda g, q: f"Consultation des pièces du client N° {g['c']}"),
+    (r"^cheques/instance$", "Consultation", lambda g, q: "Consultation des pièces en instance"),
+    (r"^bordereaux/(?P<n>\d+)$", "Consultation", lambda g, q: f"Consultation du bordereau N° {g['n']}"),
+    (r"^bordereaux/confrontation$", "Consultation",
+     lambda g, q: f"Consultation Confrontation bordereau compagnie {q.get('code_compagnie', '')} période {q.get('periode', '')}"),
+    (r"^prestataires/(?P<c>(?!lookups$)[^/]+)$", "Consultation", lambda g, q: f"Consultation du prestataire N° {g['c']}"),
+    (r"^journaux/encaissement$", "Consultation", lambda g, q: f"Consultation Journal d'encaissement compagnie {_company(q)}{_period(q)}"),
+    (r"^journaux/depense$", "Consultation", lambda g, q: f"Consultation Journal de dépense compagnie {_company(q)}{_period(q)}"),
+    (r"^journaux/feuille$", "Impression", lambda g, q: f"Impression Feuille de caisse compagnie {_company(q)}{_period(q)}"),
+    (r"^journaux/percus$", "Impression", lambda g, q: f"Impression Etat des {KINDS.get(q.get('type', 'moins'), '')}{_period(q)}"),
+    (r"^journaux/production$", "Impression",
+     lambda g, q: f"Impression Etat des opérations journalières (production des {KINDS.get(q.get('type', 'police'), '')}){_period(q)}"),
+    (r"^journaux/financier$", "Impression",
+     lambda g, q: f"Impression Etat financier des opérations journalières ({KINDS.get(q.get('type', 'technique'), '')}){_period(q)}"),
+    (r"^impayes-agence/etat$", "Impression", lambda g, q: f"Impression Etat des impayés{_period(q)}"),
+    (r"^impayes-agence/acomptes$", "Impression", lambda g, q: "Impression Etat des acomptes"),
+    (r"^impayes-agence$", "Consultation", lambda g, q: "Consultation des impayés agence"),
+    (r"^historique$", "Consultation", lambda g, q: f"Consultation Journal des événements{_period(q)}"),
+]
+# The same consultation by the same user within this many seconds is one consultation (lists reloaded as filters change).
+REPEAT_SECONDS = 120
+
+
+def describe_read(path: str, query: dict[str, str]) -> tuple[str, str] | None:
+    rest = path.split("/api/", 1)[-1].strip("/")
+    for pattern, move, wording in READS:
+        found = re.match(pattern, rest)
+        if found:
+            design = wording(found.groupdict(), query)
+            return (move, re.sub(r"\s+", " ", design).strip()[:250]) if design else None
+    return None
 
 
 # Path after /api/ -> the record it acts on, read before and after the change (key values from the path, then the
@@ -302,6 +371,16 @@ def record(user: str, move: str, design: str, detail: Any = None) -> None:
             db.commit()
             _detail_ready = True
         db.execute(text("SELECT pg_advisory_xact_lock(hashtext('dbo.TMouchard.N'))"))
+        if move in ("Consultation", "Impression"):
+            since = now - timedelta(seconds=REPEAT_SECONDS)
+            repeated = db.execute(
+                text('SELECT 1 FROM dbo."TMouchard" WHERE utilisateur = :u AND design = :design AND dmvt = :d AND "Hmvt" >= :h LIMIT 1'),
+                {"u": user[:50], "design": design, "d": now.replace(hour=0, minute=0, second=0, microsecond=0),
+                 "h": datetime(1900, 1, 1, since.hour, since.minute, since.second) if since.date() == now.date() else datetime(1900, 1, 1)},
+            ).first()
+            if repeated:
+                db.rollback()
+                return
         number = db.execute(
             text(
                 'INSERT INTO dbo."TMouchard" ("N", utilisateur, "Mvt", dmvt, "Hmvt", design, code) '
@@ -325,6 +404,15 @@ def record(user: str, move: str, design: str, detail: Any = None) -> None:
 
 async def audit_middleware(request: Request, call_next):
     method = request.method.upper()
+    if method == "GET" and "/api/" in request.url.path:
+        read = describe_read(request.url.path, dict(request.query_params))
+        if not read:
+            return await call_next(request)
+        response = await call_next(request)
+        user = _user(request)
+        if 200 <= response.status_code < 300 and user:
+            response.background = BackgroundTask(record, str(user), *read)  # written after the answer is sent
+        return response
     if method not in VERBS and not (method == "POST" and request.url.path.endswith("/api/auth/login")):
         return await call_next(request)
     if "/api/" not in request.url.path:
