@@ -529,27 +529,36 @@ def cancel_period_fusion(
 def quittances(
     tc: str = Query(default="C", pattern="^[TC]$"),
     periode: str = Query(default="", pattern=r"^([0-9]{2}/[0-9]{4})?$"),
+    annee: int | None = Query(default=None, ge=1900, le=2100),
     code_compagnie: int | None = None,
+    compagnies: str | None = Query(default=None, pattern=r"^[0-9]+(,[0-9]+)*$"),
     db: Session = Depends(get_db),
 ) -> list[dict[str, Any]]:
     """Quittances of dbo."TQuittance" of a type (T/C) and period, in the shape of the bordereau lines; an empty period
-    gives the quittances without a period. The company is the one of the quittance's policy."""
-    conditions = ["q.tc = :t", "COALESCE(TRIM(q.\"Periode\"), '') = :p"]
+    gives the quittances whose "Periode" is '' (optionally of one due year). The company is the one of the quittance's
+    policy: one company, or a list of them ("1,4,9")."""
+    conditions = ["q.tc = :t", "TRIM(q.\"Periode\") = :p"]
     params: dict[str, Any] = {"t": tc, "p": periode}
+    if annee is not None and not periode:
+        conditions.append("EXTRACT(YEAR FROM q.echeance) = :a")
+        params["a"] = annee
     if code_compagnie is not None:
         conditions.append("p.code_compagnie = :c")
         params["c"] = code_compagnie
-    rows = db.execute(
-        text(
-            'SELECT TRIM(q.num_int) AS num_police, TRIM(q.code_client) AS code_client, TRIM(c.nom_client) AS nom_client, q.echeance, '
-            'TRIM(q.num_quittance) AS num_quittance, ROUND((COALESCE(q.prime_net, 0) + COALESCE(q.frais_quit, 0))::numeric, 3) AS prime_net, '
-            'q.commission, q.prime_total '
-            'FROM dbo."TQuittance" q LEFT JOIN dbo."TPolice" p ON TRIM(p.num_int) = TRIM(q.num_int) '
-            'LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(q.code_client) '
-            f"WHERE {' AND '.join(conditions)} ORDER BY q.echeance, TRIM(q.num_quittance) LIMIT 5000"
-        ),
-        params,
-    ).mappings().all()
+    elif compagnies:
+        conditions.append("p.code_compagnie IN :cs")
+        params["cs"] = [int(code) for code in compagnies.split(",")]
+    statement = text(
+        'SELECT TRIM(q.num_int) AS num_police, TRIM(q.code_client) AS code_client, TRIM(c.nom_client) AS nom_client, q.echeance, '
+        'TRIM(q.num_quittance) AS num_quittance, ROUND((COALESCE(q.prime_net, 0) + COALESCE(q.frais_quit, 0))::numeric, 3) AS prime_net, '
+        'q.commission, q.prime_total '
+        'FROM dbo."TQuittance" q LEFT JOIN dbo."TPolice" p ON TRIM(p.num_int) = TRIM(q.num_int) '
+        'LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(q.code_client) '
+        f"WHERE {' AND '.join(conditions)} ORDER BY q.echeance, TRIM(q.num_quittance) LIMIT 5000"
+    )
+    if "cs" in params:
+        statement = statement.bindparams(bindparam("cs", expanding=True))
+    rows = db.execute(statement, params).mappings().all()
     return [_plain(row) for row in rows]
 
 
