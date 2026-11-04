@@ -22,6 +22,7 @@ from app.config import settings
 from app.database import get_db
 from app.text_fields import label_values
 from app.routers.assistant import FicheRequest, _gemini_generate, _ocr_space
+from app.routers.flotte import check_claim_vehicle, covered_vehicles
 
 
 router = APIRouter(prefix="/api/sinistres", tags=["Sinistres"])
@@ -172,10 +173,30 @@ def _find_policy(db: Session, numero: str | None = None, immat: str | None = Non
             text(select_policy + "WHERE REPLACE(UPPER(TRIM(p.num_imat)), ' ', '') = :i ORDER BY (UPPER(TRIM(p.etat)) = 'AN') DESC, p.effet DESC NULLS LAST LIMIT 1"),
             {"i": plate},
         ).mappings().first()
+    vehicle = None
+    if row is None and len(plate) >= 4:
+        # A vehicle of a fleet: the fleet contract, with the vehicle's client and registration.
+        vehicle = db.execute(
+            text(
+                'SELECT TRIM(f.num_int) AS num_int, TRIM(f.num_imat) AS num_imat, TRIM(f.code_client) AS code_client, c.nom_client, '
+                'TRIM(f.risque) AS risque FROM dbo."TPoliceFlotte" f LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(f.code_client) '
+                "WHERE REPLACE(UPPER(TRIM(f.num_imat)), ' ', '') = :i ORDER BY (f.date_re IS NULL) DESC, f.effet DESC NULLS LAST LIMIT 1"
+            ),
+            {"i": plate},
+        ).mappings().first()
+        if vehicle:
+            row = db.execute(text(select_policy + "WHERE TRIM(p.num_int) = :n LIMIT 1"), {"n": vehicle["num_int"]}).mappings().first()
     if row is None:
         return None
     policy = _plain(row)
+    if vehicle:
+        policy.update({key: vehicle[key] for key in ("num_imat", "code_client", "nom_client")}, risque=vehicle["risque"] or policy["risque"])
     policy["code_type_branche"] = _branch_type(db, policy["code_compagnie"], policy["code_branche"])
+    # Fleet contract: the vehicles a claim may name (with their client), chosen in the claim.
+    policy["vehicules_flotte"] = [
+        {key: item[key] for key in ("ordre", "num_imat", "marque", "code_client", "nom_client", "effet", "date_re", "actif", "risque")}
+        for item in covered_vehicles(db, policy["num_int"], None)
+    ]
     return policy
 
 
@@ -418,6 +439,7 @@ def create_sinistre(payload: dict[str, Any], user: dict[str, Any] = Depends(requ
             text('SELECT 1 FROM dbo."Sinistre" WHERE TRIM("Num_Sinistre_Agence") = :n'), {"n": str(chosen).strip()}
         ).first():
             raise HTTPException(status_code=409, detail=f"Le sinistre {chosen} existe déjà.")
+        check_claim_vehicle(db, values.get("Num_Int"), values.get("Num_Imat"), values["Date_Sinistre"].date())
         values["Num_Sinistre_Agence"] = chosen or _next_number(db, values["Date_Sinistre"].date())
         columns = ", ".join(f'"{key}"' for key in values)
         db.execute(text(f'INSERT INTO dbo."Sinistre" ({columns}) VALUES ({", ".join(f":{key}" for key in values)})'), values)
@@ -451,6 +473,15 @@ def update_sinistre(numero: str, payload: dict[str, Any], user: dict[str, Any] =
         if result.rowcount == 0:
             db.rollback()
             raise HTTPException(status_code=404, detail="Sinistre introuvable.")
+        # Fleet contract: the claim names a vehicle of the fleet covered on its date.
+        claim = db.execute(
+            text('SELECT "Num_Int", "Num_Imat", "Date_Sinistre" FROM dbo."Sinistre" WHERE TRIM("Num_Sinistre_Agence") = :n'), {"n": numero.strip()}
+        ).mappings().first()
+        try:
+            check_claim_vehicle(db, claim["Num_Int"], claim["Num_Imat"], claim["Date_Sinistre"].date() if claim["Date_Sinistre"] else None)
+        except HTTPException:
+            db.rollback()
+            raise
         if reglement:
             _store_settlement(db, reglement, values, values["Update_User"])
         db.commit()

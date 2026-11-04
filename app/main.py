@@ -35,6 +35,7 @@ from app.routers.access import router as access_router
 from app.routers.historique import router as historique_router
 from app.routers.notifications import router as notifications_router
 from app.routers.ocr import router as ocr_router
+from app.routers.flotte import router as flotte_router
 from app.audit import audit_middleware
 from app.repairs import run_repairs
 
@@ -88,6 +89,7 @@ app.include_router(access_router)
 app.include_router(historique_router)
 app.include_router(notifications_router)
 app.include_router(ocr_router)
+app.include_router(flotte_router)
 
 
 @app.get("/health", tags=["Health"])

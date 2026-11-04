@@ -421,3 +421,118 @@ def cash_sheet(
     finally:
         db.rollback()  # ends the transaction, and with it the SET LOCAL
     return {"journaux": journals, "depenses": expenses}
+
+
+# ---------------------------------------------------------------------------------------------
+# Opérations journalières (production)
+# ---------------------------------------------------------------------------------------------
+# As the legacy report: the history lines (TMouchard) "Ajout / Modification / Suppression Police N° x" (or Quittance)
+# dated in the period, one per day, movement and record, with the record as it is now.
+PRODUCTION_MOVES = r"""
+SELECT DISTINCT dmvt::date AS date_mvt, TRIM("Mvt") AS mvt, substring(design FROM 'N°\s*(\S+)') AS numero
+FROM dbo."TMouchard"
+WHERE dmvt >= :debut AND dmvt < :fin AND TRIM("Mvt") IN ('Ajout', 'Modification', 'Suppresion', 'Suppression', 'Annulation')
+  AND design ~* :pattern
+"""
+PRODUCTION_SQL = {
+    "police": f"""
+WITH m AS ({PRODUCTION_MOVES})
+SELECT m.date_mvt, m.mvt, m.numero AS num_int, TRIM(p.num_police) AS num_police, TRIM(p.code_client) AS code_client,
+       TRIM(c.nom_client) AS nom_client, TRIM(p.echeance) AS echeance, UPPER(TRIM(p.etat)) AS etat, TRIM(p.risque) AS risque
+FROM m
+LEFT JOIN LATERAL (SELECT * FROM dbo."TPolice" p WHERE TRIM(p.num_int) = m.numero ORDER BY p.effet DESC NULLS LAST LIMIT 1) p ON TRUE
+LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(p.code_client)
+ORDER BY m.date_mvt, m.numero, m.mvt
+""",
+    "quittance": f"""
+WITH m AS ({PRODUCTION_MOVES})
+SELECT m.date_mvt, m.mvt, m.numero AS num_quittance, TRIM(q.num_int) AS num_int, TRIM(q.code_client) AS code_client,
+       TRIM(c.nom_client) AS nom_client, q.echeance, TRIM(q.tc) AS tc, TRIM(q."Periode") AS periode,
+       TRIM(q.type_quittance) AS type_quittance, q.prime_total
+FROM m
+LEFT JOIN dbo."TQuittance" q ON TRIM(q.num_quittance) = m.numero
+LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(q.code_client)
+ORDER BY m.date_mvt, m.numero, m.mvt
+""",
+}
+PRODUCTION_PATTERNS = {"police": r"^\s*\S+\s+Police\s+N°", "quittance": r"^\s*\S+\s+Quittance\s+N°"}
+
+
+@router.get("/production")
+def daily_production(
+    debut: date,
+    fin: date,
+    type: str = Query("police", pattern="^(police|quittance)$"),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Opérations journalières: the policies (or quittances) added, modified or deleted between debut and fin."""
+    if fin < debut:
+        raise HTTPException(status_code=422, detail="La date de fin précède la date de début.")
+    try:
+        rows = db.execute(
+            text(PRODUCTION_SQL[type]), {"debut": debut, "fin": fin + timedelta(days=1), "pattern": PRODUCTION_PATTERNS[type]},
+        ).mappings().all()
+    except SQLAlchemyError as exc:
+        raise _fail(exc) from exc
+    items = [{**_plain(row), "mvt": "Suppression" if row["mvt"] == "Suppresion" else row["mvt"]} for row in rows]
+    return {"items": items}
+
+
+# ---------------------------------------------------------------------------------------------
+# Opérations journalières (financières)
+# ---------------------------------------------------------------------------------------------
+# Technique: the client payments of the period (TRegCli with a piece, one line per quittance paid, Opé R) and the
+# technical payments (TDepense 'T': claims, rebates, experts; Opé D). Divers: the sorties diverses (TDepense 'S', Opé D)
+# and entrées diverses (TDepense 'E', Opé R).
+FINANCIAL_SQL = {
+    "technique": """
+SELECT 'R' AS ope, r.date_reg_cli::date AS date_op, r.num_reg_cli AS numero, d."Num_Recu" AS ligne,
+       TRIM(r.code_client) AS code_client, TRIM(c.nom_client) AS nom_client, TRIM(q.num_int) AS num_police, q.echeance,
+       CASE WHEN TRIM(q.tc) = 'T' THEN 'T' || COALESCE(TRIM(q."Periode"), '') ELSE TRIM(q.tc) END AS tc,
+       q.montant_quittance AS prime, d."Montant" AS reglement,
+       CASE WHEN ROW_NUMBER() OVER (PARTITION BY r.num_reg_cli ORDER BY d."Num_Recu") = 1 THEN r.mont_reg_cli END AS total,
+       TRIM(r.num_piece) AS num_cheq, p.datep::date AS date_cheq, TRIM(r.code_banque) AS compte,
+       NULL AS sin_rist, NULL AS beneficiaire
+FROM dbo."TRegCli" r
+JOIN dbo."RDetRegCli" d ON d."Num_reg_cli" = r.num_reg_cli
+LEFT JOIN dbo."TQuittance" q ON TRIM(q.num_quittance) = TRIM(d."Num_quitance")
+LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(r.code_client)
+LEFT JOIN LATERAL (SELECT datep FROM dbo."TPiece" p WHERE TRIM(p.nump) = TRIM(r.num_piece) ORDER BY (TRIM(p.code_client) = TRIM(r.code_client)) DESC LIMIT 1) p ON TRUE
+WHERE r.date_reg_cli >= :debut AND r.date_reg_cli < :fin AND COALESCE(TRIM(r.type_reg_cli), '') <> 'R'
+UNION ALL
+SELECT 'D', d.date_dep::date, d.num_dep, 0, TRIM(d.code_client), TRIM(c.nom_client), TRIM(d.num_police), NULL, NULL,
+       NULL, d.mont_dep, NULL, TRIM(d.num_cheq), d.date_cheq::date, TRIM(d.code_banque),
+       COALESCE(NULLIF(TRIM(d.sinistre), ''), NULLIF(TRIM(d.num_quittance), '')), TRIM(d.objet_dep)
+FROM dbo."TDepense" d
+LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(d.code_client)
+WHERE TRIM(d."Typ_dep") = 'T' AND d.date_dep >= :debut AND d.date_dep < :fin
+ORDER BY date_op, ope, numero, ligne
+""",
+    "divers": """
+SELECT CASE WHEN TRIM(d."Typ_dep") = 'E' THEN 'R' ELSE 'D' END AS ope, d.date_dep::date AS date_op, d.num_dep AS numero,
+       d.mont_dep AS reglement, TRIM(d.num_cheq) AS num_cheq, d.date_cheq::date AS date_cheq, TRIM(d.code_banque) AS compte,
+       TRIM(d.objet_dep) AS beneficiaire
+FROM dbo."TDepense" d
+WHERE TRIM(d."Typ_dep") IN ('S', 'E') AND d.date_dep >= :debut AND d.date_dep < :fin
+ORDER BY date_op, ope, numero
+""",
+}
+
+
+@router.get("/financier")
+def daily_financial(
+    debut: date,
+    fin: date,
+    type: str = Query("technique", pattern="^(technique|divers)$"),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Opérations journalières financières between debut and fin, with the totals of the recettes (R) and dépenses (D)."""
+    if fin < debut:
+        raise HTTPException(status_code=422, detail="La date de fin précède la date de début.")
+    try:
+        rows = db.execute(text(FINANCIAL_SQL[type]), {"debut": debut, "fin": fin + timedelta(days=1)}).mappings().all()
+    except SQLAlchemyError as exc:
+        raise _fail(exc) from exc
+    items = [_plain(row) for row in rows]
+    total = lambda ope: round(sum(float(row["reglement"] or 0) for row in items if row["ope"] == ope), 3)  # noqa: E731
+    return {"items": items, "total_recette": total("R"), "total_depense": total("D")}

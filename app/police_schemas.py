@@ -27,6 +27,7 @@ class PoliceCreate(BaseModel):
     participation: Optional[bool] = None
     tous_risque: Optional[bool] = None
     hors_taxe: Optional[bool] = None
+    flotte: Optional[bool] = None  # fleet contract: its vehicles are entered in "Véhicules de la flotte"
 
     risque: Optional[str] = None
     num_imat: Optional[str] = None

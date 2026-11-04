@@ -35,6 +35,11 @@ VERBS = {"POST": "Ajout", "PUT": "Modification", "PATCH": "Modification", "DELET
 # Path after /api/ -> (what is acted on, how its number is written), most specific first.
 ENTITIES = [
     (r"^clients", "client", "Code"),
+    (r"^flotte/[^/]+/vehicules/[^/]+/sortie", "Sortie du véhicule de flotte police", "N°"),
+    (r"^flotte/[^/]+/vehicules/[^/]+/remplacement", "Remplacement de véhicule, flotte police", "N°"),
+    (r"^flotte/[^/]+/vehicules/import", "Import de véhicules, flotte police", "N°"),
+    (r"^flotte/[^/]+/vehicules", "Véhicule de flotte police", "N°"),
+    (r"^flotte", "Police flotte", "N°"),
     (r"^polices", "Police", "N°"),
     (r"^quittances", "Quittance", "N°"),
     (r"^sinistres/[^/]+/etapes", "Étape du sinistre", "N°"),
@@ -73,6 +78,7 @@ SNAPSHOTS = [
     (r"^sinistres/(?P<n>[^/]+)/appels/(?P<c>\d+)$", 'SELECT * FROM dbo."Sinistre_Appel" WHERE TRIM("Num_Sinistre_Agence") = :n AND "Cmp" = CAST(:c AS integer)'),
     (r"^sinistres/(?P<n>[^/]+)$", 'SELECT * FROM dbo."Sinistre" WHERE TRIM("Num_Sinistre_Agence") = :n'),
     (r"^clients/(?P<n>[^/]+)$", 'SELECT * FROM dbo."TClient" WHERE TRIM(code_client) = :n'),
+    (r"^flotte/(?P<n>[^/]+)/vehicules/(?P<c>[^/]+)(/sortie)?$", 'SELECT * FROM dbo."TPoliceFlotte" WHERE TRIM(num_int) = :n AND TRIM(ordre) = :c'),
     (r"^polices/(?P<n>[^/]+)$", 'SELECT * FROM dbo."TPolice" WHERE TRIM(num_int) = :n ORDER BY date_creation DESC NULLS LAST'),
     (r"^(?:quittances|ristournes)/(?P<n>[^/]+)$", 'SELECT * FROM dbo."TQuittance" WHERE TRIM(num_quittance) = :n'),
     (r"^banques/(?P<n>[^/]+)$", 'SELECT * FROM dbo."TBanque" WHERE TRIM(code_banque) = :n'),

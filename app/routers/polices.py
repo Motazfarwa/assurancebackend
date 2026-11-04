@@ -160,7 +160,7 @@ def create_police_with_quittance(
                         "Serie", "Puissance", "Circulation",
                         "Garantie", "Franchise", capital, neuf, venale,
                         obser, prime_net, commission,
-                        prime_total
+                        prime_total, flotte
                     )
                     VALUES (
                         :num_int, :num_police, :code_client,
@@ -174,7 +174,7 @@ def create_police_with_quittance(
                         :serie, :puissance, :circulation,
                         :garantie, :franchise, :capital, :neuf, :venale,
                         :obser, :prime_net, :commission,
-                        :prime_total
+                        :prime_total, :flotte
                     )
                 """),
                 {
@@ -196,6 +196,7 @@ def create_police_with_quittance(
                     "participation": flag(p.participation),
                     "tous_risque": flag(p.tous_risque),
                     "hors_taxe": flag(p.hors_taxe),
+                    "flotte": "O" if p.flotte else "N",
                     "risque": p.risque,
                     "num_imat": p.num_imat,
                     "marque": p.marque,

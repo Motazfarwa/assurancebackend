@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.auth import require_current_user
 from app.database import get_db
 from app.routers.client_records import serialize
+from app.routers.flotte import ACTIVE_SQL
 
 
 router = APIRouter(prefix="/api/records", tags=["Recherche polices et quittances"], dependencies=[Depends(require_current_user)])
@@ -42,7 +43,11 @@ def search_policies(
     if statut in STATUT_SQL:
         conditions.append(STATUT_SQL[statut])
     if code_client and code_client.strip():
-        conditions.append("TRIM(p.code_client) = :code_client")
+        # The client's own policies and the fleet contracts where the client has a vehicle.
+        conditions.append(
+            "(TRIM(p.code_client) = :code_client OR EXISTS (SELECT 1 FROM dbo.\"TPoliceFlotte\" f "
+            "WHERE TRIM(f.num_int) = TRIM(p.num_int) AND TRIM(f.code_client) = :code_client))"
+        )
         params["code_client"] = code_client.strip()
     if nom_client and nom_client.strip():
         conditions.append("c.nom_client ILIKE :nom_client")
@@ -52,7 +57,13 @@ def search_policies(
         params["num_police"] = _like(num_police)
     rows = db.execute(
         text(
-            'SELECT p.*, TRIM(c.nom_client) AS nom_client, TRIM(co.nom_compagnie) AS nom_compagnie FROM dbo."TPolice" p '
+            'SELECT p.*, TRIM(c.nom_client) AS nom_client, TRIM(co.nom_compagnie) AS nom_compagnie, '
+            # Fleet: vehicles in the fleet, and (client filter) the client's vehicles when the contract is not theirs.
+            f'(SELECT COUNT(*) FROM dbo."TPoliceFlotte" f WHERE TRIM(f.num_int) = TRIM(p.num_int) AND {ACTIVE_SQL}) AS nb_vehicules, '
+            + ("(SELECT STRING_AGG(TRIM(f.num_imat), ', ' ORDER BY TRIM(f.ordre)) FROM dbo.\"TPoliceFlotte\" f WHERE TRIM(f.num_int) = TRIM(p.num_int) "
+               "AND TRIM(f.code_client) = :code_client AND TRIM(p.code_client) <> :code_client) AS vehicules_client "
+               if "code_client" in params else "NULL AS vehicules_client ")
+            + 'FROM dbo."TPolice" p '
             'LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(p.code_client) '
             'LEFT JOIN dbo."TCompagnie" co ON co.code_compagnie = p.code_compagnie '
             f"WHERE {' AND '.join(conditions)} ORDER BY p.effet DESC NULLS LAST, p.num_police LIMIT :limit"
