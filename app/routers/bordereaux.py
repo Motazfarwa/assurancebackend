@@ -525,6 +525,34 @@ def cancel_period_fusion(
     db.commit()
 
 
+@router.get("/quittances")
+def quittances(
+    tc: str = Query(default="C", pattern="^[TC]$"),
+    periode: str = Query(default="", pattern=r"^([0-9]{2}/[0-9]{4})?$"),
+    code_compagnie: int | None = None,
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    """Quittances of dbo."TQuittance" of a type (T/C) and period, in the shape of the bordereau lines; an empty period
+    gives the quittances without a period. The company is the one of the quittance's policy."""
+    conditions = ["q.tc = :t", "COALESCE(TRIM(q.\"Periode\"), '') = :p"]
+    params: dict[str, Any] = {"t": tc, "p": periode}
+    if code_compagnie is not None:
+        conditions.append("p.code_compagnie = :c")
+        params["c"] = code_compagnie
+    rows = db.execute(
+        text(
+            'SELECT TRIM(q.num_int) AS num_police, TRIM(q.code_client) AS code_client, TRIM(c.nom_client) AS nom_client, q.echeance, '
+            'TRIM(q.num_quittance) AS num_quittance, ROUND((COALESCE(q.prime_net, 0) + COALESCE(q.frais_quit, 0))::numeric, 3) AS prime_net, '
+            'q.commission, q.prime_total '
+            'FROM dbo."TQuittance" q LEFT JOIN dbo."TPolice" p ON TRIM(p.num_int) = TRIM(q.num_int) '
+            'LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(q.code_client) '
+            f"WHERE {' AND '.join(conditions)} ORDER BY q.echeance, TRIM(q.num_quittance) LIMIT 5000"
+        ),
+        params,
+    ).mappings().all()
+    return [_plain(row) for row in rows]
+
+
 @router.get("/{bordereau_id}")
 def get_bordereau(bordereau_id: int, db: Session = Depends(get_db)) -> dict[str, Any]:
     _ensure_tables(db)
