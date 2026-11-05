@@ -562,6 +562,31 @@ def quittances(
     return [_plain(row) for row in rows]
 
 
+class QuittancePeriodIn(BaseModel):
+    num_quittance: str = Field(min_length=1, max_length=15)
+    num_int: str = Field(min_length=1, max_length=20)
+    periode: str = Field(pattern=r"^([0-9]{2}/[0-9]{4})?$")  # '' takes the validation back
+    avant: str = Field(default="", pattern=r"^([0-9]{2}/[0-9]{4})?$")  # the period the quittance has now
+
+
+@router.put("/quittances/periode")
+def set_quittance_period(payload: QuittancePeriodIn, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Validates a comptant quittance of the reception in a period: its "Periode" goes from '' to the month chosen
+    (or back to '' when the validation is taken back). Refused when the quittance no longer has the period expected."""
+    result = db.execute(
+        text(
+            'UPDATE dbo."TQuittance" SET "Periode" = :p, "Update_User" = :u, "Update_Date" = now() '
+            'WHERE TRIM(num_quittance) = :q AND TRIM(num_int) = :n AND tc = \'C\' AND TRIM(COALESCE("Periode", \'\')) = :avant'
+        ),
+        {"p": payload.periode, "u": str(user.get("sub", ""))[:20], "q": payload.num_quittance.strip(), "n": payload.num_int.strip(), "avant": payload.avant},
+    )
+    if result.rowcount != 1:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=f"La quittance N° {payload.num_quittance} n'a plus la période attendue : rechargez la liste.")
+    db.commit()
+    return {"num_quittance": payload.num_quittance.strip(), "periode": payload.periode}
+
+
 @router.get("/{bordereau_id}")
 def get_bordereau(bordereau_id: int, db: Session = Depends(get_db)) -> dict[str, Any]:
     _ensure_tables(db)

@@ -56,6 +56,7 @@ ENTITIES = [
     (r"^frais-generaux", "Frais généraux", "N°"),
     (r"^journaux/encaissement", "Comptabilisation journal d'encaissement", ""),
     (r"^journaux/depense", "Comptabilisation journal de dépense", ""),
+    (r"^bordereaux/quittances", "Période de la quittance", "N°"),
     (r"^bordereaux/fusion-periode", "Fusion bordereau", ""),
     (r"^bordereaux/[^/]+/fusion", "Fusion bordereau", "N°"),
     (r"^bordereaux", "Bordereau", "N°"),
