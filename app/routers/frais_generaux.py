@@ -19,7 +19,8 @@ from app.database import get_db
 
 router = APIRouter(prefix="/api/frais-generaux", tags=["Frais généraux"], dependencies=[Depends(require_admin)])
 
-NATURES = {"D": "Frais Généraux (W.J)", "F": "Frais Généraux (M.J)"}
+# Only the W.J frais are entered now; the M.J ones (Typ_dep 'F') stay in TDepense as history.
+NATURES = {"D": "Frais Généraux (W.J)"}
 MODES = {"C": "Chèque", "V": "Virement", "E": "Espèces", "T": "Traite"}
 
 
@@ -39,7 +40,7 @@ def _fail(exc: SQLAlchemyError) -> HTTPException:
 
 
 class FraisCreate(BaseModel):
-    nature: str = Field(pattern="^[DF]$")
+    nature: str = Field(pattern="^D$")
     code_type: str = Field(min_length=1, max_length=10)
     mode: str = Field(pattern="^[CVET]$")
     date_dep: date
@@ -52,19 +53,21 @@ class FraisCreate(BaseModel):
 
 @router.get("/options")
 def options(db: Session = Depends(get_db)) -> dict[str, Any]:
-    """The natures with their types of frais, the payment modes, the agency accounts and the last one used per nature."""
+    """The natures with their types of frais, the payment modes, the agency accounts given to the frais généraux in
+    Gestion des banques (Type_Dep 'D', not archived) and the last one of them used per nature."""
     try:
         types = db.execute(text(
             'SELECT TRIM(code_type) AS code_type, TRIM(libelle) AS libelle, TRIM(typ_dep) AS nature FROM dbo.ttype_dep '
-            "WHERE TRIM(typ_dep) IN ('D', 'F') ORDER BY code_type"
+            "WHERE TRIM(typ_dep) = 'D' ORDER BY code_type"
         )).mappings().all()
         banks = db.execute(text(
             'SELECT TRIM(code_banque) AS code_banque, TRIM(nom_banque) AS nom_banque FROM dbo."TBanque" '
-            "WHERE COALESCE(\"Archive\", FALSE) = FALSE ORDER BY code_banque"
+            "WHERE TRIM(\"Type_Dep\") = 'D' AND COALESCE(\"Archive\", FALSE) = FALSE ORDER BY code_banque"
         )).mappings().all()
         last = db.execute(text(
             'SELECT DISTINCT ON ("Typ_dep") TRIM("Typ_dep") AS nature, TRIM(code_banque) AS code_banque FROM dbo."TDepense" '
-            "WHERE \"Typ_dep\" IN ('D', 'F') AND COALESCE(TRIM(code_banque), '') <> '' ORDER BY \"Typ_dep\", num_dep DESC"
+            "WHERE \"Typ_dep\" = 'D' AND TRIM(code_banque) IN (SELECT TRIM(code_banque) FROM dbo.\"TBanque\" "
+            "WHERE TRIM(\"Type_Dep\") = 'D' AND COALESCE(\"Archive\", FALSE) = FALSE) ORDER BY \"Typ_dep\", num_dep DESC"
         )).mappings().all()
     except SQLAlchemyError as exc:
         raise _fail(exc) from exc

@@ -536,3 +536,195 @@ def daily_financial(
     items = [_plain(row) for row in rows]
     total = lambda ope: round(sum(float(row["reglement"] or 0) for row in items if row["ope"] == ope), 3)  # noqa: E731
     return {"items": items, "total_recette": total("R"), "total_depense": total("D")}
+
+
+# ---------------------------------------------------------------------------------------------
+# Etat des comptes client
+# ---------------------------------------------------------------------------------------------
+# Per client, for the quittances due between two dates (or all of them): the primes, the ristournes (quittances of type R),
+# what the client paid on them (RDetRegCli), the commissions, and the claims paid to the client in the period (TDepense 'T'
+# of nature S). Optional filters: one company, one client, one police; état: tous, comptabilisé, en instance, ristournes.
+ACCOUNTS_SQL = """
+WITH pol AS MATERIALIZED (  -- the policies of the company / the police asked for (none asked: not used)
+    SELECT TRIM(num_int) AS num_int, TRIM(num_police) AS num_police FROM dbo."TPolice"
+    WHERE (CAST(:compagnie AS int) IS NOT NULL OR CAST(:police AS text) IS NOT NULL)
+      AND (CAST(:compagnie AS int) IS NULL OR code_compagnie = CAST(:compagnie AS int))
+      AND (CAST(:police AS text) IS NULL OR TRIM(num_int) = CAST(:police AS text) OR TRIM(num_police) = CAST(:police AS text))
+),
+q AS MATERIALIZED (
+    SELECT q.num_quittance, TRIM(q.code_client) AS code_client, TRIM(COALESCE(q.type_quittance, '')) = 'R' AS ristourne,
+           COALESCE(q.prime_total, 0) AS prime_total, COALESCE(q.commission, 0) AS commission
+    FROM dbo."TQuittance" q
+    WHERE COALESCE(q.annule, 'N') <> 'O'
+      AND (CAST(:debut AS date) IS NULL OR (q.echeance >= CAST(:debut AS date) AND q.echeance < CAST(:fin AS date)))
+      AND (CAST(:client AS text) IS NULL OR TRIM(q.code_client) = CAST(:client AS text))
+      AND (CAST(:compagnie AS int) IS NULL AND CAST(:police AS text) IS NULL OR TRIM(q.num_int) IN (SELECT num_int FROM pol))
+      AND CASE CAST(:etat AS text)
+            WHEN 'comptabilise' THEN COALESCE(q."Comptabiliser", 'N') = 'O'
+            WHEN 'instance' THEN COALESCE(q."Comptabiliser", 'N') <> 'O'
+            WHEN 'ristourne' THEN TRIM(COALESCE(q.type_quittance, '')) = 'R'
+            ELSE TRUE END
+),
+reg AS (
+    SELECT d."Num_quitance" AS num_quittance, SUM(d."Montant") AS montant
+    FROM dbo."RDetRegCli" d WHERE d."Num_quitance" IN (SELECT num_quittance FROM q) GROUP BY 1
+),
+quit AS (
+    SELECT q.code_client,
+           SUM(q.prime_total) FILTER (WHERE NOT q.ristourne) AS prime,
+           ABS(SUM(q.prime_total) FILTER (WHERE q.ristourne)) AS ristourne,
+           SUM(reg.montant) FILTER (WHERE NOT q.ristourne) AS reglement,
+           SUM(q.commission) AS commission
+    FROM q LEFT JOIN reg ON reg.num_quittance = q.num_quittance
+    GROUP BY 1
+),
+sin AS (
+    SELECT TRIM(d.code_client) AS code_client, SUM(d.mont_dep) AS sinistre
+    FROM dbo."TDepense" d JOIN dbo.ttype_dep t ON TRIM(t.code_type) = TRIM(d.code_type)
+    WHERE TRIM(d."Typ_dep") = 'T' AND TRIM(t."Nat_quit") = 'S' AND CAST(:etat AS text) <> 'ristourne'
+      AND (CAST(:debut AS date) IS NULL OR (d.date_dep >= CAST(:debut AS date) AND d.date_dep < CAST(:fin AS date)))
+      AND (CAST(:client AS text) IS NULL OR TRIM(d.code_client) = CAST(:client AS text))
+      AND (CAST(:compagnie AS int) IS NULL AND CAST(:police AS text) IS NULL OR TRIM(d.num_police) IN (SELECT num_police FROM pol))
+      AND CASE CAST(:etat AS text)
+            WHEN 'comptabilise' THEN COALESCE(d."Comptabiliser", 'N') = 'O'
+            WHEN 'instance' THEN COALESCE(d."Comptabiliser", 'N') <> 'O'
+            ELSE TRUE END
+    GROUP BY 1
+)
+SELECT COALESCE(quit.code_client, sin.code_client) AS code_client,
+       (SELECT TRIM(c.nom_client) FROM dbo."TClient" c WHERE TRIM(c.code_client) = COALESCE(quit.code_client, sin.code_client) LIMIT 1) AS nom_client,
+       ROUND(COALESCE(quit.prime, 0)::numeric, 3) AS prime, ROUND(COALESCE(quit.ristourne, 0)::numeric, 3) AS ristourne,
+       ROUND(COALESCE(sin.sinistre, 0)::numeric, 3) AS sinistre, ROUND(COALESCE(quit.reglement, 0)::numeric, 3) AS reglement,
+       ROUND(COALESCE(quit.commission, 0)::numeric, 3) AS commission
+FROM quit FULL JOIN sin ON sin.code_client = quit.code_client
+ORDER BY COALESCE(quit.prime, 0) DESC, 1
+"""
+ACCOUNT_TOTALS = ("prime", "ristourne", "sinistre", "reglement", "commission")
+
+
+@router.get("/comptes-clients")
+def client_accounts(
+    debut: date | None = None,
+    fin: date | None = None,
+    code_compagnie: int | None = None,
+    code_client: str | None = Query(default=None, max_length=20),
+    police: str | None = Query(default=None, max_length=30),
+    etat: str = Query("tous", pattern="^(tous|comptabilise|instance|ristourne)$"),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Etat des comptes client: one line per client with its primes, ristournes, sinistres, règlements and commissions."""
+    if (debut is None) != (fin is None):
+        raise HTTPException(status_code=422, detail="Donnez la date de début et la date de fin.")
+    if debut and fin and fin < debut:
+        raise HTTPException(status_code=422, detail="La date de fin précède la date de début.")
+    params = {
+        "debut": debut, "fin": fin + timedelta(days=1) if fin else None, "compagnie": code_compagnie,
+        "client": (code_client or "").strip() or None, "police": (police or "").strip() or None, "etat": etat,
+    }
+    try:
+        rows = db.execute(text(ACCOUNTS_SQL), params).mappings().all()
+    except SQLAlchemyError as exc:
+        raise _fail(exc) from exc
+    items = [_plain(row) for row in rows]
+    return {"items": items, "totals": {key: round(sum(float(row[key] or 0) for row in items), 3) for key in ACCOUNT_TOTALS}}
+
+
+# ---------------------------------------------------------------------------------------------
+# Etat de la recette technique
+# ---------------------------------------------------------------------------------------------
+# The client payments of the period (TRegCli, except the rests settled without a piece, type R), one line per quittance
+# paid (RDetRegCli), with the company of the quittance's policy and the feuille de caisse (JEQ) that declared it.
+RECETTE_SQL = """
+SELECT r.date_reg_cli::date AS date_reg, r.num_reg_cli, d."Num_Recu" AS num_recu, TRIM(r.type_reg_cli) AS type_reg, TRIM(r.num_piece) AS num_piece,
+       TRIM(r.code_banque) AS banque, TRIM(r.code_client) AS code_client, TRIM(c.nom_client) AS nom_client,
+       TRIM(q.num_int) AS num_int, TRIM(p.num_police) AS num_police, TRIM(d."Num_quitance") AS num_quittance, q.echeance::date AS echeance,
+       p.code_compagnie, TRIM(cp.nom_compagnie) AS nom_compagnie, d."Montant" AS montant,
+       COALESCE(d."Comptabiliser", 'N') = 'O' AS comptabilise, d."Date_Comptabiliser"::date AS date_comptabilise
+FROM dbo."TRegCli" r
+JOIN dbo."RDetRegCli" d ON d."Num_reg_cli" = r.num_reg_cli
+LEFT JOIN dbo."TQuittance" q ON q.num_quittance = d."Num_quitance"
+LEFT JOIN LATERAL (SELECT num_police, code_compagnie FROM dbo."TPolice" p WHERE TRIM(p.num_int) = TRIM(q.num_int) LIMIT 1) p ON TRUE
+LEFT JOIN dbo."TCompagnie" cp ON cp.code_compagnie = p.code_compagnie
+LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(r.code_client)
+WHERE r.date_reg_cli >= :debut AND r.date_reg_cli < :fin AND COALESCE(TRIM(r.type_reg_cli), '') <> 'R'
+  AND (CAST(:compagnie AS int) IS NULL OR p.code_compagnie = CAST(:compagnie AS int))
+ORDER BY r.date_reg_cli, r.num_reg_cli, d."Num_Recu"
+"""
+
+
+@router.get("/recette")
+def recette_technique(debut: date, fin: date, code_compagnie: int | None = None, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Etat de la recette technique between debut and fin (optionally of one company); the grouping is done by the page."""
+    if fin < debut:
+        raise HTTPException(status_code=422, detail="La date de fin précède la date de début.")
+    try:
+        rows = db.execute(text(RECETTE_SQL), {"debut": debut, "fin": fin + timedelta(days=1), "compagnie": code_compagnie}).mappings().all()
+    except SQLAlchemyError as exc:
+        raise _fail(exc) from exc
+    items = [_plain(row) for row in rows]
+    return {"items": items, "total": round(sum(float(row["montant"] or 0) for row in items), 3)}
+
+
+# ---------------------------------------------------------------------------------------------
+# Retour des quittances
+# ---------------------------------------------------------------------------------------------
+# The quittances of a company, type (T/C) and period; ticking « Retour » gives them back to the company: TQuittance
+# "Date_Retour" is set (as the legacy software did), unticking clears it.
+RETURNS_SQL = """
+SELECT TRIM(q.num_int) AS num_police, TRIM(q.code_client) AS code_client, TRIM(c.nom_client) AS nom_client, q.echeance::date AS echeance,
+       TRIM(q.num_quittance) AS num_quittance, q.prime_net, q.commission, q.prime_total, q.solde_quittance, q."Date_Retour" AS date_retour
+FROM dbo."TQuittance" q
+JOIN dbo."TPolice" p ON TRIM(p.num_int) = TRIM(q.num_int) AND p.code_compagnie = :compagnie
+LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(q.code_client)
+WHERE q.tc = :tc AND TRIM(q."Periode") = :periode AND TRIM(COALESCE(q.type_quittance, '')) <> 'R'
+  AND (NOT :retournees OR q."Date_Retour" IS NOT NULL)
+ORDER BY q.echeance, TRIM(q.num_quittance)
+"""
+
+
+@router.get("/retours")
+def quittance_returns(
+    code_compagnie: int,
+    periode: str = Query(pattern=r"^[0-9]{2}/[0-9]{4}$"),
+    tc: str = Query("C", pattern="^[TC]$"),
+    retournees: bool = False,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Quittances of a company, type and period with their return date (only the returned ones with retournees)."""
+    try:
+        rows = db.execute(
+            text(RETURNS_SQL), {"compagnie": code_compagnie, "tc": tc, "periode": periode, "retournees": retournees},
+        ).mappings().all()
+    except SQLAlchemyError as exc:
+        raise _fail(exc) from exc
+    return {"items": [_plain(row) for row in rows]}
+
+
+class ReturnIn(BaseModel):
+    num_quittance: str = Field(min_length=1, max_length=15)
+    num_police: str = Field(min_length=1, max_length=20)
+    retour: bool
+
+
+@router.put("/retours/quittance")
+def set_quittance_return(payload: ReturnIn, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Returns a quittance to the company (Date_Retour = now) or takes the return back (Date_Retour emptied)."""
+    keys = {"q": payload.num_quittance.strip(), "n": payload.num_police.strip()}
+    try:
+        result = db.execute(
+            text(
+                'UPDATE dbo."TQuittance" SET "Date_Retour" = CASE WHEN :retour THEN LOCALTIMESTAMP(0) END, "Update_User" = :u, "Update_Date" = now() '
+                'WHERE TRIM(num_quittance) = :q AND TRIM(num_int) = :n AND ("Date_Retour" IS NULL) = :retour'
+            ),
+            {**keys, "retour": payload.retour, "u": str(user.get("sub", ""))[:20]},
+        )
+        if result.rowcount != 1:
+            db.rollback()
+            state = "déjà retournée" if payload.retour else "pas retournée"
+            raise HTTPException(status_code=409, detail=f"La quittance N° {payload.num_quittance} est {state} : rechargez la liste.")
+        returned = db.execute(text('SELECT "Date_Retour" FROM dbo."TQuittance" WHERE TRIM(num_quittance) = :q AND TRIM(num_int) = :n'), keys).scalar()
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise _fail(exc) from exc
+    return {"num_quittance": keys["q"], "date_retour": returned.isoformat() if returned else None}

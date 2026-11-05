@@ -35,6 +35,12 @@ def search_policies(
     nom_client: str | None = Query(default=None, max_length=60),
     num_police: str | None = Query(default=None, max_length=20),
     statut: str | None = Query(default=None, pattern="^(tous|vigueur|susp|expirees)$"),
+    # Filters of the legacy "Liste des polices": company, date d'effet between two dates, observation, order.
+    code_compagnie: int | None = None,
+    date_debut: date | None = None,
+    date_fin: date | None = None,
+    obs: str | None = Query(default=None, max_length=60),
+    ordre: str = Query(default="effet", pattern="^(effet|client|police)$"),
     limit: int = Query(default=200, ge=1, le=500),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
@@ -42,6 +48,18 @@ def search_policies(
     params: dict[str, Any] = {"limit": limit}
     if statut in STATUT_SQL:
         conditions.append(STATUT_SQL[statut])
+    if code_compagnie is not None:
+        conditions.append("p.code_compagnie = :code_compagnie")
+        params["code_compagnie"] = code_compagnie
+    if date_debut:
+        conditions.append("p.effet >= :date_debut")
+        params["date_debut"] = date_debut
+    if date_fin:
+        conditions.append("p.effet < :date_fin_next")
+        params["date_fin_next"] = date_fin + timedelta(days=1)
+    if obs and obs.strip():
+        conditions.append("p.obser ILIKE :obs")
+        params["obs"] = _like(obs)
     if code_client and code_client.strip():
         # The client's own policies and the fleet contracts where the client has a vehicle.
         conditions.append(
@@ -66,11 +84,23 @@ def search_policies(
             + 'FROM dbo."TPolice" p '
             'LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(p.code_client) '
             'LEFT JOIN dbo."TCompagnie" co ON co.code_compagnie = p.code_compagnie '
-            f"WHERE {' AND '.join(conditions)} ORDER BY p.effet DESC NULLS LAST, p.num_police LIMIT :limit"
+            f"WHERE {' AND '.join(conditions)} ORDER BY {POLICY_ORDERS[ordre]} LIMIT :limit"
         ),
         params,
     ).mappings().all()
     return {"items": [serialize(row) for row in rows], "total": len(rows)}
+
+
+POLICY_ORDERS = {
+    "effet": "p.effet DESC NULLS LAST, p.num_police",
+    "client": "c.nom_client, LENGTH(TRIM(p.code_client)), TRIM(p.code_client), p.effet DESC NULLS LAST",
+    "police": "TRIM(p.num_police), p.effet DESC NULLS LAST",
+}
+# Gestion des quittances: the receipts still owed (solde > 0) or settled.
+REGLEMENT_SQL = {
+    "impayees": "COALESCE(q.solde_quittance, 0) > 0.0005",
+    "reglees": "COALESCE(q.solde_quittance, 0) <= 0.0005",
+}
 
 
 @router.get("/receipts")
@@ -84,11 +114,22 @@ def search_receipts(
     # Échéance between date_min and date_max (both days included).
     date_min: date | None = None,
     date_max: date | None = None,
+    code_compagnie: int | None = None,
+    num_police: str | None = Query(default=None, max_length=20),
+    reglement: str | None = Query(default=None, pattern="^(tous|impayees|reglees)$"),
     limit: int = Query(default=200, ge=1, le=2000),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     conditions = ["TRUE"]
     params: dict[str, Any] = {"limit": limit}
+    if reglement in REGLEMENT_SQL:
+        conditions.append(REGLEMENT_SQL[reglement])
+    if code_compagnie is not None:
+        conditions.append("p.code_compagnie = :code_compagnie")
+        params["code_compagnie"] = code_compagnie
+    if num_police and num_police.strip():
+        conditions.append("(TRIM(p.num_police) ILIKE :num_police OR TRIM(q.num_int) ILIKE :num_police)")
+        params["num_police"] = _like(num_police)
     if date_min:
         conditions.append("q.echeance >= :date_min")
         params["date_min"] = date_min
@@ -116,9 +157,11 @@ def search_receipts(
         params["code_branche"] = code_branche.strip()
     rows = db.execute(
         text(
-            f"SELECT q.*, TRIM(c.nom_client) AS nom_client, TRIM(p.num_police) AS num_police, {BRANCH_EXPRESSION} AS branche "
+            f"SELECT q.*, TRIM(c.nom_client) AS nom_client, TRIM(p.num_police) AS num_police, {BRANCH_EXPRESSION} AS branche, "
+            "TRIM(co.nom_compagnie) AS nom_compagnie "
             'FROM dbo."TQuittance" q '
             'LEFT JOIN dbo."TPolice" p ON TRIM(p.num_int) = TRIM(q.num_int) '
+            'LEFT JOIN dbo."TCompagnie" co ON co.code_compagnie = p.code_compagnie '
             'LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(q.code_client) '
             f"WHERE {' AND '.join(conditions)} ORDER BY q.date_emission DESC NULLS LAST, q.num_quittance LIMIT :limit"
         ),
