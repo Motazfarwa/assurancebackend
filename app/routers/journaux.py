@@ -341,7 +341,8 @@ WITH pol AS (
 q AS MATERIALIZED (
     SELECT TRIM(q.num_quittance) AS num_quittance, q."Comptabiliser" AS comptabiliser, q."Date_Comptabiliser"::date AS jour,
            COALESCE(q.montant_quittance, 0) AS montant_quittance, COALESCE(q.commission, 0) AS comm,
-           COALESCE(q.timbre, 0) AS timbre, COALESCE(q.cout_attestation, 0) AS frais
+           COALESCE(q.timbre, 0) AS timbre, COALESCE(q.cout_attestation, 0) AS frais,
+           COALESCE(q.solde_quittance, 0) <= 0.0005 AS paid
     FROM dbo."TQuittance" q JOIN pol p ON p.num_int = TRIM(q.num_int)
     WHERE p.code_compagnie = :compagnie AND TRIM(q.type_quittance) = 'P' AND COALESCE(q.annule, 'N') <> 'O'
 ),
@@ -355,7 +356,8 @@ balance AS (
     SELECT q.jour, q.num_quittance, q.montant_quittance - COALESCE(SUM(det.montant) FILTER (WHERE det.jour < q.jour), 0) AS montant,
            q.comm, q.timbre, q.frais
     FROM q LEFT JOIN det ON det.num_quittance = q.num_quittance
-    WHERE q.comptabiliser = 'O' AND q.jour IS NOT NULL
+    -- only quittances paid in full: what is still owed is not cash of the day
+    WHERE q.comptabiliser = 'O' AND q.jour IS NOT NULL AND q.paid
       AND (CAST(:debut AS date) IS NULL OR q.jour >= CAST(:debut AS date)) AND (CAST(:fin AS date) IS NULL OR q.jour <= CAST(:fin AS date))
     GROUP BY q.jour, q.num_quittance, q.montant_quittance, q.comm, q.timbre, q.frais
 ),
@@ -421,6 +423,87 @@ def cash_sheet(
     finally:
         db.rollback()  # ends the transaction, and with it the SET LOCAL
     return {"journaux": journals, "depenses": expenses}
+
+
+# The "Détails" of the feuille de caisse of a company on a day: the solde and the montant à déclarer may be rounded by
+# the user, by at most one dinar each way, with a remarque; the adjusted values are kept per company and day.
+ADJUSTMENT_DDL = """
+CREATE TABLE IF NOT EXISTS dbo."TFeuilleCaisseAjust" (
+    code_compagnie integer NOT NULL,
+    jour date NOT NULL,
+    solde_calcule numeric(14, 3) NOT NULL,
+    solde numeric(14, 3) NOT NULL,
+    a_declarer_calcule numeric(14, 3) NOT NULL,
+    a_declarer numeric(14, 3) NOT NULL,
+    remarque varchar(200),
+    update_user varchar(50),
+    update_date timestamp NOT NULL DEFAULT now(),
+    PRIMARY KEY (code_compagnie, jour)
+)
+"""
+MAX_ADJUSTMENT = 1.0  # dinars, up or down
+
+
+def _adjustment(db: Session, compagnie: int, jour: date) -> dict[str, Any] | None:
+    db.execute(text(ADJUSTMENT_DDL))
+    row = db.execute(
+        text('SELECT * FROM dbo."TFeuilleCaisseAjust" WHERE code_compagnie = :c AND jour = :j'), {"c": compagnie, "j": jour},
+    ).mappings().first()
+    return _plain(row) if row else None
+
+
+@router.get("/feuille/ajustement")
+def cash_adjustment(compagnie: int, jour: date, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """The solde and montant à déclarer kept for the feuille of a company on a day (null: the computed ones)."""
+    try:
+        found = _adjustment(db, compagnie, jour)
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise _fail(exc) from exc
+    return {"ajustement": found}
+
+
+class AdjustmentIn(BaseModel):
+    compagnie: int
+    jour: date
+    solde_calcule: float
+    solde: float
+    a_declarer_calcule: float
+    a_declarer: float
+    remarque: str | None = Field(default=None, max_length=200)
+
+
+@router.put("/feuille/ajustement")
+def save_cash_adjustment(payload: AdjustmentIn, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Keeps the solde and montant à déclarer of the feuille, each within one dinar of the computed value; a remarque is
+    required when one of them differs. Back to the computed values: the adjustment is removed."""
+    for label, value, computed in (("solde", payload.solde, payload.solde_calcule), ("montant à déclarer", payload.a_declarer, payload.a_declarer_calcule)):
+        if abs(round(value - computed, 3)) > MAX_ADJUSTMENT:
+            raise HTTPException(status_code=422, detail=f"Le {label} ne peut pas s'écarter de plus de 1,000 DT du montant calculé ({computed:.3f}).")
+    remarque = (payload.remarque or "").strip()
+    changed = abs(payload.solde - payload.solde_calcule) > 0.0005 or abs(payload.a_declarer - payload.a_declarer_calcule) > 0.0005
+    if changed and not remarque:
+        raise HTTPException(status_code=422, detail="Indiquez une remarque pour expliquer la modification.")
+    key = {"c": payload.compagnie, "j": payload.jour}
+    try:
+        db.execute(text(ADJUSTMENT_DDL))
+        db.execute(text('DELETE FROM dbo."TFeuilleCaisseAjust" WHERE code_compagnie = :c AND jour = :j'), key)
+        if changed:
+            db.execute(
+                text(
+                    'INSERT INTO dbo."TFeuilleCaisseAjust" (code_compagnie, jour, solde_calcule, solde, a_declarer_calcule, a_declarer, '
+                    'remarque, update_user) VALUES (:c, :j, :sc, :s, :ac, :a, :r, :u)'
+                ),
+                {**key, "sc": round(payload.solde_calcule, 3), "s": round(payload.solde, 3), "ac": round(payload.a_declarer_calcule, 3),
+                 "a": round(payload.a_declarer, 3), "r": remarque, "u": str(user.get("sub", ""))[:50]},
+            )
+        found = _adjustment(db, payload.compagnie, payload.jour)
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise _fail(exc) from exc
+    return {"ajustement": found}
 
 
 # ---------------------------------------------------------------------------------------------

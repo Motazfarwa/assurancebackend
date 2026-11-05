@@ -55,6 +55,7 @@ ENTITIES = [
     (r"^ristournes", "Ristourne", "N°"),
     (r"^frais-generaux", "Frais généraux", "N°"),
     (r"^journaux/retours", "Retour de la quittance", "N°"),
+    (r"^journaux/feuille/ajustement", "Ajustement de la feuille de caisse", ""),
     (r"^journaux/encaissement", "Comptabilisation journal d'encaissement", ""),
     (r"^journaux/depense", "Comptabilisation journal de dépense", ""),
     (r"^bordereaux/quittances", "Période de la quittance", "N°"),
