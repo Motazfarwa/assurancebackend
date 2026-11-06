@@ -235,6 +235,37 @@ def list_bordereaux(
     return [_plain(row) for row in rows]
 
 
+@router.get("/periodes")
+def bordereau_periods(
+    code_compagnie: int,
+    tc: str = Query(default="T", pattern="^[TC]$"),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    """Periods that really have a bordereau for a company and T/C (dbo."TBordereau", or one imported in
+    dbo."TBordereauCie"), most recent first, with their line count and fusion status."""
+    _ensure_tables(db)
+    rows = db.execute(
+        text(
+            'SELECT TRIM(b."Periode") AS periode, COUNT(*) AS nb_lignes, '
+            "SUM(CASE WHEN UPPER(TRIM(COALESCE(b.\"Fusion\", ''))) = 'O' THEN 1 ELSE 0 END) AS nb_fusionnees "
+            f'FROM dbo."TBordereau" b WHERE b."Code_Compagnie" = :c AND b.tc = :t AND TRIM(b."Periode") ~ \'^[0-9]{{2}}/[0-9]{{4}}$\' '
+            'GROUP BY TRIM(b."Periode") '
+            "UNION ALL "
+            "SELECT periode, nb_lignes, CASE WHEN fusionne = 'O' THEN nb_lignes ELSE 0 END "
+            'FROM dbo."TBordereauCie" WHERE code_compagnie = :c AND tc = :t'
+        ),
+        {"c": code_compagnie, "t": tc},
+    ).mappings().all()
+    # TBordereau wins over TBordereauCie for the same period, as in the confrontation.
+    periods: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        periods.setdefault(row["periode"], {
+            "periode": row["periode"], "nb_lignes": int(row["nb_lignes"]),
+            "fusionne": int(row["nb_lignes"]) > 0 and int(row["nb_fusionnees"]) == int(row["nb_lignes"]),
+        })
+    return sorted(periods.values(), key=lambda entry: (entry["periode"][3:], entry["periode"][:2]), reverse=True)
+
+
 @router.get("/confrontation")
 def confrontation(
     code_compagnie: int,
