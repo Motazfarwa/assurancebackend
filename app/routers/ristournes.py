@@ -8,6 +8,7 @@ import json
 import logging
 import re
 from datetime import date, datetime
+from itertools import combinations
 from typing import Any
 
 import anthropic
@@ -535,8 +536,10 @@ def _parse_quittance(raw: str) -> dict[str, Any] | None:
         "client": (pick(r"ASSURE\s*[:.]?\s*([^\n]{2,60})") or pick(r"SOUSCRIPTEUR\s*[:.]?\s*([^\n]{2,60})") or "").strip() or None,
         "date_du": pick(r"EFFET\s*DU\s*[:.]?\s*(\d{1,2}/\d{1,2}/\d{2,4})"),
         "date_au": pick(r"JUSQU.?AU\s*[:.]?\s*(\d{1,2}/\d{1,2}/\d{2,4})"),
-        "date_document": pick(r"\bLE\s+(\d{1,2}/\d{1,2}/\d{2,4})"),
-        "decommission": pick(r"Commission\s*[:.]?\s*(-?[\d .]+,\d{3})"),
+        "date_document": pick(r"(?:\b|TUNIS)LE\s+(\d{1,2}/\d{1,2}/\d{2,4})"),  # "TUNIS LE 06/05/2026", read "TUNISLE"
+        # The commission of the avis d'encaissement; the OCR garbles its label ("Coñimtéaton::") and its "DT" ("2,1770T").
+        "decommission": _labelled_amounts(raw).get("decommission")
+        or pick(r"\bCo\w{0,3}m\w{2,10}\s*:{1,2}\s*(\d{1,3}(?:[ .]\d{3})*,\d{3})"),
         # A Tunisian plate (4637 TU 86, RS 283583), else the few characters before the next label.
         "immatriculation": (pick(r"Immatriculation\s*[:.]?\s*(\d{1,4}\s*TU\s*\d{1,4}|RS\s*\d{3,7}|[^\n]{3,12}?)(?=\s{2,}|\s+(?:TUNIS|Marque|Type)\b|\n|$)") or "").strip() or None,
         "remarque": "Lu par OCR (service IA indisponible) : vérifiez chaque montant avec le document.",
@@ -544,47 +547,87 @@ def _parse_quittance(raw: str) -> dict[str, Any] | None:
     if re.search(r"\bCARTE\b", flat):
         line["compagnie"] = "CARTE"
     # The row of amounts under "Prime de Base | Prime Annexe | Frais | Taxe Base | Taxes Annexes | F.P.C.S.R | FPAC |
-    # FGA | Prime Totale": its first five amounts, then the LAST one is the Prime Totale; amounts in between are
-    # the FPCSR / FPAC / FGA cells that are filled (usually empty).
-    amount = r"-?\s?\d[\d .]*,\d{3}\s*D\s?T"
-    every = [re.sub(r"\s*D\s?T$", "", cell).replace(" ", "") for cell in re.findall(f"({amount})", raw)]
+    # FGA | Prime Totale". Every amount of the text, in reading order: an amount with 3 decimals followed by its "DT",
+    # which the OCR often misreads ("0T", "DI", "D1", a lone "D") or loses.
+    every = [cell.replace(" ", "") for cell in re.findall(r"(?<![\d,])(-?\s?\d{1,3}(?:[ .]\d{3})*,\d{3})(?=\s*(?:D\s?T|[D0O]\s?[T1I|l]|D\b|\s|\||\]|$))", raw)]
     checked = _consistent_row(every)
     if checked:
         # The row whose amounts add up: Base + Annexe + Frais + Taxe Base + Taxes Annexes (+ FPCSR / FPAC / FGA) = Totale.
         line.update(checked)
         return line
-    rows = [re.findall(f"({amount})", row) for row in raw.splitlines()]
-    row = next((cells for cells in rows if len(cells) >= 6), None)
-    if row is None:  # the cells were read on separate lines: the amounts in order of the whole text
-        row = every[:6] if len(every) >= 6 else None
-    if row:
-        cells = [re.sub(r"\s*D\s?T$", "", cell).replace(" ", "") for cell in row[:9]]
-        line.update(dict(zip(("prime_base", "prime_annexe", "frais", "taxe_base", "taxes_annexes"), cells[:5])))
-        line.update(dict(zip(("fpcsr", "fpac", "fga"), cells[5:-1])))
-        line["totale"] = cells[-1]
+    # No row adds up: the amounts are not guessed from their position (a cell lost by the OCR shifts every other one).
+    labelled = _labelled_amounts(raw).get("totale")
+    if labelled:
+        line["totale"] = labelled
+    line["remarque"] = "Lu par OCR : le tableau des montants est illisible, saisissez la ristourne nette, la détaxe et la totale depuis le document."
     return line
+
+
+# Labelled amounts of a document's text: the company's commission is the ristourne's décommission, and its Prime Totale
+# (or ristourne totale / montant de la ristourne) is the ristourne totale. Only a value printed right after its label.
+_AMOUNT = r"(-?[ ]?\d{1,3}(?:[ .]\d{3})*,\d{3}|-?[ ]?\d+[.,]\d{3})(?![\d,])"  # 1.234,567 / 1 234,567 / 20,087 / 4.188
+_LABELLED = {
+    "decommission": r"(?:D[ée]\s?commission|Commission|Comm\.)",
+    "totale": r"(?:Prime\s+Totale|Ristourne\s+Totale|Total\s+(?:de\s+la\s+)?ristourne|Montant\s+(?:de\s+la\s+)?ristourne|Net\s+[àa]\s+(?:payer|rembourser))",
+}
+
+
+def _labelled_amounts(raw: str) -> dict[str, str]:
+    found: dict[str, str] = {}
+    for key, label in _LABELLED.items():
+        match = re.search(label + r"[ \t]*(?:\(?[ \t]*DT[ \t]*\)?)?[ \t]*[:.]?[ \t]*" + _AMOUNT, raw, re.IGNORECASE)
+        if match:
+            found[key] = match.group(1).replace(" ", "")
+    return found
+
+
+def _adds_up(parts: list[float], total: float) -> list[float] | None:
+    """The cells (Base, Annexe, Frais, Taxe Base, Taxes Annexes…) when they add up to the Prime Totale. The OCR often
+    drops the minus sign of Frais and Taxe Base (refunds are negative there): both signs are tried."""
+    for frais_sign in (1, -1):
+        for taxe_sign in (1, -1):
+            cells = list(parts)
+            cells[2] = abs(cells[2]) * frais_sign if frais_sign == -1 or cells[2] >= 0 else cells[2]
+            cells[3] = abs(cells[3]) * taxe_sign if taxe_sign == -1 or cells[3] >= 0 else cells[3]
+            if total > 0 and abs(sum(cells) - total) <= 0.011:
+                return cells
+    return None
 
 
 def _consistent_row(amounts: list[str]) -> dict[str, Any] | None:
     """Among the amounts read in order, the row of the quittance's table whose cells add up to its Prime Totale.
-    The OCR often drops the minus sign of Frais and Taxe Base (refunds are negative there): both signs are tried."""
+    First a row read in order (5 cells + Prime Totale, plus up to 3 filled FPCSR / FPAC / FGA cells); else, as the
+    scattered-text OCR may read the Prime Totale before the last cells or slip a stray value in, any 5 cells kept in
+    their order within 8 neighbouring amounts, the Prime Totale being one of the others."""
     values = [_signed(value) for value in amounts]
-    for width in (6, 7, 8, 9):  # 5 cells + Prime Totale, plus up to 3 filled FPCSR / FPAC / FGA cells
+
+    def row(cells: list[float], total: float) -> dict[str, Any]:
+        found = dict(zip(("prime_base", "prime_annexe", "frais", "taxe_base", "taxes_annexes"), cells[:5]))
+        found.update(dict(zip(("fpcsr", "fpac", "fga"), cells[5:])))
+        return {**found, "totale": total}
+
+    for width in (6, 7, 8, 9):
         for start in range(0, len(values) - width + 1):
             window = values[start:start + width]
             if any(value is None for value in window):
                 continue
-            *parts, total = window
-            for frais_sign in (1, -1):
-                for taxe_sign in (1, -1):
-                    cells = list(parts)
-                    cells[2] = abs(cells[2]) * frais_sign if frais_sign == -1 or cells[2] >= 0 else cells[2]
-                    cells[3] = abs(cells[3]) * taxe_sign if taxe_sign == -1 or cells[3] >= 0 else cells[3]
-                    if total > 0 and abs(sum(cells) - total) <= 0.011:
-                        row = dict(zip(("prime_base", "prime_annexe", "frais", "taxe_base", "taxes_annexes"), cells[:5]))
-                        row.update(dict(zip(("fpcsr", "fpac", "fga"), cells[5:])))
-                        return {**row, "totale": total}
-    return None
+            cells = _adds_up(window[:-1], window[-1])
+            if cells:
+                return row(cells, window[-1])
+    # The tightest match wins (fewest amounts skipped): with signs to try, a loose one can add up by chance.
+    best: tuple[int, int, dict[str, Any]] | None = None
+    for start in range(len(values)):
+        window = [value for value in values[start:start + 8] if value is not None]
+        for index, total in enumerate(window[1:], start=1):  # the window's first amount is the Prime de Base
+            others = window[1:index] + window[index + 1:]
+            for chosen in combinations(range(len(others)), 4):
+                cells = _adds_up([window[0], *(others[position] for position in chosen)], total)
+                if cells:
+                    used = [0, index, *(position + 1 if position + 1 < index else position + 2 for position in chosen)]
+                    skipped = max(used) + 1 - len(used)
+                    if best is None or (skipped, start) < best[:2]:
+                        best = (skipped, start, row(cells, total))
+    return best[2] if best else None
 
 
 def _dedupe(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -671,7 +714,11 @@ def extract_ristournes_from_text(payload: TextIn, db: Session = Depends(get_db))
         else:
             found = re.findall(r"[A-Z0-9][A-Z0-9/.-]{4,19}", payload.text.upper())
             tokens = dict.fromkeys(token for token in found if sum(ch.isdigit() for ch in token) >= 4)
-            document = {"lignes": [{"num_police": token, "remarque": "Lu par OCR : montants et dates à saisir."} for token in tokens if _find_policies(db, token)]}
+            lines = [{"num_police": token, "remarque": "Lu par OCR : montants et dates à saisir."} for token in tokens if _find_policies(db, token)]
+            # One policy on the document: its commission (décommission) and Prime Totale, when printed with their labels.
+            if len(lines) == 1:
+                lines[0].update(_labelled_amounts(payload.text))
+            document = {"lignes": lines}
         return {**_answer(db, "ocr-local", document), "infos": label_values(payload.text)}
     except SQLAlchemyError as exc:
         raise _fail(exc) from exc
