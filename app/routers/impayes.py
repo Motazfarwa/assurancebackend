@@ -305,6 +305,36 @@ def unpaid_statement(
     return {"items": items, "count": len(items), "limit": limit}
 
 
+@router.get("/etat/liens/{code_client}")
+def unpaid_statement_links(code_client: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """The clients linked to a client, for its Etat des impayés: the client of its own "Lien" (code_locuteur, as stored
+    on the client) and the clients whose "Lien" is this client. Only codes that are real clients are given."""
+    schema = settings.db_schema
+    code = code_client.strip()
+    client = db.execute(
+        text(f'SELECT TRIM(code_client) AS code_client, TRIM(nom_client) AS nom_client, NULLIF(TRIM(code_locuteur), \'\') AS code_locuteur '
+             f'FROM "{schema}"."TClient" WHERE TRIM(code_client) = :c LIMIT 1'),
+        {"c": code},
+    ).mappings().first()
+    if not client:
+        raise HTTPException(status_code=404, detail=f"Client {code} introuvable.")
+    rows = db.execute(
+        text(
+            f'SELECT TRIM(c.code_client) AS code_client, TRIM(c.nom_client) AS nom_client, \'lien\' AS relation FROM "{schema}"."TClient" c '
+            "WHERE TRIM(c.code_client) = :lien "
+            "UNION ALL "
+            f'SELECT TRIM(c.code_client), TRIM(c.nom_client), \'lie\' FROM "{schema}"."TClient" c WHERE TRIM(c.code_locuteur) = :c'
+        ),
+        {"c": code, "lien": client["code_locuteur"] or ""},
+    ).mappings().all()
+    links: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if row["code_client"] != code:
+            links.setdefault(row["code_client"], dict(row))
+    ordered = sorted(links.values(), key=lambda row: (row["relation"] != "lien", len(row["code_client"]), row["code_client"]))
+    return {"client": {"code_client": client["code_client"], "nom_client": client["nom_client"]}, "liens": ordered}
+
+
 # Compagnies the agency does not work with: left out of the Etat des impayés choice.
 HIDDEN_COMPANIES = ("MAE", "EL AMANA TAKAFUL", "SALIM", "STAR")
 
