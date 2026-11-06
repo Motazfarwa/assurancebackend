@@ -128,7 +128,8 @@ LEFT JOIN treg tr ON tr.num_quittance = TRIM(q.num_quittance)
 WHERE (CAST(:compagnie AS integer) IS NULL OR p.code_compagnie = CAST(:compagnie AS integer))
   AND UPPER(TRIM(k.nom_compagnie)) <> ALL(:excluded)
   -- With `regles`, only the quittances with a client settlement (and, between two dates, settled in them).
-  AND (NOT :regles OR (tr.num_quittance IS NOT NULL AND (CAST(:reg_debut AS date) IS NULL OR tr.in_period)))
+  AND (NOT :regles OR (tr.date_reglement IS NOT NULL AND COALESCE(tr.regle, 0) > 0.0005
+                       AND (CAST(:reg_debut AS date) IS NULL OR tr.in_period)))
 ORDER BY q.echeance, TRIM(q.num_quittance)
 """
 
