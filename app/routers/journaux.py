@@ -69,14 +69,16 @@ def companies(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
 # Journal d'encaissement
 # ---------------------------------------------------------------------------------------------
 
-# Receipts of the company still to declare (due by the journal date), and with `done` the ones declared on that date.
+# Receipts of the company still to declare (due in the year of the journal date, by that date), and with `done` the ones
+# declared on that date.
 # declared_before / at_day / pending: the settlement lines declared before the date, on the date, not yet.
 RECEIPTS_SQL = """
 WITH q AS MATERIALIZED (
     SELECT q.* FROM dbo."TQuittance" q
     WHERE TRIM(q.type_quittance) = 'P' AND COALESCE(q.annule, 'N') <> 'O'
       AND (
-        (COALESCE(q."Comptabiliser", 'N') <> 'O' AND q.echeance < :next_day)
+        -- due in the journal date's year, by that date (01/01/2026 → 15/11/2026)
+        (COALESCE(q."Comptabiliser", 'N') <> 'O' AND q.echeance >= date_trunc('year', CAST(:day AS date)) AND q.echeance < :next_day)
         OR (:done AND q."Date_Comptabiliser" >= :day AND q."Date_Comptabiliser" < :next_day)
         OR (:done AND EXISTS (
             SELECT 1 FROM dbo."RDetRegCli" d WHERE TRIM(d."Num_quitance") = TRIM(q.num_quittance)
