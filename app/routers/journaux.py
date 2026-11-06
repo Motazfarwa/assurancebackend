@@ -93,11 +93,17 @@ reg AS (
     SELECT TRIM(d."Num_quitance") AS num_quittance,
            SUM(CASE WHEN d."Comptabiliser" = 'O' AND d."Date_Comptabiliser" < :day THEN d."Montant" ELSE 0 END) AS declared_before,
            SUM(CASE WHEN d."Comptabiliser" = 'O' AND d."Date_Comptabiliser" >= :day AND d."Date_Comptabiliser" < :next_day THEN d."Montant" ELSE 0 END) AS at_day,
-           SUM(CASE WHEN COALESCE(d."Comptabiliser", 'N') <> 'O' THEN d."Montant" ELSE 0 END) AS pending
-    FROM dbo."RDetRegCli" d WHERE TRIM(d."Num_quitance") IN (SELECT TRIM(num_quittance) FROM q)
+           SUM(CASE WHEN COALESCE(d."Comptabiliser", 'N') <> 'O' THEN d."Montant" ELSE 0 END) AS pending,
+           -- Every client settlement of the quittance (RDetRegCli: TRDetRegCli is its copy frozen in 2012), and the last one.
+           SUM(d."Montant") AS regle, MAX(t.date_reg_cli) AS date_reglement,
+           STRING_AGG(DISTINCT TRIM(t.num_piece), ', ') FILTER (WHERE TRIM(t.num_piece) <> '') AS pieces_reglement
+    FROM dbo."RDetRegCli" d LEFT JOIN dbo."TRegCli" t ON t.num_reg_cli = d."Num_reg_cli"
+    WHERE TRIM(d."Num_quitance") IN (SELECT TRIM(num_quittance) FROM q)
     GROUP BY 1
 )
 SELECT TRIM(q.num_quittance) AS num_quittance, TRIM(q.tc) AS tc, q.echeance, p.num_police, TRIM(q."Code_Agence") AS code_agence,
+       p.code_compagnie, TRIM(k.nom_compagnie) AS nom_compagnie,
+       COALESCE(r.regle, 0) AS regle, r.date_reglement, r.pieces_reglement,
        TRIM(q.code_client) AS code_client,
        (SELECT TRIM(c.nom_client) FROM dbo."TClient" c WHERE TRIM(c.code_client) = TRIM(q.code_client) LIMIT 1) AS assure,
        COALESCE(q.prime_net, 0) AS prime_net, COALESCE(q.frais_quit, 0) AS frais_quit, COALESCE(q.montant_quittance, 0) AS montant_quittance,
@@ -106,8 +112,11 @@ SELECT TRIM(q.num_quittance) AS num_quittance, TRIM(q.tc) AS tc, q.echeance, p.n
        COALESCE(r.declared_before, 0) AS declared_before, COALESCE(r.at_day, 0) AS at_day, COALESCE(r.pending, 0) AS pending
 FROM q
 JOIN pol p ON p.num_int = TRIM(q.num_int)
+JOIN dbo."TCompagnie" k ON k.code_compagnie = p.code_compagnie
 LEFT JOIN reg r ON r.num_quittance = TRIM(q.num_quittance)
-WHERE p.code_compagnie = :compagnie
+-- One company, or all those the agency keeps journals for.
+WHERE (CAST(:compagnie AS integer) IS NULL OR p.code_compagnie = CAST(:compagnie AS integer))
+  AND UPPER(TRIM(k.nom_compagnie)) <> ALL(:excluded)
 ORDER BY q.echeance, TRIM(q.num_quittance)
 """
 
@@ -136,17 +145,18 @@ def _receipt(row: Any) -> dict[str, Any]:
     return item
 
 
-def _receipts(db: Session, compagnie: int, day: date, done: bool, numbers: list[str] | None = None) -> list[dict[str, Any]]:
+def _receipts(db: Session, compagnie: int | None, day: date, done: bool, numbers: list[str] | None = None) -> list[dict[str, Any]]:
     rows = db.execute(
         text(RECEIPTS_SQL),
-        {"compagnie": compagnie, "day": day, "next_day": day + timedelta(days=1), "done": done, "numbers": numbers},
+        {"compagnie": compagnie, "day": day, "next_day": day + timedelta(days=1), "done": done, "numbers": numbers,
+         "excluded": EXCLUDED_COMPANIES},
     ).mappings().all()
     return [_receipt(row) for row in rows]
 
 
 @router.get("/encaissement")
 def receipts_journal(
-    compagnie: int = Query(...),
+    compagnie: int | None = Query(default=None, description="Without it, every company"),
     date_journal: date = Query(..., alias="date"),
     comptabilises: bool = Query(default=False, description="Also the receipts declared on that date"),
     db: Session = Depends(get_db),
@@ -811,3 +821,45 @@ def set_quittance_return(payload: ReturnIn, user: dict[str, Any] = Depends(requi
         db.rollback()
         raise _fail(exc) from exc
     return {"num_quittance": keys["q"], "date_retour": returned.isoformat() if returned else None}
+
+
+# ---------------------------------------------------------------------------------------------
+# Etat du terme
+# ---------------------------------------------------------------------------------------------
+# The policies en cours (etat AN) whose terme falls in the month, as the legacy "Etat de terme du mois": the month of
+# their échéance ("dd/mm"), or for a policy paid by months (Unite M, durée 3 or 6) every durée months from it (01/09
+# by 3 months: September, December, March, June). A policy with an expiration date is temporary.
+TERM_SQL = """
+WITH p AS (
+    SELECT TRIM(p.num_police) AS num_police, TRIM(p.code_client) AS code_client, TRIM(p.echeance) AS echeance,
+           UPPER(TRIM(p."Unite")) AS unite, p.duree, UPPER(COALESCE(TRIM(p."TousRisque"), '')) = 'O' AS tous_risque,
+           UPPER(TRIM(p.etat)) AS etat, p.expiration, p.code_compagnie,
+           CAST(SUBSTRING(TRIM(p.echeance) FROM '^[0-9]{1,2}[/-]([0-9]{1,2})') AS integer) AS mois_echeance
+    FROM dbo."TPolice" p
+    WHERE UPPER(TRIM(p.etat)) = 'AN'
+      AND (CAST(:compagnie AS integer) IS NULL OR p.code_compagnie = CAST(:compagnie AS integer))
+)
+SELECT p.num_police, p.code_client, TRIM(c.nom_client) AS nom_client, p.echeance, p.unite, p.duree, p.tous_risque, p.etat,
+       p.expiration, TRIM(k.nom_compagnie) AS nom_compagnie
+FROM p
+LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = p.code_client
+LEFT JOIN dbo."TCompagnie" k ON k.code_compagnie = p.code_compagnie
+WHERE p.mois_echeance BETWEEN 1 AND 12
+  AND (p.mois_echeance = :mois
+       OR (p.unite = 'M' AND p.duree BETWEEN 1 AND 11 AND MOD(:mois - p.mois_echeance + 12, p.duree) = 0))
+ORDER BY p.num_police
+"""
+
+
+@router.get("/terme")
+def term_statement(
+    mois: int = Query(..., ge=1, le=12),
+    code_compagnie: int | None = None,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        rows = db.execute(text(TERM_SQL), {"mois": mois, "compagnie": code_compagnie}).mappings().all()
+    except SQLAlchemyError as exc:
+        raise _fail(exc) from exc
+    items = [{**_plain(row), "temporaire": row["expiration"] is not None} for row in rows]
+    return {"items": items}

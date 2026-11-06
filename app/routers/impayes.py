@@ -253,11 +253,19 @@ def unpaid_statement(
             FROM "{schema}"."TPolice"
             WHERE TRIM(num_int) IN (SELECT TRIM(num_int) FROM q)
             ORDER BY TRIM(num_int), effet DESC NULLS LAST
+        ),
+        -- What the client already paid on the quittance (RDetRegCli: TRDetRegCli is its copy frozen in 2012).
+        reg AS (
+            SELECT TRIM(d."Num_quitance") AS num_quittance, SUM(d."Montant") AS montant, MAX(t.date_reg_cli) AS date_reglement
+            FROM "{schema}"."RDetRegCli" d LEFT JOIN "{schema}"."TRegCli" t ON t.num_reg_cli = d."Num_reg_cli"
+            WHERE TRIM(d."Num_quitance") IN (SELECT TRIM(num_quittance) FROM q)
+            GROUP BY 1
         )
         SELECT TRIM(q.code_client) AS code_client, TRIM(c.nom_client) AS nom_client, TRIM(c.adresse) AS adresse,
                TRIM(c.ville) AS ville, c.cp, TRIM(c."Type_Client") AS type_client,
                TRIM(q.num_quittance) AS num_quittance, TRIM(q.num_int) AS num_int, TRIM(q.tc) AS tc, TRIM(q."Periode") AS periode,
                q.echeance, q.montant_quittance, q.solde_quittance, COALESCE(i.montant, 0) AS en_instance, i.pieces,
+               COALESCE(g.montant, 0) AS regle, g.date_reglement,
                CASE WHEN :piece = 'avec' THEN q.solde_quittance - COALESCE(i.montant, 0) ELSE q.solde_quittance END AS solde,
                COALESCE(NULLIF(TRIM(p.risque), ''), '') AS risque, TRIM(q.observation) AS observation,
                p.code_compagnie, TRIM(k.nom_compagnie) AS nom_compagnie, TRIM(b.nom_branche) AS nom_branche,
@@ -265,6 +273,7 @@ def unpaid_statement(
         FROM q
         LEFT JOIN "{schema}"."TClient" c ON TRIM(c.code_client) = TRIM(q.code_client)
         LEFT JOIN instance i ON i.num_quittance = TRIM(q.num_quittance)
+        LEFT JOIN reg g ON g.num_quittance = TRIM(q.num_quittance)
         LEFT JOIN pol p ON p.num_int = TRIM(q.num_int)
         LEFT JOIN "{schema}"."TCompagnie" k ON k.code_compagnie = p.code_compagnie
         -- The policy's branch, else the company's longest branch code the policy number starts with.

@@ -43,6 +43,10 @@ ENTITIES = [
     (r"^flotte/[^/]+/vehicules", "Véhicule de flotte police", "N°"),
     (r"^flotte", "Police flotte", "N°"),
     (r"^polices", "Police", "N°"),
+    (r"^reconciliation/police/client", "Réconciliation (changement de client) de la police", "N°"),
+    (r"^reconciliation/numero/police", "Rectification du N° police", ""),
+    (r"^reconciliation/numero/quittance", "Rectification du N° quittance", ""),
+    (r"^reconciliation/numero/attestation", "Rectification du N° attestation", ""),
     (r"^quittances", "Quittance", "N°"),
     (r"^sinistres/[^/]+/etapes", "Étape du sinistre", "N°"),
     (r"^sinistres/[^/]+/appels", "Appel du sinistre", "N°"),
@@ -116,7 +120,7 @@ READS: list[tuple[str, str, Any]] = [
     (r"^bordereaux/confrontation$", "Consultation",
      lambda g, q: f"Consultation Confrontation bordereau compagnie {q.get('code_compagnie', '')} période {q.get('periode', '')}"),
     (r"^prestataires/(?P<c>(?!lookups$)[^/]+)$", "Consultation", lambda g, q: f"Consultation du prestataire N° {g['c']}"),
-    (r"^journaux/encaissement$", "Consultation", lambda g, q: f"Consultation Journal d'encaissement compagnie {_company(q)}{_period(q)}"),
+    (r"^journaux/encaissement$", "Consultation", lambda g, q: f"Consultation Journal d'encaissement compagnie {_company(q) or 'toutes'}{_period(q)}"),
     (r"^journaux/depense$", "Consultation", lambda g, q: f"Consultation Journal de dépense compagnie {_company(q)}{_period(q)}"),
     (r"^journaux/feuille$", "Impression", lambda g, q: f"Impression Feuille de caisse compagnie {_company(q)}{_period(q)}"),
     (r"^journaux/percus$", "Impression", lambda g, q: f"Impression Etat des {KINDS.get(q.get('type', 'moins'), '')}{_period(q)}"),
@@ -126,6 +130,8 @@ READS: list[tuple[str, str, Any]] = [
      lambda g, q: f"Impression Etat financier des opérations journalières ({KINDS.get(q.get('type', 'technique'), '')}){_period(q)}"),
     (r"^journaux/comptes-clients$", "Impression", lambda g, q: f"Impression Etat des comptes client{_period(q)}"),
     (r"^journaux/recette$", "Impression", lambda g, q: f"Impression Etat de la recette technique{_period(q)}"),
+    (r"^journaux/terme$", "Impression",
+     lambda g, q: f"Impression Etat du terme du mois {q.get('mois', '')}" + (f" compagnie {q['code_compagnie']}" if q.get("code_compagnie") else "")),
     (r"^journaux/retours$", "Consultation",
      lambda g, q: f"Consultation des retours de quittances compagnie {_company(q)} période {q.get('periode', '')}"),
     (r"^impayes-agence/etat$", "Impression", lambda g, q: f"Impression Etat des impayés{_period(q)}"),
@@ -350,7 +356,7 @@ def describe(method: str, path: str, request_body: Any, response_body: Any, refu
     number = path_id or _first_id(response_body) or _first_id(request_body)
     action = "Suppression" if verb == "Suppresion" else verb
     target = f"{label} {number_word} {number}".strip() if number and number_word else f"{label} {number}".strip()
-    if label.startswith(("Comptabilisation", "Fusion", "Versement")):
+    if label.startswith(("Comptabilisation", "Fusion", "Versement", "Réconciliation", "Rectification")):
         action = ""  # the label already says what was done
     if refused:
         return "Tentative", f"Tentative de {(action or label).lower()} {target if action else ''}".strip()[:250]
