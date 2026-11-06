@@ -253,7 +253,7 @@ SELECT d.num_dep, d.nature, d.libelle, d.date_dep, COALESCE(d.mont_dep, 0) AS mo
 FROM d
 JOIN pol p ON p.num_police = TRIM(d.num_police)
 WHERE p.code_compagnie = :compagnie
-ORDER BY d.date_dep, d.num_dep
+ORDER BY TRIM(d.num_police), d.num_dep  -- as the legacy "Liste des dépenses": by police
 """
 
 
