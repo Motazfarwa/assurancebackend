@@ -646,7 +646,7 @@ def daily_financial(
 # ---------------------------------------------------------------------------------------------
 # Etat des comptes client
 # ---------------------------------------------------------------------------------------------
-# Per client, for the quittances due between two dates (or all of them): the primes, the ristournes (quittances of type R),
+# Per client, for the quittances due between two dates (or all of them, the returned ones left out): the primes, the ristournes (quittances of type R),
 # what the client paid on them (RDetRegCli), the commissions, and the claims paid to the client in the period (TDepense 'T'
 # of nature S). Optional filters: one company, one client, one police; état: tous, comptabilisé, en instance, ristournes.
 ACCOUNTS_SQL = """
@@ -661,6 +661,7 @@ q AS MATERIALIZED (
            COALESCE(q.prime_total, 0) AS prime_total, COALESCE(q.commission, 0) AS commission
     FROM dbo."TQuittance" q
     WHERE COALESCE(q.annule, 'N') <> 'O'
+      AND q."Date_Retour" IS NULL  -- a quittance returned to the company is no longer the client's
       AND (CAST(:debut AS date) IS NULL OR (q.echeance >= CAST(:debut AS date) AND q.echeance < CAST(:fin AS date)))
       AND (CAST(:client AS text) IS NULL OR TRIM(q.code_client) = CAST(:client AS text))
       AND (CAST(:compagnie AS int) IS NULL AND CAST(:police AS text) IS NULL OR TRIM(q.num_int) IN (SELECT num_int FROM pol))
