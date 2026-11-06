@@ -340,48 +340,38 @@ def received_gaps(
 # ---------------------------------------------------------------------------------------------
 # Feuille de caisse over a period
 # ---------------------------------------------------------------------------------------------
-# Per journal day (Date_Comptabiliser) of the period, what the journal d'encaissement declared that day, counted as in
-# _receipt: a receipt declared that day for its balance (montant less the acomptes declared before, with its commission),
-# otherwise its acomptes declared that day (no commission). Without dates: every day.
+# Per day of the period, the client settlements of the company's quittances (TRegCli dated that day, one RDetRegCli
+# line per quittance paid; the 'R' moins perçus are not cash): primes = what the clients paid, and the commission of a
+# quittance on the line that settles it (Acompte_Solde 'S'; an acompte carries none). Without dates: every day.
 CASH_RECEIPTS_SQL = """
-WITH pol AS (
+WITH r AS MATERIALIZED (
+    SELECT r.num_reg_cli, r.date_reg_cli::date AS jour
+    FROM dbo."TRegCli" r
+    WHERE COALESCE(TRIM(r.type_reg_cli), '') <> 'R'
+      AND (CAST(:debut AS date) IS NULL OR r.date_reg_cli >= CAST(:debut AS date))
+      AND (CAST(:fin AS date) IS NULL OR r.date_reg_cli < CAST(:fin AS date) + 1)
+),
+lines AS MATERIALIZED (
+    SELECT r.jour, TRIM(d."Num_quitance") AS num_quittance, COALESCE(d."Montant", 0) AS montant,
+           COALESCE(NULLIF(TRIM(d."Acompte_Solde"), ''), 'S') = 'S' AS settles
+    FROM r JOIN dbo."RDetRegCli" d ON d."Num_reg_cli" = r.num_reg_cli
+),
+q AS (
+    SELECT DISTINCT ON (TRIM(q.num_quittance)) TRIM(q.num_quittance) AS num_quittance, TRIM(q.num_int) AS num_int,
+           COALESCE(q.commission, 0) AS comm
+    FROM dbo."TQuittance" q WHERE TRIM(q.num_quittance) IN (SELECT num_quittance FROM lines)
+    ORDER BY TRIM(q.num_quittance)
+),
+pol AS (
     SELECT DISTINCT ON (TRIM(num_int)) TRIM(num_int) AS num_int, code_compagnie
-    FROM dbo."TPolice" ORDER BY TRIM(num_int), effet DESC NULLS LAST
-),
-q AS MATERIALIZED (
-    SELECT TRIM(q.num_quittance) AS num_quittance, q."Comptabiliser" AS comptabiliser, q."Date_Comptabiliser"::date AS jour,
-           COALESCE(q.montant_quittance, 0) AS montant_quittance, COALESCE(q.commission, 0) AS comm,
-           COALESCE(q.timbre, 0) AS timbre, COALESCE(q.cout_attestation, 0) AS frais,
-           COALESCE(q.solde_quittance, 0) <= 0.0005 AS paid
-    FROM dbo."TQuittance" q JOIN pol p ON p.num_int = TRIM(q.num_int)
-    WHERE p.code_compagnie = :compagnie AND TRIM(q.type_quittance) = 'P' AND COALESCE(q.annule, 'N') <> 'O'
-),
-det AS MATERIALIZED (
-    SELECT TRIM(d."Num_quitance") AS num_quittance, d."Date_Comptabiliser"::date AS jour, SUM(d."Montant") AS montant
-    FROM dbo."RDetRegCli" d JOIN q ON q.num_quittance = TRIM(d."Num_quitance")
-    WHERE d."Comptabiliser" = 'O' AND d."Date_Comptabiliser" IS NOT NULL
-    GROUP BY 1, 2
-),
-balance AS (
-    SELECT q.jour, q.num_quittance, q.montant_quittance - COALESCE(SUM(det.montant) FILTER (WHERE det.jour < q.jour), 0) AS montant,
-           q.comm, q.timbre, q.frais
-    FROM q LEFT JOIN det ON det.num_quittance = q.num_quittance
-    -- only quittances paid in full: what is still owed is not cash of the day
-    WHERE q.comptabiliser = 'O' AND q.jour IS NOT NULL AND q.paid
-      AND (CAST(:debut AS date) IS NULL OR q.jour >= CAST(:debut AS date)) AND (CAST(:fin AS date) IS NULL OR q.jour <= CAST(:fin AS date))
-    GROUP BY q.jour, q.num_quittance, q.montant_quittance, q.comm, q.timbre, q.frais
-),
-acomptes AS (
-    -- acomptes of a day the receipt was not declared for its balance
-    SELECT det.jour, det.num_quittance, det.montant, 0 AS comm, q.timbre, q.frais
-    FROM det JOIN q ON q.num_quittance = det.num_quittance
-    WHERE NOT (q.comptabiliser IS NOT DISTINCT FROM 'O' AND q.jour IS NOT DISTINCT FROM det.jour)
-      AND (CAST(:debut AS date) IS NULL OR det.jour >= CAST(:debut AS date)) AND (CAST(:fin AS date) IS NULL OR det.jour <= CAST(:fin AS date))
-),
-lines AS (SELECT * FROM balance UNION ALL SELECT * FROM acomptes)
-SELECT jour, COUNT(*) AS quittances, ROUND(SUM(montant)::numeric, 3) AS primes, ROUND(SUM(timbre)::numeric, 3) AS tq,
-       ROUND(SUM(comm)::numeric, 3) AS commission, ROUND(SUM(frais)::numeric, 3) AS frais
-FROM lines GROUP BY jour ORDER BY jour
+    FROM dbo."TPolice" WHERE TRIM(num_int) IN (SELECT num_int FROM q)
+    ORDER BY TRIM(num_int), effet DESC NULLS LAST
+)
+SELECT l.jour, COUNT(*) AS quittances, ROUND(SUM(l.montant)::numeric, 3) AS primes, 0 AS tq,
+       ROUND(SUM(CASE WHEN l.settles THEN q.comm ELSE 0 END)::numeric, 3) AS commission, 0 AS frais
+FROM lines l JOIN q ON q.num_quittance = l.num_quittance JOIN pol p ON p.num_int = q.num_int
+WHERE p.code_compagnie = :compagnie
+GROUP BY l.jour ORDER BY l.jour
 """
 
 CASH_EXPENSES_SQL = """
@@ -389,15 +379,15 @@ WITH pol AS (
     SELECT DISTINCT ON (TRIM(num_police)) TRIM(num_police) AS num_police, code_compagnie
     FROM dbo."TPolice" ORDER BY TRIM(num_police), effet DESC NULLS LAST
 ), d AS MATERIALIZED (
-    SELECT d.num_dep, TRIM(t."Nat_quit") AS nature, d."Date_Comptabiliser"::date AS jour, d.date_dep, COALESCE(d.mont_dep, 0) AS montant,
+    -- the claims and rebates paid that day (date of the dépense), like the client settlements
+    SELECT d.num_dep, TRIM(t."Nat_quit") AS nature, d.date_dep::date AS jour, d.date_dep, COALESCE(d.mont_dep, 0) AS montant,
            COALESCE(NULLIF(TRIM(d.sinistre), ''), TRIM(d.num_quittance)) AS numero, TRIM(d.num_quittance) AS num_quittance
     FROM dbo."TDepense" d
     JOIN dbo.ttype_dep t ON TRIM(t.code_type) = TRIM(d.code_type)
     JOIN pol p ON p.num_police = TRIM(d.num_police)
     WHERE p.code_compagnie = :compagnie AND TRIM(d."Typ_dep") = 'T' AND TRIM(t."Nat_quit") IN ('S', 'R')
-      AND d."Comptabiliser" = 'O' AND d."Date_Comptabiliser" IS NOT NULL
-      AND (CAST(:debut AS date) IS NULL OR d."Date_Comptabiliser" >= CAST(:debut AS date))
-      AND (CAST(:fin AS date) IS NULL OR d."Date_Comptabiliser" < CAST(:fin AS date) + 1)
+      AND (CAST(:debut AS date) IS NULL OR d.date_dep >= CAST(:debut AS date))
+      AND (CAST(:fin AS date) IS NULL OR d.date_dep < CAST(:fin AS date) + 1)
 ), rebated AS (
     -- D.Com: on a rebate, the commission of the rebated receipt
     SELECT TRIM(q.num_quittance) AS num_quittance, MAX(ABS(COALESCE(q.commission, 0))) AS d_com
@@ -418,7 +408,8 @@ def cash_sheet(
     fin: date | None = None,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """The JEQ of each journal day of the period (primes, T.Q., commission, FSSR) and the claims and rebates comptabilisés in it."""
+    """The client settlements of each day of the period (primes paid, commission of the quittances settled) and the
+    claims and rebates paid in it."""
     if debut and fin and fin < debut:
         raise HTTPException(status_code=422, detail="La date de fin précède la date de début.")
     params = {"compagnie": compagnie, "debut": debut, "fin": fin}
