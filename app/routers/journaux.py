@@ -98,13 +98,13 @@ reg AS (
     WHERE TRIM(d."Num_quitance") IN (SELECT TRIM(num_quittance) FROM q)
     GROUP BY 1
 ),
--- The client settlements shown in the journal, as the user asked: those of TRDetRegCli (with their TRegCli date and
--- pièce). TRDetRegCli stops on 02/03/2012; the later settlements are only in RDetRegCli.
+-- What the clients paid on each quittance (RDetRegCli, with the TRegCli date and pièce; TRDetRegCli is its copy
+-- frozen on 02/03/2012), shown in the journal for information.
 treg AS (
     SELECT TRIM(d."Num_quitance") AS num_quittance, SUM(d."Montant") AS regle, MAX(t.date_reg_cli) AS date_reglement,
            BOOL_OR(t.date_reg_cli >= CAST(:reg_debut AS date) AND t.date_reg_cli < CAST(:reg_fin AS date) + 1) AS in_period,
            STRING_AGG(DISTINCT TRIM(t.num_piece), ', ') FILTER (WHERE TRIM(t.num_piece) <> '') AS pieces_reglement
-    FROM dbo."TRDetRegCli" d LEFT JOIN dbo."TRegCli" t ON t.num_reg_cli = d."Num_reg_cli"
+    FROM dbo."RDetRegCli" d LEFT JOIN dbo."TRegCli" t ON t.num_reg_cli = d."Num_reg_cli"
     WHERE TRIM(d."Num_quitance") IN (SELECT TRIM(num_quittance) FROM q)
     GROUP BY 1
 )
@@ -125,7 +125,7 @@ LEFT JOIN treg tr ON tr.num_quittance = TRIM(q.num_quittance)
 -- One company, or all those the agency keeps journals for.
 WHERE (CAST(:compagnie AS integer) IS NULL OR p.code_compagnie = CAST(:compagnie AS integer))
   AND UPPER(TRIM(k.nom_compagnie)) <> ALL(:excluded)
-  -- With `regles`, only the quittances found in TRDetRegCli (and, between two dates, settled in them).
+  -- With `regles`, only the quittances with a client settlement (and, between two dates, settled in them).
   AND (NOT :regles OR (tr.num_quittance IS NOT NULL AND (CAST(:reg_debut AS date) IS NULL OR tr.in_period)))
 ORDER BY q.echeance, TRIM(q.num_quittance)
 """
