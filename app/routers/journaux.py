@@ -93,18 +93,24 @@ reg AS (
     SELECT TRIM(d."Num_quitance") AS num_quittance,
            SUM(CASE WHEN d."Comptabiliser" = 'O' AND d."Date_Comptabiliser" < :day THEN d."Montant" ELSE 0 END) AS declared_before,
            SUM(CASE WHEN d."Comptabiliser" = 'O' AND d."Date_Comptabiliser" >= :day AND d."Date_Comptabiliser" < :next_day THEN d."Montant" ELSE 0 END) AS at_day,
-           SUM(CASE WHEN COALESCE(d."Comptabiliser", 'N') <> 'O' THEN d."Montant" ELSE 0 END) AS pending,
-           -- Every client settlement of the quittance (RDetRegCli: TRDetRegCli is its copy frozen in 2012), and the last one.
-           SUM(d."Montant") AS regle, MAX(t.date_reg_cli) AS date_reglement,
+           SUM(CASE WHEN COALESCE(d."Comptabiliser", 'N') <> 'O' THEN d."Montant" ELSE 0 END) AS pending
+    FROM dbo."RDetRegCli" d
+    WHERE TRIM(d."Num_quitance") IN (SELECT TRIM(num_quittance) FROM q)
+    GROUP BY 1
+),
+-- The client settlements shown in the journal, as the user asked: those of TRDetRegCli (with their TRegCli date and
+-- pièce). TRDetRegCli stops on 02/03/2012; the later settlements are only in RDetRegCli.
+treg AS (
+    SELECT TRIM(d."Num_quitance") AS num_quittance, SUM(d."Montant") AS regle, MAX(t.date_reg_cli) AS date_reglement,
            BOOL_OR(t.date_reg_cli >= CAST(:reg_debut AS date) AND t.date_reg_cli < CAST(:reg_fin AS date) + 1) AS in_period,
            STRING_AGG(DISTINCT TRIM(t.num_piece), ', ') FILTER (WHERE TRIM(t.num_piece) <> '') AS pieces_reglement
-    FROM dbo."RDetRegCli" d LEFT JOIN dbo."TRegCli" t ON t.num_reg_cli = d."Num_reg_cli"
+    FROM dbo."TRDetRegCli" d LEFT JOIN dbo."TRegCli" t ON t.num_reg_cli = d."Num_reg_cli"
     WHERE TRIM(d."Num_quitance") IN (SELECT TRIM(num_quittance) FROM q)
     GROUP BY 1
 )
 SELECT TRIM(q.num_quittance) AS num_quittance, TRIM(q.tc) AS tc, q.echeance, p.num_police, TRIM(q."Code_Agence") AS code_agence,
        p.code_compagnie, TRIM(k.nom_compagnie) AS nom_compagnie,
-       COALESCE(r.regle, 0) AS regle, r.date_reglement, r.pieces_reglement,
+       COALESCE(tr.regle, 0) AS regle, tr.date_reglement, tr.pieces_reglement,
        TRIM(q.code_client) AS code_client,
        (SELECT TRIM(c.nom_client) FROM dbo."TClient" c WHERE TRIM(c.code_client) = TRIM(q.code_client) LIMIT 1) AS assure,
        COALESCE(q.prime_net, 0) AS prime_net, COALESCE(q.frais_quit, 0) AS frais_quit, COALESCE(q.montant_quittance, 0) AS montant_quittance,
@@ -115,14 +121,12 @@ FROM q
 JOIN pol p ON p.num_int = TRIM(q.num_int)
 JOIN dbo."TCompagnie" k ON k.code_compagnie = p.code_compagnie
 LEFT JOIN reg r ON r.num_quittance = TRIM(q.num_quittance)
+LEFT JOIN treg tr ON tr.num_quittance = TRIM(q.num_quittance)
 -- One company, or all those the agency keeps journals for.
 WHERE (CAST(:compagnie AS integer) IS NULL OR p.code_compagnie = CAST(:compagnie AS integer))
   AND UPPER(TRIM(k.nom_compagnie)) <> ALL(:excluded)
-  -- With `regles`, only the quittances a client has paid something on (and, between two dates, paid in them); the ones
-  -- declared on the journal date are always kept.
-  AND (NOT :regles OR (q."Comptabiliser" = 'O' AND q."Date_Comptabiliser" >= :day AND q."Date_Comptabiliser" < :next_day)
-       OR COALESCE(r.at_day, 0) > 0.0005
-       OR (COALESCE(r.regle, 0) > 0.0005 AND (CAST(:reg_debut AS date) IS NULL OR r.in_period)))
+  -- With `regles`, only the quittances found in TRDetRegCli (and, between two dates, settled in them).
+  AND (NOT :regles OR (tr.num_quittance IS NOT NULL AND (CAST(:reg_debut AS date) IS NULL OR tr.in_period)))
 ORDER BY q.echeance, TRIM(q.num_quittance)
 """
 
