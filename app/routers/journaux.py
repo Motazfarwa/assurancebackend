@@ -96,6 +96,7 @@ reg AS (
            SUM(CASE WHEN COALESCE(d."Comptabiliser", 'N') <> 'O' THEN d."Montant" ELSE 0 END) AS pending,
            -- Every client settlement of the quittance (RDetRegCli: TRDetRegCli is its copy frozen in 2012), and the last one.
            SUM(d."Montant") AS regle, MAX(t.date_reg_cli) AS date_reglement,
+           BOOL_OR(t.date_reg_cli >= CAST(:reg_debut AS date) AND t.date_reg_cli < CAST(:reg_fin AS date) + 1) AS in_period,
            STRING_AGG(DISTINCT TRIM(t.num_piece), ', ') FILTER (WHERE TRIM(t.num_piece) <> '') AS pieces_reglement
     FROM dbo."RDetRegCli" d LEFT JOIN dbo."TRegCli" t ON t.num_reg_cli = d."Num_reg_cli"
     WHERE TRIM(d."Num_quitance") IN (SELECT TRIM(num_quittance) FROM q)
@@ -117,6 +118,11 @@ LEFT JOIN reg r ON r.num_quittance = TRIM(q.num_quittance)
 -- One company, or all those the agency keeps journals for.
 WHERE (CAST(:compagnie AS integer) IS NULL OR p.code_compagnie = CAST(:compagnie AS integer))
   AND UPPER(TRIM(k.nom_compagnie)) <> ALL(:excluded)
+  -- With `regles`, only the quittances a client has paid something on (and, between two dates, paid in them); the ones
+  -- declared on the journal date are always kept.
+  AND (NOT :regles OR (q."Comptabiliser" = 'O' AND q."Date_Comptabiliser" >= :day AND q."Date_Comptabiliser" < :next_day)
+       OR COALESCE(r.at_day, 0) > 0.0005
+       OR (COALESCE(r.regle, 0) > 0.0005 AND (CAST(:reg_debut AS date) IS NULL OR r.in_period)))
 ORDER BY q.echeance, TRIM(q.num_quittance)
 """
 
@@ -145,11 +151,12 @@ def _receipt(row: Any) -> dict[str, Any]:
     return item
 
 
-def _receipts(db: Session, compagnie: int | None, day: date, done: bool, numbers: list[str] | None = None) -> list[dict[str, Any]]:
+def _receipts(db: Session, compagnie: int | None, day: date, done: bool, numbers: list[str] | None = None,
+              regles: bool = False, reg_debut: date | None = None, reg_fin: date | None = None) -> list[dict[str, Any]]:
     rows = db.execute(
         text(RECEIPTS_SQL),
         {"compagnie": compagnie, "day": day, "next_day": day + timedelta(days=1), "done": done, "numbers": numbers,
-         "excluded": EXCLUDED_COMPANIES},
+         "excluded": EXCLUDED_COMPANIES, "regles": regles, "reg_debut": reg_debut, "reg_fin": reg_fin},
     ).mappings().all()
     return [_receipt(row) for row in rows]
 
@@ -159,10 +166,17 @@ def receipts_journal(
     compagnie: int | None = Query(default=None, description="Without it, every company"),
     date_journal: date = Query(..., alias="date"),
     comptabilises: bool = Query(default=False, description="Also the receipts declared on that date"),
+    regles: bool = Query(default=False, description="Only the receipts with a client settlement"),
+    debut: date | None = Query(default=None, description="With fin: settled between the two dates"),
+    fin: date | None = None,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    if bool(debut) != bool(fin):
+        raise HTTPException(status_code=422, detail="Indiquez les deux dates.")
+    if debut and fin and fin < debut:
+        raise HTTPException(status_code=422, detail="La date de fin précède la date de début.")
     try:
-        items = _receipts(db, compagnie, date_journal, comptabilises)
+        items = _receipts(db, compagnie, date_journal, comptabilises, regles=regles, reg_debut=debut, reg_fin=fin)
     except SQLAlchemyError as exc:
         raise _fail(exc) from exc
     return {"items": items, "num_jeq": date_journal.strftime("%Y%m%d")}
