@@ -133,7 +133,7 @@ READS: list[tuple[str, str, Any]] = [
     (r"^journaux/terme$", "Impression",
      lambda g, q: f"Impression Etat du terme du mois {q.get('mois', '')}" + (f" compagnie {q['code_compagnie']}" if q.get("code_compagnie") else "")),
     (r"^journaux/retours$", "Consultation",
-     lambda g, q: f"Consultation des retours de quittances compagnie {_company(q)} période {q.get('periode', '')}"),
+     lambda g, q: f"Consultation des retours de quittances compagnie {_company(q) or 'toutes'} période {q.get('periode', '')}"),
     (r"^impayes-agence/etat$", "Impression", lambda g, q: f"Impression Etat des impayés{_period(q)}"),
     (r"^impayes-agence/acomptes$", "Impression", lambda g, q: "Impression Etat des acomptes"),
     (r"^impayes-agence$", "Consultation", lambda g, q: "Consultation des impayés agence"),

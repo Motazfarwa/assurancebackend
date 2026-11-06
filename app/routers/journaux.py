@@ -761,32 +761,47 @@ def recette_technique(debut: date, fin: date, code_compagnie: int | None = None,
 # ---------------------------------------------------------------------------------------------
 # Retour des quittances
 # ---------------------------------------------------------------------------------------------
-# The quittances of a company, type (T/C) and period; ticking « Retour » gives them back to the company: TQuittance
-# "Date_Retour" is set (as the legacy software did), unticking clears it.
+# The quittances of a type (T/C) and period, of one company or all; ticking « Retour » gives them back to the company:
+# TQuittance "Date_Retour" is set (as the legacy software did), unticking clears it. With `retournees`, the quittances
+# returned during the period's month (by their return date, whatever their own period).
 RETURNS_SQL = """
 SELECT TRIM(q.num_int) AS num_police, TRIM(q.code_client) AS code_client, TRIM(c.nom_client) AS nom_client, q.echeance::date AS echeance,
-       TRIM(q.num_quittance) AS num_quittance, q.prime_net, q.commission, q.prime_total, q.solde_quittance, q."Date_Retour" AS date_retour
+       TRIM(q.num_quittance) AS num_quittance, q.prime_net, q.commission, q.prime_total, q.solde_quittance, q."Date_Retour" AS date_retour,
+       TRIM(q."Periode") AS periode, TRIM(k.nom_compagnie) AS nom_compagnie
 FROM dbo."TQuittance" q
-JOIN dbo."TPolice" p ON TRIM(p.num_int) = TRIM(q.num_int) AND p.code_compagnie = :compagnie
+JOIN dbo."TPolice" p ON TRIM(p.num_int) = TRIM(q.num_int)
+JOIN dbo."TCompagnie" k ON k.code_compagnie = p.code_compagnie
 LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(q.code_client)
-WHERE q.tc = :tc AND TRIM(q."Periode") = :periode AND TRIM(COALESCE(q.type_quittance, '')) <> 'R'
-  AND (NOT :retournees OR q."Date_Retour" IS NOT NULL)
-ORDER BY q.echeance, TRIM(q.num_quittance)
+WHERE q.tc = :tc AND TRIM(COALESCE(q.type_quittance, '')) <> 'R'
+  AND (CAST(:compagnie AS integer) IS NULL OR p.code_compagnie = CAST(:compagnie AS integer))
+  AND UPPER(TRIM(k.nom_compagnie)) <> ALL(:excluded)
+  AND CASE WHEN :retournees THEN q."Date_Retour" >= :debut AND q."Date_Retour" < :fin ELSE TRIM(q."Periode") = :periode END
+ORDER BY CASE WHEN :retournees THEN q."Date_Retour" END, q.echeance, TRIM(q.num_quittance)
 """
+# Companies the agency does not return quittances to (as in Réception comptant, Gestion des quittances, Etat du terme).
+RETURN_EXCLUDED = ["STAR", "SALIM", "MAE", "EL AMANA TAKAFUL", "EUROP ASSISTANCE", "EUROPE ASSISTANCE"]
 
 
 @router.get("/retours")
 def quittance_returns(
-    code_compagnie: int,
+    code_compagnie: int | None = None,
     periode: str = Query(pattern=r"^[0-9]{2}/[0-9]{4}$"),
     tc: str = Query("C", pattern="^[TC]$"),
     retournees: bool = False,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Quittances of a company, type and period with their return date (only the returned ones with retournees)."""
+    """Quittances of a type and period (every company without code_compagnie) with their return date; with retournees,
+    those returned during the period's month."""
+    month, year = int(periode[:2]), int(periode[3:])
+    if not 1 <= month <= 12:
+        raise HTTPException(status_code=422, detail="Période invalide.")
+    debut = date(year, month, 1)
+    fin = date(year + month // 12, month % 12 + 1, 1)
     try:
         rows = db.execute(
-            text(RETURNS_SQL), {"compagnie": code_compagnie, "tc": tc, "periode": periode, "retournees": retournees},
+            text(RETURNS_SQL),
+            {"compagnie": code_compagnie, "tc": tc, "periode": periode, "retournees": retournees, "debut": debut, "fin": fin,
+             "excluded": RETURN_EXCLUDED},
         ).mappings().all()
     except SQLAlchemyError as exc:
         raise _fail(exc) from exc
@@ -843,8 +858,9 @@ SELECT p.num_police, p.code_client, TRIM(c.nom_client) AS nom_client, p.echeance
        p.expiration, TRIM(k.nom_compagnie) AS nom_compagnie
 FROM p
 LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = p.code_client
-LEFT JOIN dbo."TCompagnie" k ON k.code_compagnie = p.code_compagnie
+JOIN dbo."TCompagnie" k ON k.code_compagnie = p.code_compagnie
 WHERE p.mois_echeance BETWEEN 1 AND 12
+  AND UPPER(TRIM(k.nom_compagnie)) <> ALL(:excluded)
   AND (p.mois_echeance = :mois
        OR (p.unite = 'M' AND p.duree BETWEEN 1 AND 11 AND MOD(:mois - p.mois_echeance + 12, p.duree) = 0))
 ORDER BY p.num_police
@@ -858,7 +874,7 @@ def term_statement(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     try:
-        rows = db.execute(text(TERM_SQL), {"mois": mois, "compagnie": code_compagnie}).mappings().all()
+        rows = db.execute(text(TERM_SQL), {"mois": mois, "compagnie": code_compagnie, "excluded": RETURN_EXCLUDED}).mappings().all()
     except SQLAlchemyError as exc:
         raise _fail(exc) from exc
     items = [{**_plain(row), "temporaire": row["expiration"] is not None} for row in rows]
