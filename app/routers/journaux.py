@@ -861,14 +861,17 @@ TERM_SQL = """
 WITH p AS (
     SELECT TRIM(p.num_police) AS num_police, TRIM(p.code_client) AS code_client, TRIM(p.echeance) AS echeance,
            UPPER(TRIM(p."Unite")) AS unite, p.duree, UPPER(COALESCE(TRIM(p."TousRisque"), '')) = 'O' AS tous_risque,
-           UPPER(TRIM(p.etat)) AS etat, p.expiration, p.code_compagnie,
+           UPPER(TRIM(p.etat)) AS etat, p.expiration, p.code_compagnie, NULLIF(TRIM(p.code_branche), '') AS code_branche,
            CAST(SUBSTRING(TRIM(p.echeance) FROM '^[0-9]{1,2}[/-]([0-9]{1,2})') AS integer) AS mois_echeance
     FROM dbo."TPolice" p
     WHERE UPPER(TRIM(p.etat)) = 'AN'
       AND (CAST(:compagnie AS integer) IS NULL OR p.code_compagnie = CAST(:compagnie AS integer))
 )
 SELECT p.num_police, p.code_client, TRIM(c.nom_client) AS nom_client, p.echeance, p.unite, p.duree, p.tous_risque, p.etat,
-       p.expiration, TRIM(k.nom_compagnie) AS nom_compagnie
+       p.expiration, TRIM(k.nom_compagnie) AS nom_compagnie, p.code_branche,
+       (SELECT NULLIF(TRIM(b.nom_branche), '') FROM dbo."TBranche" b
+        WHERE TRIM(b.code_branche) = p.code_branche AND b.code_compagnie = p.code_compagnie LIMIT 1) AS nom_branche,
+       CAST(EXTRACT(YEAR FROM c."DateNaissance") AS integer) AS annee_naissance
 FROM p
 LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = p.code_client
 JOIN dbo."TCompagnie" k ON k.code_compagnie = p.code_compagnie
