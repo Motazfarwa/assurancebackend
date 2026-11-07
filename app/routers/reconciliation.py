@@ -1,4 +1,4 @@
-"""Réconciliation de police, as in the legacy software (administrator only):
+"""Réconciliation de police, as in the legacy software (every signed-in user):
 
 - a police (TPolice) goes to another client, with the quittances not yet comptabilisées that are chosen (TQuittance);
   the client's settlements (TRegCli, RDetRegCli) stay as they were paid;
@@ -15,11 +15,11 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.auth import require_admin
+from app.auth import require_current_user
 from app.database import get_db
 
 
-router = APIRouter(prefix="/api/reconciliation", tags=["Réconciliation de police"], dependencies=[Depends(require_admin)])
+router = APIRouter(prefix="/api/reconciliation", tags=["Réconciliation de police"], dependencies=[Depends(require_current_user)])
 
 # The tables (and their column) holding each number, besides TPolice / TQuittance themselves. Archive copies (TT…,
 # TRDetRegCli, TRPiece) and the print buffers (TTemp…) are left as they are.
@@ -143,7 +143,7 @@ class ClientChange(BaseModel):
 
 
 @router.put("/police/client")
-def change_police_client(payload: ClientChange, user: dict[str, Any] = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+def change_police_client(payload: ClientChange, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     """The police goes to the new client, with the chosen quittances not yet comptabilisées."""
     num_int, code = payload.num_int.strip(), payload.code_client.strip()
     numbers = sorted({number.strip() for number in payload.quittances if number.strip()})
@@ -247,7 +247,7 @@ RENAMES = {"police": _rename_police, "quittance": _rename_quittance, "attestatio
 
 
 @router.put("/numero/{kind}")
-def rename_number(kind: str, payload: NumberChange, user: dict[str, Any] = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+def rename_number(kind: str, payload: NumberChange, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     rename = RENAMES.get(kind)
     if not rename:
         raise HTTPException(status_code=404, detail="Rectification inconnue.")
