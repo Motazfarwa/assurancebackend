@@ -1,7 +1,8 @@
 """Réconciliation de police, as in the legacy software (every signed-in user):
 
-- a police (TPolice) goes to another client, with the quittances not yet comptabilisées that are chosen (TQuittance);
-  the client's settlements (TRegCli, RDetRegCli) stay as they were paid;
+- a police (TPolice) goes to another client with all its quittances (TQuittance), comptabilisées or not, and its
+  sinistres; so do the settlements and pièces (TRegCli, RDetRegCli, TPiece, RPiece) that pay only this police. One that
+  also pays another police of the old client, or whose piece number the new client already has, stays where it is;
 - a wrong N° police, N° quittance or N° attestation is replaced by the right one, here and in every table that
   refers to it (settlements, pièces, dépenses, attestations, avenants, sinistres, bordereaux, tarifs…).
 
@@ -76,7 +77,7 @@ def _cascade(db: Session, refs: list[tuple[str, str]], old: str, new: str, exist
 
 
 # ---------------------------------------------------------------------------------------------
-# The police, its client and its quittances not yet comptabilisées
+# The police, its client and its quittances
 # ---------------------------------------------------------------------------------------------
 
 @router.get("/police")
@@ -99,9 +100,9 @@ def find_police(numero: str = Query(..., min_length=1, max_length=30), db: Sessi
                 text(
                     'SELECT TRIM(q.num_quittance) AS num_quittance, TRIM(q.code_client) AS code_client, TRIM(c.nom_client) AS nom_client, '
                     'q.date_saisie, q.echeance, TRIM(q.tc) AS tc, COALESCE(q.prime_net, 0) AS prime_net, COALESCE(q.prime_total, 0) AS prime_total, '
-                    'COALESCE(q.solde_quittance, 0) AS solde_quittance, TRIM(q.type_quittance) AS type_quittance '
+                    'COALESCE(q.solde_quittance, 0) AS solde_quittance, TRIM(q.type_quittance) AS type_quittance, COALESCE(q."Comptabiliser", \'N\') = \'O\' AS comptabilise '
                     'FROM dbo."TQuittance" q LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(q.code_client) '
-                    'WHERE TRIM(q.num_int) = :i AND COALESCE(q."Comptabiliser", \'N\') <> \'O\' ORDER BY q.echeance, TRIM(q.num_quittance)'
+                    'WHERE TRIM(q.num_int) = :i ORDER BY q.echeance, TRIM(q.num_quittance)'
                 ),
                 {"i": police["num_int"]},
             ).mappings().all()
@@ -139,14 +140,61 @@ def find_client(code_client: str, db: Session = Depends(get_db)) -> dict[str, An
 class ClientChange(BaseModel):
     num_int: str = Field(min_length=1, max_length=30)
     code_client: str = Field(min_length=1, max_length=8)
-    quittances: list[str] = Field(default_factory=list, max_length=2000)
+
+
+def _move_payments(db: Session, num_int: str, old: str, new: str, user: str) -> tuple[int, int]:
+    """Moves the old client's settlements and pièces that pay only this police: (moved, left with the old client)."""
+    numbers = [row[0] for row in db.execute(
+        text('SELECT TRIM(num_quittance) FROM dbo."TQuittance" WHERE TRIM(num_int) = :n AND num_quittance IS NOT NULL'), {"n": num_int}
+    ).all()]
+    keys = {"old": old, "new": new, "u": user, "q": numbers}
+    # A piece number is kept together: never split between two clients, never doubled at the new client.
+    blocked = {row[0] for row in db.execute(
+        text(
+            """
+            SELECT TRIM(r."NumP") FROM dbo."RPiece" r
+            WHERE TRIM(r."Code_Client") = :old AND TRIM(r."Num_Quittance") <> ALL(CAST(:q AS text[]))
+            UNION
+            SELECT TRIM(t.num_piece) FROM dbo."TRegCli" t JOIN dbo."RDetRegCli" d ON d."Num_reg_cli" = t.num_reg_cli
+            WHERE TRIM(t.code_client) = :old AND TRIM(d."Num_quitance") <> ALL(CAST(:q AS text[]))
+            UNION
+            SELECT TRIM(num_piece) FROM dbo."TRegCli" WHERE TRIM(code_client) = :new
+            UNION
+            SELECT TRIM(nump) FROM dbo."TPiece" WHERE TRIM(code_client) = :new
+            """
+        ),
+        keys,
+    ).all()}
+    linked = db.execute(
+        text(
+            """
+            SELECT t.num_reg_cli, TRIM(t.num_piece) AS piece,
+                   NOT EXISTS (SELECT 1 FROM dbo."RDetRegCli" d WHERE d."Num_reg_cli" = t.num_reg_cli
+                               AND TRIM(d."Num_quitance") <> ALL(CAST(:q AS text[]))) AS own
+            FROM dbo."TRegCli" t
+            WHERE TRIM(t.code_client) = :old AND EXISTS (SELECT 1 FROM dbo."RDetRegCli" d WHERE d."Num_reg_cli" = t.num_reg_cli
+                                                         AND TRIM(d."Num_quitance") = ANY(CAST(:q AS text[])))
+            """
+        ),
+        keys,
+    ).mappings().all()
+    moved = [row for row in linked if row["own"] and (not row["piece"] or row["piece"] not in blocked)]
+    reserved = db.execute(
+        text('SELECT TRIM("NumP") FROM dbo."RPiece" WHERE TRIM("Code_Client") = :old AND TRIM("Num_Quittance") = ANY(CAST(:q AS text[]))'), keys
+    ).all()
+    pieces = ({row["piece"] for row in moved} | {row[0] for row in reserved}) - blocked - {None, ""}
+    ids = {**keys, "ids": [row["num_reg_cli"] for row in moved], "pieces": sorted(pieces)}
+    db.execute(text('UPDATE dbo."TRegCli" SET code_client = :new, "Update_User" = :u, "Update_Date" = now() WHERE num_reg_cli = ANY(CAST(:ids AS bigint[]))'), ids)
+    db.execute(text('UPDATE dbo."RDetRegCli" SET "Ncpt" = :new WHERE "Num_reg_cli" = ANY(CAST(:ids AS bigint[])) AND TRIM("Ncpt") = :old'), ids)
+    db.execute(text('UPDATE dbo."TPiece" SET code_client = :new, "Update_User" = :u, "Update_Date" = now() WHERE TRIM(code_client) = :old AND TRIM(nump) = ANY(CAST(:pieces AS text[]))'), ids)
+    db.execute(text('UPDATE dbo."RPiece" SET "Code_Client" = :new WHERE TRIM("Code_Client") = :old AND TRIM("NumP") = ANY(CAST(:pieces AS text[]))'), ids)
+    return len(moved), len(linked) - len(moved)
 
 
 @router.put("/police/client")
 def change_police_client(payload: ClientChange, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
-    """The police goes to the new client, with the chosen quittances not yet comptabilisées."""
+    """The police goes to the new client with its quittances, its sinistres and the settlements paying only this police."""
     num_int, code = payload.num_int.strip(), payload.code_client.strip()
-    numbers = sorted({number.strip() for number in payload.quittances if number.strip()})
     try:
         police = db.execute(
             text('SELECT TRIM(num_police) AS num_police, TRIM(code_client) AS code_client FROM dbo."TPolice" WHERE TRIM(num_int) = :n'),
@@ -159,25 +207,21 @@ def change_police_client(payload: ClientChange, user: dict[str, Any] = Depends(r
             raise HTTPException(status_code=409, detail=f"La police appartient déjà au client {code}.")
         if not db.execute(text('SELECT 1 FROM dbo."TClient" WHERE TRIM(code_client) = :c'), {"c": code}).first():
             raise HTTPException(status_code=404, detail=f"Aucun client de code {code}.")
-        params = {"n": num_int, "c": code, "u": _user(user), "q": numbers}
+        params = {"n": num_int, "c": code, "u": _user(user)}
         db.execute(text('UPDATE dbo."TPolice" SET code_client = :c, "Update_User" = :u, "Update_Date" = now() WHERE TRIM(num_int) = :n'), params)
         flotte = db.execute(text('UPDATE dbo."TPoliceFlotte" SET code_client = :c WHERE TRIM(num_int) = :n'), params).rowcount
         moved = db.execute(
-            text(
-                'UPDATE dbo."TQuittance" SET code_client = :c, "Update_User" = :u, "Update_Date" = now() '
-                'WHERE TRIM(num_int) = :n AND TRIM(num_quittance) = ANY(:q) AND COALESCE("Comptabiliser", \'N\') <> \'O\''
-            ),
+            text('UPDATE dbo."TQuittance" SET code_client = :c, "Update_User" = :u, "Update_Date" = now() WHERE TRIM(num_int) = :n'),
             params,
-        ).rowcount if numbers else 0
-        if moved != len(numbers):
-            db.rollback()
-            raise HTTPException(status_code=409, detail="Une quittance choisie a été comptabilisée ou modifiée entre-temps : rechargez la police.")
+        ).rowcount
+        sinistres = db.execute(text('UPDATE dbo."Sinistre" SET "Code_Client" = :c WHERE TRIM("Num_Int") = :n'), params).rowcount
+        reglements, reglements_restes = _move_payments(db, num_int, police[0]["code_client"], code, _user(user))
         db.commit()
     except SQLAlchemyError as exc:
         db.rollback()
         raise _fail(exc) from exc
     return {"numero": police[0]["num_police"] or num_int, "ancien_client": police[0]["code_client"], "code_client": code,
-            "quittances": moved, "vehicules_flotte": flotte}
+            "quittances": moved, "vehicules_flotte": flotte, "sinistres": sinistres, "reglements": reglements, "reglements_restes": reglements_restes}
 
 
 # ---------------------------------------------------------------------------------------------
