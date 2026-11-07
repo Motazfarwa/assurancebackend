@@ -97,7 +97,7 @@ class RevalorisationCreate(BaseModel):
 
 class PoliceWithQuittanceCreate(BaseModel):
     police: PoliceCreate
-    quittance: QuittanceCreate
+    quittance: Optional[QuittanceCreate] = None  # none for a police flotte: each vehicle has its own quittance
     garanties: Optional[GarantiesCreate] = None
     carte_verte: Optional[CarteVerteCreate] = None
     revalorisation: Optional[RevalorisationCreate] = None

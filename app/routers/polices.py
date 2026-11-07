@@ -91,6 +91,8 @@ def create_police_with_quittance(
 ):
     p = payload.police
     q = payload.quittance
+    if q is None and not p.flotte:
+        raise HTTPException(status_code=422, detail="La quittance est obligatoire pour une police qui n'est pas une flotte.")
 
     try:
         with engine.begin() as conn:
@@ -209,9 +211,9 @@ def create_police_with_quittance(
                     "neuf": p.neuf,
                     "venale": p.venale,
                     "obser": p.obser,
-                    "prime_net": q.prime_net,
-                    "commission": q.commission,
-                    "prime_total": q.prime_total,
+                    "prime_net": q.prime_net if q else None,
+                    "commission": q.commission if q else None,
+                    "prime_total": q.prime_total if q else None,
                 }
             )
 
@@ -235,77 +237,78 @@ def create_police_with_quittance(
                     {"num_int": internal_id, "d": payload.revalorisation.date_revalorisation, "e": payload.revalorisation.date_envoi},
                 )
 
-            conn.execute(
-                text("""
-                    INSERT INTO dbo."TQuittance" (
-                        num_quittance, num_int,
-                        code_client, code_branche,
-                        date_saisie, date_emission,
-                        echeance, "Periode",
-                        prime_net, prime_total,
-                        commission, montant_quittance,
-                        solde_quittance,
-                        "Taxe", timbre,
-                        cout_attestation, transport,
-                        frais_quit, "Num_Attestation",
-                        observation, type_quittance
-                    )
-                    VALUES (
-                        :num_quittance, :num_int,
-                        :code_client, :code_branche,
-                        :date_saisie, :date_emission,
-                        :echeance, :periode,
-                        :prime_net, :prime_total,
-                        :commission, :montant_quittance,
-                        :solde_quittance,
-                        :taxe, :timbre,
-                        :cout_attestation, :transport,
-                        :frais_quit, :num_attestation,
-                        :observation, :type_quittance
-                    )
-                """),
-                {
-                    "num_quittance": receipt_id,
-                    "num_int": internal_id,
-                    "code_client": p.code_client,
-                    "code_branche": p.code_branche,
-                    "date_saisie": q.date_saisie
-                        or datetime.now(),
-                    "date_emission": q.date_emission,
-                    "echeance": q.echeance,
-                    "periode": q.periode,
-                    "prime_net": q.prime_net,
-                    "prime_total": q.prime_total,
-                    "commission": q.commission,
-                    "montant_quittance": q.montant_quittance,
-                    "solde_quittance": q.solde_quittance,
-                    "taxe": q.taxe,
-                    "timbre": q.timbre,
-                    "cout_attestation": q.cout_attestation,
-                    "transport": q.transport,
-                    "frais_quit": q.frais_quit,
-                    "num_attestation": q.num_attestation,
-                    "observation": q.observation,
-                    "type_quittance": q.type_quittance,
-                }
-            )
-
-            # Green card validity ("Carte verte"): from / to dates, kept with the receipt.
-            if payload.carte_verte and (payload.carte_verte.du or payload.carte_verte.au):
-                conn.execute(text(CARTE_VERTE_DDL))
+            if q is not None:
                 conn.execute(
-                    text(
-                        'INSERT INTO dbo."TQuittanceCarteVerte" (num_quittance, date_debut, date_fin) '
-                        "VALUES (:num_quittance, :du, :au)"
-                    ),
-                    {"num_quittance": receipt_id, "du": payload.carte_verte.du, "au": payload.carte_verte.au},
+                    text("""
+                        INSERT INTO dbo."TQuittance" (
+                            num_quittance, num_int,
+                            code_client, code_branche,
+                            date_saisie, date_emission,
+                            echeance, "Periode",
+                            prime_net, prime_total,
+                            commission, montant_quittance,
+                            solde_quittance,
+                            "Taxe", timbre,
+                            cout_attestation, transport,
+                            frais_quit, "Num_Attestation",
+                            observation, type_quittance
+                        )
+                        VALUES (
+                            :num_quittance, :num_int,
+                            :code_client, :code_branche,
+                            :date_saisie, :date_emission,
+                            :echeance, :periode,
+                            :prime_net, :prime_total,
+                            :commission, :montant_quittance,
+                            :solde_quittance,
+                            :taxe, :timbre,
+                            :cout_attestation, :transport,
+                            :frais_quit, :num_attestation,
+                            :observation, :type_quittance
+                        )
+                    """),
+                    {
+                        "num_quittance": receipt_id,
+                        "num_int": internal_id,
+                        "code_client": p.code_client,
+                        "code_branche": p.code_branche,
+                        "date_saisie": q.date_saisie
+                            or datetime.now(),
+                        "date_emission": q.date_emission,
+                        "echeance": q.echeance,
+                        "periode": q.periode,
+                        "prime_net": q.prime_net,
+                        "prime_total": q.prime_total,
+                        "commission": q.commission,
+                        "montant_quittance": q.montant_quittance,
+                        "solde_quittance": q.solde_quittance,
+                        "taxe": q.taxe,
+                        "timbre": q.timbre,
+                        "cout_attestation": q.cout_attestation,
+                        "transport": q.transport,
+                        "frais_quit": q.frais_quit,
+                        "num_attestation": q.num_attestation,
+                        "observation": q.observation,
+                        "type_quittance": q.type_quittance,
+                    }
                 )
+
+                # Green card validity ("Carte verte"): from / to dates, kept with the receipt.
+                if payload.carte_verte and (payload.carte_verte.du or payload.carte_verte.au):
+                    conn.execute(text(CARTE_VERTE_DDL))
+                    conn.execute(
+                        text(
+                            'INSERT INTO dbo."TQuittanceCarteVerte" (num_quittance, date_debut, date_fin) '
+                            "VALUES (:num_quittance, :du, :au)"
+                        ),
+                        {"num_quittance": receipt_id, "du": payload.carte_verte.du, "au": payload.carte_verte.au},
+                    )
 
         return {
             "message": "Police et quittance créées",
             "num_int": internal_id,
             "num_police": policy_number,
-            "num_quittance": receipt_id,
+            "num_quittance": receipt_id if q is not None else None,
         }
 
     except IntegrityError as exc:

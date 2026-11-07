@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 
 from app.auth import require_current_user
 from app.database import get_db
+from app.police_schemas import CarteVerteCreate, QuittanceCreate
 
 
 router = APIRouter(prefix="/api/flotte", tags=["Polices flotte"], dependencies=[Depends(require_current_user)])
@@ -265,6 +266,24 @@ def _avenant(
 # ---------------------------------------------------------------------------------------------
 # Contract and vehicles
 # ---------------------------------------------------------------------------------------------
+@router.get("/immatriculation/verifier")
+def check_plate(plate: str, exclude: str = "", db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Where a registration is in force, before its police flotte exists: refused in a fleet, to confirm on a policy."""
+    key = _plate(plate)
+    in_fleet = db.execute(
+        text(f'SELECT TRIM(f.num_int) FROM dbo."TPoliceFlotte" f WHERE {ACTIVE_SQL} AND {PLATE_SQL.format(col="f.num_imat")} = :plate AND TRIM(f.num_int) <> :x LIMIT 1'),
+        {"plate": key, "x": exclude.strip()},
+    ).scalar()
+    on_policy = db.execute(
+        text(
+            'SELECT TRIM(p.num_int) FROM dbo."TPolice" p WHERE UPPER(TRIM(p.etat)) = \'AN\' AND (p.expiration IS NULL OR p.expiration >= CURRENT_DATE) '
+            f"AND {PLATE_SQL.format(col='p.num_imat')} = :plate AND TRIM(p.num_int) <> :x LIMIT 1"
+        ),
+        {"plate": key, "x": exclude.strip()},
+    ).scalar()
+    return {"flotte": in_fleet, "police": on_policy}
+
+
 @router.get("/{num_int}")
 def fleet(num_int: str, db: Session = Depends(get_db)) -> dict[str, Any]:
     """The fleet contract, all its vehicles (in the fleet or gone) with their claims count, its avenants, and the
@@ -320,6 +339,9 @@ class VehiculeIn(BaseModel):
     # one entered with the contract is part of its first quittance). On a change: True bills the premium difference.
     avenant: bool | None = None
     date_avenant: date | None = None  # date of a modification avenant (default today)
+    # Entered with its police flotte: the vehicle's own quittance, in the name of its client (then no avenant).
+    quittance: QuittanceCreate | None = None
+    carte_verte: CarteVerteCreate | None = None
 
 
 VEHICLE_COLUMNS = {
@@ -334,7 +356,7 @@ VEHICLE_COLUMNS = {
 def _check_vehicle(db: Session, contract: dict[str, Any], payload: VehiculeIn, ordre: str | None, *, ignore: str | None = None) -> dict[str, Any]:
     """Payload -> column values, after the checks: client known, entry inside the contract, registration not in force
     elsewhere (`ignore`: the ordre of a vehicle being replaced, still in the fleet until the replacement)."""
-    values = payload.model_dump(exclude={"forcer", "avenant", "date_avenant"})
+    values = payload.model_dump(exclude={"forcer", "avenant", "date_avenant", "quittance", "carte_verte"})
     values["num_imat"] = " ".join(payload.num_imat.upper().split())
     values["code_client"] = (payload.code_client or "").strip() or contract["code_client"]
     if not db.execute(text('SELECT 1 FROM dbo."TClient" WHERE TRIM(code_client) = :c'), {"c": values["code_client"]}).first():
@@ -396,10 +418,54 @@ def _insert_vehicle(db: Session, contract: dict[str, Any], values: dict[str, Any
     return {**values, "ordre": ordre}
 
 
+def _vehicle_receipt(db: Session, contract: dict[str, Any], vehicle: dict[str, Any], payload: VehiculeIn, user: str) -> str:
+    """The vehicle's own quittance, paid by its client; the contract's premiums are the sum of those of its vehicles."""
+    from app.routers.polices import CARTE_VERTE_DDL  # here: polices imports records_search, which imports this module
+
+    q = payload.quittance
+    number = _next_number(db)
+    db.execute(
+        text("""
+            INSERT INTO dbo."TQuittance" (
+                num_quittance, num_int, code_client, code_branche, date_saisie, date_emission, "Periode",
+                prime_net, prime_total, commission, montant_quittance, solde_quittance, "Taxe", timbre, cout_attestation,
+                "Num_Attestation", observation, type_quittance, "Comptabiliser", "Create_User", "Create_Date"
+            ) VALUES (
+                :n, :num_int, :code_client, :code_branche, :date_saisie, :date_emission, :periode,
+                :prime_net, :prime_total, :commission, :montant, :solde, :taxe, :timbre, :cout,
+                :attestation, :observation, 'P', 'N', :user, now()
+            )
+        """),
+        {
+            "n": number, "num_int": contract["num_int"], "code_client": vehicle["code_client"], "code_branche": contract["code_branche"],
+            "date_saisie": q.date_saisie or datetime.now(), "date_emission": q.date_emission, "periode": q.periode,
+            "prime_net": q.prime_net, "prime_total": q.prime_total, "commission": q.commission, "montant": q.montant_quittance, "solde": q.solde_quittance,
+            "taxe": q.taxe, "timbre": q.timbre, "cout": q.cout_attestation, "attestation": q.num_attestation,
+            "observation": q.observation or f"Flotte {vehicle['num_imat']}"[:50], "user": user,
+        },
+    )
+    if payload.carte_verte and (payload.carte_verte.du or payload.carte_verte.au):
+        db.execute(text(CARTE_VERTE_DDL))
+        db.execute(
+            text('INSERT INTO dbo."TQuittanceCarteVerte" (num_quittance, date_debut, date_fin) VALUES (:n, :du, :au)'),
+            {"n": number, "du": payload.carte_verte.du, "au": payload.carte_verte.au},
+        )
+    db.execute(
+        text(
+            'UPDATE dbo."TPolice" SET prime_net = COALESCE(prime_net, 0) + :net, prime_total = COALESCE(prime_total, 0) + :total, '
+            'commission = COALESCE(commission, 0) + :commission WHERE TRIM(num_int) = :i'
+        ),
+        {"net": q.prime_net or 0, "total": q.prime_total or 0, "commission": q.commission or 0, "i": contract["num_int"]},
+    )
+    return number
+
+
 def _add(db: Session, contract: dict[str, Any], payload: VehiculeIn, user: str) -> dict[str, Any]:
     """One vehicle added, with its incorporation avenant when it enters after the contract's start (or when asked)."""
     values = _check_vehicle(db, contract, payload, None)
     vehicle = _insert_vehicle(db, contract, values, user)
+    if payload.quittance:
+        return {**vehicle, "num_quittance": _vehicle_receipt(db, contract, vehicle, payload, user)}
     later = bool(_day(contract["effet"]) and values["effet"] > _day(contract["effet"]))
     if payload.avenant if payload.avenant is not None else later:
         return {**vehicle, "avenant": _avenant(db, contract, "incorporation", values["effet"], user, vehicle=vehicle, delta=_premiums(values))}
