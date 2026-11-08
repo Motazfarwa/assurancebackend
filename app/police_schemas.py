@@ -11,7 +11,7 @@ class PoliceCreate(BaseModel):
 
     code_compagnie: Optional[int] = None
     code_client: str = Field(min_length=1, max_length=8)
-    code_branche: str = Field(pattern=r"^[0-9]{3}$")
+    code_branche: str = Field(pattern=r"^[0-9A-Z]{1,4}$")  # as many characters as the company's Nbr_Chiffre_Code
 
     effet: Optional[datetime] = None
     heure_effet: Optional[datetime] = None

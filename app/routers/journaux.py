@@ -857,20 +857,31 @@ def set_quittance_return(payload: ReturnIn, user: dict[str, Any] = Depends(requi
 # The policies en cours (etat AN) whose terme falls in the month, as the legacy "Etat de terme du mois": the month of
 # their échéance ("dd/mm"), or for a policy paid by months (Unite M, durée 3 or 6) every durée months from it (01/09
 # by 3 months: September, December, March, June). A policy with an expiration date is temporary.
+# Its branche: TPolice.code_branche often holds the start of the police number ("001", "252") rather than a TBranche
+# code, or nothing. So, within the company: the exact code, else its first two characters, else the branche name
+# that the risque starts with (the longest, "CHAMEL M1+M5" is CHAMEL). None of them: no branche.
 TERM_SQL = """
 WITH p AS (
     SELECT TRIM(p.num_police) AS num_police, TRIM(p.code_client) AS code_client, TRIM(p.echeance) AS echeance,
            UPPER(TRIM(p."Unite")) AS unite, p.duree, UPPER(COALESCE(TRIM(p."TousRisque"), '')) = 'O' AS tous_risque,
            UPPER(TRIM(p.etat)) AS etat, p.expiration, p.code_compagnie, NULLIF(TRIM(p.code_branche), '') AS code_branche,
+           UPPER(TRIM(p.risque)) AS risque,
            CAST(SUBSTRING(TRIM(p.echeance) FROM '^[0-9]{1,2}[/-]([0-9]{1,2})') AS integer) AS mois_echeance
     FROM dbo."TPolice" p
     WHERE UPPER(TRIM(p.etat)) = 'AN'
       AND (CAST(:compagnie AS integer) IS NULL OR p.code_compagnie = CAST(:compagnie AS integer))
 )
 SELECT p.num_police, p.code_client, TRIM(c.nom_client) AS nom_client, p.echeance, p.unite, p.duree, p.tous_risque, p.etat,
-       p.expiration, TRIM(k.nom_compagnie) AS nom_compagnie, p.code_branche,
-       (SELECT NULLIF(TRIM(b.nom_branche), '') FROM dbo."TBranche" b
-        WHERE TRIM(b.code_branche) = p.code_branche AND b.code_compagnie = p.code_compagnie LIMIT 1) AS nom_branche,
+       p.expiration, TRIM(k.nom_compagnie) AS nom_compagnie,
+       COALESCE(
+           (SELECT NULLIF(TRIM(b.nom_branche), '') FROM dbo."TBranche" b
+            WHERE b.code_compagnie = p.code_compagnie AND TRIM(b.code_branche) = p.code_branche LIMIT 1),
+           (SELECT NULLIF(TRIM(b.nom_branche), '') FROM dbo."TBranche" b
+            WHERE b.code_compagnie = p.code_compagnie AND TRIM(b.code_branche) = LEFT(p.code_branche, 2) LIMIT 1),
+           (SELECT NULLIF(TRIM(b.nom_branche), '') FROM dbo."TBranche" b
+            WHERE b.code_compagnie = p.code_compagnie AND LEFT(p.risque, LENGTH(TRIM(b.nom_branche))) = UPPER(TRIM(b.nom_branche))
+            ORDER BY LENGTH(TRIM(b.nom_branche)) DESC LIMIT 1)
+       ) AS nom_branche,
        CAST(EXTRACT(YEAR FROM c."DateNaissance") AS integer) AS annee_naissance
 FROM p
 LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = p.code_client

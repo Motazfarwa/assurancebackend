@@ -71,18 +71,45 @@ def flag(value):
     return "O" if value else "N"
 
 
-def validate_policy_number(number, branch):
-    if not re.fullmatch(r"\d{4}\d{3}\d{5}", number):
-        raise HTTPException(
-            status_code=422,
-            detail="Format attendu : AAAA + branche(3) + 5 chiffres"
-        )
+# The code branche of a company has its Nbr_Chiffre_Code characters (GAT 3, BIAT 4, MAGHREBIA 2).
+def branch_length(conn, company) -> int | None:
+    if company is None:
+        return None
+    return conn.execute(
+        text('SELECT "Nbr_Chiffre_Code" FROM dbo."TCompagnie" WHERE code_compagnie = :c'), {"c": company}
+    ).scalar()
 
-    if number[4:7] != branch:
+
+# TPolice, TQuittance, TPoliceFlotte and Sinistre keep the code branche in 3 characters, TBranche in 4 (BIAT):
+# widened to 4 the first time a 4-character code is stored. Growing a varchar loses nothing and rewrites no data.
+BRANCHE_WIDTH_DDL = """
+DO $$
+DECLARE t text;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['TPolice', 'TQuittance', 'TPoliceFlotte', 'Sinistre'] LOOP
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'dbo' AND table_name = t
+                   AND column_name = 'code_branche' AND character_maximum_length < 4) THEN
+            EXECUTE format('ALTER TABLE dbo.%I ALTER COLUMN code_branche TYPE varchar(4)', t);
+        END IF;
+    END LOOP;
+END $$;
+"""
+
+
+# N° police: the year (4 digits), the code branche, then as many digits as wanted; 15 characters at most (the column).
+def validate_policy_number(number, branch, length=None):
+    if length and len(branch) != length:
         raise HTTPException(
             status_code=422,
-            detail="La branche du numéro ne correspond pas au code branche"
+            detail=f"Le code branche de cette compagnie contient {length} caractères."
         )
+    if not re.fullmatch(r"\d{4}" + re.escape(branch) + r"\d+", number):
+        raise HTTPException(
+            status_code=422,
+            detail="Format attendu : année (4 chiffres) + code branche + chiffres"
+        )
+    if len(number) > 15:
+        raise HTTPException(status_code=422, detail="Le numéro de police contient 15 caractères au maximum.")
 
 
 @router.post("", status_code=201)
@@ -106,7 +133,7 @@ def create_police_with_quittance(
                 prefix = f"{datetime.now().year}{p.code_branche}"
                 last_policy = conn.execute(
                     text(
-                        'SELECT COALESCE(MAX(CAST(SUBSTRING(TRIM(num_police) FROM 8 FOR 5) AS integer)), 0) '
+                        'SELECT COALESCE(MAX(CAST(RIGHT(TRIM(num_police), 5) AS integer)), 0) '
                         'FROM dbo."TPolice" WHERE TRIM(num_police) ~ :pattern'
                     ),
                     {"pattern": f"^{prefix}[0-9]{{5}}$"},
@@ -121,8 +148,10 @@ def create_police_with_quittance(
                 policy_number = f"{prefix}{last_policy + 1:05d}"
 
             validate_policy_number(
-                policy_number, p.code_branche
+                policy_number, p.code_branche, branch_length(conn, p.code_compagnie)
             )
+            if len(p.code_branche) > 3:
+                conn.execute(text(BRANCHE_WIDTH_DDL))
 
             already_used = conn.execute(
                 text('SELECT 1 FROM dbo."TPolice" WHERE TRIM(num_police) = :n OR TRIM(num_int) = :n LIMIT 1'),
@@ -330,7 +359,8 @@ def list_compagnies():
             text("""
                 SELECT
                     code_compagnie,
-                    nom_compagnie
+                    nom_compagnie,
+                    "Nbr_Chiffre_Code" AS nbr_chiffre_code
                 FROM dbo."TCompagnie"
                 ORDER BY nom_compagnie
             """)
@@ -343,24 +373,26 @@ def get_branche(
     code_compagnie: int = Query(...),
     code_branche: str = Query(...)
 ):
-    code_branche = code_branche.strip()
-
-    if not code_branche.isdigit() or len(code_branche) != 3:
-        raise HTTPException(
-            status_code=422,
-            detail="Le code branche doit contenir 3 chiffres"
-        )
+    code_branche = code_branche.strip().upper()
 
     with engine.connect() as conn:
+        length = branch_length(conn, code_compagnie)
+        if not code_branche.isalnum() or (length and len(code_branche) != length):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Le code branche de cette compagnie contient {length or 3} caractères"
+            )
+        # taux_comm: the commission rate (0.1 = 10 %), commission = prime nette × taux.
         result = conn.execute(
             text("""
                 SELECT
-                    code_branche,
+                    TRIM(code_branche) AS code_branche,
                     code_compagnie,
-                    nom_branche
+                    TRIM(nom_branche) AS nom_branche,
+                    taux_comm
                 FROM dbo."TBranche"
                 WHERE code_compagnie = :compagnie
-                  AND code_branche = :branche
+                  AND TRIM(code_branche) = :branche
                 LIMIT 1
             """),
             {
