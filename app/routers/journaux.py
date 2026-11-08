@@ -906,3 +906,89 @@ def term_statement(
         raise _fail(exc) from exc
     items = [{**_plain(row), "temporaire": row["expiration"] is not None} for row in rows]
     return {"items": items}
+
+
+# ---------------------------------------------------------------------------------------------
+# Etat détaillé des comptes (bank accounts of the agency)
+# ---------------------------------------------------------------------------------------------
+# The movements of an agency account (TBanque) between two dates, as the legacy "Etat détaillé des comptes":
+#   crédit: the client settlements paid into it (TRegCli.code_banque; neither ristourne 'R' nor fictive ones), and the
+#           entrées diverses (TDepense 'E');
+#   débit:  every other payment made from it (TDepense: technique 'T' — claims, rebates, experts —, frais généraux 'D',
+#           sorties diverses 'S', …).
+# Solde: the account's opening balance (credit_ini − debit_ini at date_ini) plus the credits less the debits since then.
+BANK_MOVES_SQL = """
+SELECT 'C' AS sens, r.date_reg_cli::date AS date_mvt, 'R' || r.num_reg_cli AS id, TRIM(r.num_piece) AS reference,
+       TRIM(r.type_reg_cli) AS mode, r.mont_reg_cli AS montant, TRIM(r.code_client) AS code_client, TRIM(c.nom_client) AS nom_client,
+       'Règlement client' AS libelle
+FROM dbo."TRegCli" r
+LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(r.code_client)
+WHERE TRIM(r.code_banque) = :banque AND r.date_reg_cli >= :debut AND r.date_reg_cli < :fin
+  AND COALESCE(TRIM(r.type_reg_cli), '') <> 'R' AND COALESCE(TRIM(r."Fectif"), 'N') <> 'O' AND COALESCE(r.mont_reg_cli, 0) <> 0
+UNION ALL
+SELECT CASE WHEN TRIM(d."Typ_dep") = 'E' THEN 'C' ELSE 'D' END, d.date_dep::date, 'D' || TRIM(d."Typ_dep") || d.num_dep,
+       TRIM(d.num_cheq), TRIM(d.mod_dep), d.mont_dep, TRIM(d.code_client), TRIM(c.nom_client),
+       COALESCE(NULLIF(TRIM(d.objet_dep), ''),
+                CASE TRIM(d."Typ_dep") WHEN 'T' THEN 'Dépense technique' WHEN 'D' THEN 'Frais généraux'
+                     WHEN 'S' THEN 'Sortie diverse' WHEN 'E' THEN 'Entrée diverse' ELSE 'Dépense' END)
+FROM dbo."TDepense" d
+LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(d.code_client)
+WHERE TRIM(d.code_banque) = :banque AND d.date_dep >= :debut AND d.date_dep < :fin AND COALESCE(d.mont_dep, 0) <> 0
+ORDER BY date_mvt, sens DESC, id
+"""
+
+BANK_TOTALS_SQL = """
+SELECT COALESCE(SUM(montant) FILTER (WHERE sens = 'C'), 0) AS credit, COALESCE(SUM(montant) FILTER (WHERE sens = 'D'), 0) AS debit
+FROM (""" + BANK_MOVES_SQL.split("ORDER BY")[0] + """) m
+"""
+
+
+@router.get("/comptes-banque/banques")
+def bank_accounts(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    """The agency accounts, those in use first."""
+    try:
+        rows = db.execute(text(
+            'SELECT TRIM(code_banque) AS code_banque, TRIM(nom_banque) AS nom_banque, TRIM(num_compte_b) AS num_compte, '
+            'COALESCE("Archive", FALSE) AS archive FROM dbo."TBanque" ORDER BY COALESCE("Archive", FALSE), code_banque'
+        )).mappings().all()
+    except SQLAlchemyError as exc:
+        raise _fail(exc) from exc
+    return [_plain(row) for row in rows]
+
+
+@router.get("/comptes-banque")
+def bank_statement(
+    code_banque: str = Query(..., min_length=1, max_length=15),
+    debut: date = Query(...),
+    fin: date = Query(...),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Etat détaillé des comptes: the opening balance at debut, the movements of debut..fin, and the closing balance."""
+    if fin < debut:
+        raise HTTPException(status_code=422, detail="La date de fin précède la date de début.")
+    banque = code_banque.strip()
+    try:
+        account = db.execute(text(
+            'SELECT TRIM(code_banque) AS code_banque, TRIM(nom_banque) AS nom_banque, TRIM(num_compte_b) AS num_compte, '
+            'COALESCE(credit_ini, 0) - COALESCE(debit_ini, 0) AS solde_initial, date_ini FROM dbo."TBanque" WHERE TRIM(code_banque) = :b'
+        ), {"b": banque}).mappings().first()
+        if account is None:
+            raise HTTPException(status_code=404, detail=f"Compte {banque} introuvable.")
+        start = account["date_ini"].date() if account["date_ini"] else date(1900, 1, 1)
+        before = db.execute(text(BANK_TOTALS_SQL), {"banque": banque, "debut": start, "fin": debut}).mappings().one() if debut > start else {"credit": 0, "debit": 0}
+        rows = db.execute(text(BANK_MOVES_SQL), {"banque": banque, "debut": max(debut, start), "fin": fin + timedelta(days=1)}).mappings().all()
+    except SQLAlchemyError as exc:
+        raise _fail(exc) from exc
+    solde = round(float(account["solde_initial"] or 0) + float(before["credit"] or 0) - float(before["debit"] or 0), 3)
+    depart = solde
+    items = []
+    for row in rows:
+        amount = float(row["montant"] or 0)
+        solde = round(solde + (amount if row["sens"] == "C" else -amount), 3)
+        items.append({**_plain(row), "montant": round(amount, 3), "solde": solde})
+    credit = round(sum(item["montant"] for item in items if item["sens"] == "C"), 3)
+    debit = round(sum(item["montant"] for item in items if item["sens"] == "D"), 3)
+    return {
+        "banque": {key: account[key] for key in ("code_banque", "nom_banque", "num_compte")},
+        "solde_depart": depart, "total_credit": credit, "total_debit": debit, "solde_final": solde, "items": items,
+    }
