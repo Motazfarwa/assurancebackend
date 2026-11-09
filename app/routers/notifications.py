@@ -80,12 +80,34 @@ def my_notifications(
 #    term (échéance if renewable, expiration if not);
 #  - quittances of a police in force without date d'émission, échéance, prime nette, prime totale, montant or solde;
 #  - sinistres not closed without date, police, company or the company's claim number.
-_PHONE = "(CONCAT({cols}) ~ '[0-9]{{4}}' OR COALESCE(to_jsonb(k)->>'{json}', '') ~ '\"value\": \"[^\"]*[0-9]{{4}}')"
-_EMAIL = "(CONCAT({cols}) ~ '@' OR COALESCE(to_jsonb(k)->>'{json}', '') ~ '\"value\": \"[^\"]*@')"
-PHONE_HOME = _PHONE.format(cols="k.tel, k.tel1, k.tel2, k.tel3", json="telephones_domicile")
-PHONE_OFFICE = _PHONE.format(cols="k.tel_b, k.tel_b2, k.tel_b3, k.tel_b4", json="telephones_bureau")
-EMAIL_HOME = _EMAIL.format(cols="k.email1, k.email2, k.email3", json="emails_domicile")
-EMAIL_OFFICE = _EMAIL.format(cols="k.adresse_email, k.emailb2, k.emailb3", json="emails_bureau")
+# What counts as filled comes from Render's data: phones are often typed with spaces ("50 932 532"), and the old software
+# left "." or "neant" where there was nothing. A phone is one field with at least 6 digits, not all the same ("000000").
+_ITEMS = "jsonb_array_elements(CASE WHEN jsonb_typeof(to_jsonb(k)->'{json}') = 'array' THEN to_jsonb(k)->'{json}' ELSE '[]'::jsonb END)"
+_IS_PHONE = r"(LENGTH(REGEXP_REPLACE(COALESCE({v}, ''), '[^0-9]', '', 'g')) >= 6 AND REGEXP_REPLACE(COALESCE({v}, ''), '[^0-9]', '', 'g') !~ '^(.)\1*$')"
+_IS_EMAIL = "COALESCE({v}, '') ~ '[^@[:space:]]@[^@[:space:]]'"
+
+
+def _any_contact(check: str, cols: str, json: str) -> str:
+    """True when one of the old columns, or one entry of the saved list, passes the check."""
+    columns = f"EXISTS (SELECT 1 FROM UNNEST(ARRAY[{cols}]::text[]) AS c(v) WHERE {check.format(v='c.v')})"
+    saved = f"EXISTS (SELECT 1 FROM {_ITEMS.format(json=json)} AS e(item) WHERE {check.format(v=chr(40) + 'e.item->>' + chr(39) + 'value' + chr(39) + chr(41))})"
+    return f"({columns} OR {saved})"
+
+
+def _empty(col: str) -> str:
+    """Nothing but punctuation or spaces: "." counts as empty (codes such as "00" do not)."""
+    return f"COALESCE({col}, '') !~ '[[:alnum:]]'"
+
+
+def _no_place(col: str) -> str:
+    """An address or a city: also empty when the old software left "0" or "neant"."""
+    return f"({_empty(col)} OR LOWER(TRIM({col})) IN ('0', 'neant', 'néant'))"
+
+
+PHONE_HOME = _any_contact(_IS_PHONE, "k.tel, k.tel1, k.tel2, k.tel3", "telephones_domicile")
+PHONE_OFFICE = _any_contact(_IS_PHONE, "k.tel_b, k.tel_b2, k.tel_b3, k.tel_b4", "telephones_bureau")
+EMAIL_HOME = _any_contact(_IS_EMAIL, "k.email1, k.email2, k.email3", "emails_domicile")
+EMAIL_OFFICE = _any_contact(_IS_EMAIL, "k.adresse_email, k.emailb2, k.emailb3", "emails_bureau")
 
 INCOMPLETE_SQL = f"""
     WITH pol AS (
@@ -94,10 +116,10 @@ INCOMPLETE_SQL = f"""
             SELECT TRIM(p.code_client) AS code, TRIM(p.num_police) AS numero,
                    CASE WHEN UPPER(TRIM(p.etat)) = 'AN' THEN ARRAY_REMOVE(ARRAY[
                        CASE WHEN p.code_compagnie IS NULL THEN 'compagnie' END,
-                       CASE WHEN TRIM(COALESCE(p.code_branche, '')) = '' THEN 'code branche' END,
+                       CASE WHEN {_empty('p.code_branche')} THEN 'code branche' END,
                        CASE WHEN p.effet IS NULL THEN 'date effet' END,
-                       CASE WHEN TRIM(COALESCE(p.risque, '')) = '' THEN 'risque' END,
-                       CASE WHEN TRIM(COALESCE(p."Renouv_An", '')) = 'O' AND TRIM(COALESCE(p.echeance, '')) = '' THEN 'échéance' END,
+                       CASE WHEN {_empty('p.risque')} THEN 'risque' END,
+                       CASE WHEN TRIM(COALESCE(p."Renouv_An", '')) = 'O' AND {_empty('p.echeance')} THEN 'échéance' END,
                        CASE WHEN TRIM(COALESCE(p."Renouv_An", '')) <> 'O' AND p.expiration IS NULL THEN 'expiration' END
                    ], NULL) ELSE ARRAY[]::text[] END AS manque
             FROM dbo."TPolice" p
@@ -128,8 +150,8 @@ INCOMPLETE_SQL = f"""
     ), c AS (
         SELECT TRIM(k.code_client) AS code_client, TRIM(k.nom_client) AS nom_client,
                ARRAY_REMOVE(ARRAY[
-                   CASE WHEN TRIM(COALESCE(k.adresse, '')) = '' AND TRIM(COALESCE(k.adresse_b, '')) = '' THEN 'adresse' END,
-                   CASE WHEN TRIM(COALESCE(k.ville, '')) = '' AND TRIM(COALESCE(k.ville_b, '')) = '' THEN 'ville' END,
+                   CASE WHEN {_no_place('k.adresse')} AND {_no_place('k.adresse_b')} THEN 'adresse' END,
+                   CASE WHEN {_no_place('k.ville')} AND {_no_place('k.ville_b')} THEN 'ville' END,
                    CASE WHEN COALESCE(k.cp, 0) = 0 AND COALESCE(k.cp_b, 0) = 0 THEN 'code postal' END,
                    CASE WHEN TRIM(COALESCE(k."Correspondant", '')) = 'B'
                         THEN CASE WHEN NOT {PHONE_OFFICE} THEN 'téléphone (bureau)' END
