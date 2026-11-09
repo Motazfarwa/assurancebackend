@@ -178,14 +178,19 @@ INCOMPLETE_SQL = f"""
 @router.get("/clients-incomplets")
 def incomplete_clients(
     limit: int = Query(default=50, ge=1, le=200),
+    q: str = Query(default="", max_length=100),  # code or name of a client; the counters stay those of the whole list
     user: dict[str, Any] = Depends(require_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     if not is_admin(user):
         raise HTTPException(status_code=403, detail="Accès réservé à l'administrateur.")
     rows = db.execute(text(INCOMPLETE_SQL)).mappings().all()
+    # Every word typed must be in the code or the name, in any order; the exact code comes first.
+    search = q.strip().lower()
+    found = [row for row in rows if all(word in f'{row["code_client"]} {row["nom_client"] or ""}'.lower() for word in search.split())]
+    found.sort(key=lambda row: row["code_client"].lower() != search)
     items = []
-    for row in rows[:limit]:
+    for row in found[:limit]:
         manques = list(row["coordonnees"])
         if row["sans_police"]:
             manques.append("aucune police")
@@ -196,6 +201,7 @@ def incomplete_clients(
         items.append({"code_client": row["code_client"], "nom_client": row["nom_client"], "manques": manques})
     return {
         "total": len(rows),
+        "found": len(found),
         "coordonnees": sum(1 for row in rows if row["coordonnees"]),
         "sans_police": sum(1 for row in rows if row["sans_police"]),
         "polices": sum(1 for row in rows if row["polices"]),
