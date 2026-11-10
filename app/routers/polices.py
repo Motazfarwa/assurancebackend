@@ -423,8 +423,8 @@ def _plain(row) -> dict:
 
 @router.get("/detail")
 def get_police_detail(
-    num_police: str | None = Query(default=None, max_length=12),
-    code_client: str | None = Query(default=None, max_length=8),
+    num_police: str | None = Query(default=None, max_length=20),
+    code_client: str | None = Query(default=None, max_length=20),
 ):
     """Full policy (and its latest receipt) by policy number or, failing that, the client's latest policy."""
     number = (num_police or "").strip()
@@ -453,8 +453,8 @@ def get_police_detail(
         ).mappings().all()
         quittance = quittance_rows[0] if quittance_rows else None
         branche = conn.execute(
-            text('SELECT nom_branche FROM dbo."TBranche" WHERE code_compagnie = :cc AND code_branche = :cb LIMIT 1'),
-            {"cc": police.get("code_compagnie"), "cb": police.get("code_branche")},
+            text('SELECT TRIM(nom_branche) FROM dbo."TBranche" WHERE code_compagnie = :cc AND TRIM(code_branche) = TRIM(:cb) LIMIT 1'),
+            {"cc": police.get("code_compagnie"), "cb": police.get("code_branche") or ""},
         ).scalar()
 
         nom_client = conn.execute(
@@ -496,7 +496,7 @@ def get_police_detail(
 def get_client_polices(code_client: str):
     code_client = code_client.strip()
 
-    if not code_client or len(code_client) > 8:
+    if not code_client or len(code_client) > 20:
         raise HTTPException(
             status_code=422,
             detail="Code client invalide"
@@ -506,12 +506,14 @@ def get_client_polices(code_client: str):
         rows = conn.execute(
             text("""
                 SELECT
-                    p.num_int,
-                    p.num_police,
-                    p.code_client,
+                    TRIM(p.num_int) AS num_int,
+                    TRIM(p.num_police) AS num_police,
+                    TRIM(p.code_client) AS code_client,
                     p.code_compagnie,
-                    p.code_branche,
-                    b.nom_branche,
+                    (SELECT TRIM(c.nom_compagnie) FROM dbo."TCompagnie" c WHERE c.code_compagnie = p.code_compagnie) AS nom_compagnie,
+                    TRIM(p.code_branche) AS code_branche,
+                    TRIM(b.nom_branche) AS nom_branche,
+                    TRIM(p.risque) AS risque,
                     p.effet,
                     p.expiration,
                     p.etat,
@@ -524,14 +526,14 @@ def get_client_polices(code_client: str):
                     SELECT tb.nom_branche
                     FROM dbo."TBranche" tb
                     WHERE tb.code_compagnie = p.code_compagnie
-                      AND tb.code_branche = p.code_branche
+                      AND TRIM(tb.code_branche) = TRIM(p.code_branche)
                     LIMIT 1
                 ) b ON TRUE
 
-                WHERE p.code_client = :code_client
+                WHERE TRIM(p.code_client) = :code_client
 
                 ORDER BY p.date_creation DESC NULLS LAST,
-                         p.num_police
+                         p.num_police DESC
             """),
             {"code_client": code_client}
         ).mappings().all()
@@ -700,3 +702,34 @@ def search_polices(
         ).scalar_one()
 
     return {"items": [dict(row) for row in rows], "total": total, "page": page, "page_size": page_size}
+
+
+# The branche written in a N° police, for each company (or the one given): a new number is the year then the code branche
+# ("2026" + "011" + digits); the older ones start with the code branche then the year ("011" + "2026" + digits). Only a
+# code that exists in TBranche for that company is returned, so nothing is guessed.
+NUMBER_BRANCH_SQL = """
+WITH c AS (
+    SELECT code_compagnie, TRIM(nom_compagnie) AS nom_compagnie, COALESCE(NULLIF(CAST("Nbr_Chiffre_Code" AS int), 0), 3) AS n
+    FROM dbo."TCompagnie" WHERE CAST(:compagnie AS int) IS NULL OR code_compagnie = CAST(:compagnie AS int)
+), cand AS (
+    SELECT c.*, SUBSTRING(CAST(:num AS text) FROM 5 FOR c.n) AS code, 'annee' AS forme
+    FROM c WHERE CAST(:num AS text) ~ '^(19|20)[0-9]{2}'
+    UNION ALL
+    SELECT c.*, LEFT(CAST(:num AS text), c.n), 'ancienne'
+    FROM c WHERE SUBSTRING(CAST(:num AS text) FROM c.n + 1 FOR 4) ~ '^(19|20)[0-9]{2}$'
+)
+SELECT DISTINCT ON (cand.code_compagnie, cand.code)
+       cand.code_compagnie, cand.nom_compagnie, cand.code AS code_branche, TRIM(b.nom_branche) AS nom_branche, b.taux_comm, cand.forme
+FROM cand JOIN dbo."TBranche" b ON b.code_compagnie = cand.code_compagnie AND TRIM(b.code_branche) = cand.code
+WHERE LENGTH(cand.code) = cand.n
+ORDER BY cand.code_compagnie, cand.code, cand.forme
+"""
+
+
+@router.get("/numero-branche")
+def number_branch(num_police: str = Query(..., min_length=1, max_length=20), code_compagnie: int | None = None):
+    """Companies and branches a N° police can belong to, read from the number itself."""
+    number = re.sub(r"[^0-9A-Z]", "", num_police.upper())
+    with engine.connect() as conn:
+        rows = conn.execute(text(NUMBER_BRANCH_SQL), {"num": number, "compagnie": code_compagnie}).mappings().all()
+    return {"candidates": [{**dict(row), "taux_comm": None if row["taux_comm"] is None else float(row["taux_comm"])} for row in rows]}

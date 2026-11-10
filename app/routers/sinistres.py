@@ -376,10 +376,14 @@ def get_sinistre(numero: str, db: Session = Depends(get_db)) -> dict[str, Any]:
 
 
 class ReglementIn(BaseModel):
-    """The settlement entered when "Réglé" is ticked: stored in TRegCli together with the claim."""
+    """The settlement entered when "Réglé" is ticked: a dépense technique (TDepense 'T'), as the legacy claim payments."""
     num_piece: str = Field(min_length=1, max_length=20)
     date_reglement: date
     code_banque: str = Field(min_length=1, max_length=15)
+    # Mode de dépense (TDepense.mod_dep): C chèque, T traite, V virement, B carte bancaire.
+    mod_dep: str = Field(default="C", pattern="^[CTVB]$")
+    # Type de dépense (TDepense.Typ_dep): T technique.
+    typ_dep: str = Field(default="T", pattern="^T$")
 
 
 def _settlement(payload: dict[str, Any]) -> ReglementIn | None:
@@ -389,32 +393,57 @@ def _settlement(payload: dict[str, Any]) -> ReglementIn | None:
     try:
         return ReglementIn(**raw)
     except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=422, detail="Règlement : renseignez le N° pièce, la date de règlement et le compte banque.") from exc
+        raise HTTPException(status_code=422, detail="Règlement : renseignez le N° pièce, la date de règlement, le compte banque et le mode de dépense.") from exc
 
 
-def _store_settlement(db: Session, reglement: ReglementIn, values: dict[str, Any], login: str) -> None:
-    """The claim's settlement as a client settlement (dbo."TRegCli"): the claim's client, the amount settled, the piece,
-    its date and the agency account (TBanque) it was paid into."""
-    client = (values.get("Code_Client") or "").strip()
-    montant = values.get("Montant_Reglement") or 0
+# Type de la dépense technique of a claim, from its branch (TType_Branche): as the legacy payments.
+CLAIM_EXPENSE_TYPES = {1: "T04", 2: "T03", 12: "T06"}  # auto, transport, maladie; any other branch: T05 risques divers
+
+
+def _store_settlement(db: Session, reglement: ReglementIn, numero: str, login: str) -> None:
+    """The claim's settlement as a dépense technique (dbo."TDepense", Typ_dep 'T'), like the legacy "Reglement Sinistre
+    Auto" lines: the claim's client and police, the compagnie's claim number, the amount settled, the piece (N° chèque),
+    its date, the mode and the agency account (TBanque) it was paid from. It then shows in the Journal de dépense."""
+    claim = db.execute(text('SELECT * FROM dbo."Sinistre" WHERE TRIM("Num_Sinistre_Agence") = :n'), {"n": numero.strip()}).mappings().first()
+    if claim is None:
+        raise HTTPException(status_code=404, detail="Sinistre introuvable.")
+    client = (claim["Code_Client"] or "").strip()
+    montant = claim["Montant_Reglement"] or 0
     piece, compte = reglement.num_piece.strip(), reglement.code_banque.strip()
     if not client:
         raise HTTPException(status_code=422, detail="Règlement : le code client du sinistre est obligatoire.")
     if montant <= 0:
         raise HTTPException(status_code=422, detail="Renseignez le montant du règlement.")
+    if claim["Code_Type_Branche"] is None:
+        raise HTTPException(status_code=422, detail="Règlement : choisissez la branche du sinistre (elle donne le type de la dépense).")
     if db.execute(text('SELECT 1 FROM dbo."TBanque" WHERE TRIM(code_banque) = :c'), {"c": compte}).first() is None:
         raise HTTPException(status_code=422, detail=f"Compte banque {compte} inconnu.")
-    if db.execute(text('SELECT 1 FROM dbo."TRegCli" WHERE TRIM(num_piece) = :n AND TRIM(code_client) = :c LIMIT 1'), {"n": piece, "c": client}).first():
-        raise HTTPException(status_code=409, detail=f"La pièce {piece} est déjà enregistrée comme règlement de ce client.")
-    # Settlements saved at the same time from several PCs get different numbers (lock held until the commit).
-    db.execute(text("SELECT pg_advisory_xact_lock(hashtext('dbo.TRegCli.num_reg_cli'))"))
-    numero = db.execute(text('SELECT COALESCE(MAX(num_reg_cli), 0) + 1 FROM dbo."TRegCli"')).scalar()
+    sinistre = ((claim["Num_Sinistre_Compagnie_Assure"] or "").strip() or numero.strip())[:20]
+    if db.execute(
+        text('SELECT 1 FROM dbo."TDepense" WHERE "Typ_dep" = \'T\' AND TRIM(sinistre) = :s AND TRIM(num_cheq) = :p LIMIT 1'), {"s": sinistre, "p": piece}
+    ).first():
+        raise HTTPException(status_code=409, detail=f"La pièce {piece} est déjà enregistrée comme règlement de ce sinistre.")
+    police = db.execute(
+        text('SELECT TRIM(num_police) FROM dbo."TPolice" WHERE TRIM(num_int) = TRIM(:i) ORDER BY effet DESC NULLS LAST LIMIT 1'), {"i": claim["Num_Int"] or ""}
+    ).scalar() or (claim["Num_Int"] or "").strip() or None
+    nom = (claim.get("nom_client") or "").strip() or (db.execute(
+        text('SELECT TRIM(nom_client) FROM dbo."TClient" WHERE TRIM(code_client) = :c LIMIT 1'), {"c": client}
+    ).scalar() or "")
+    # Payments saved at the same time from several PCs get different numbers (lock held until the commit).
+    db.execute(text("SELECT pg_advisory_xact_lock(hashtext('dbo.TDepense.num_dep'))"))
+    num_dep = db.execute(text('SELECT COALESCE(MAX(num_dep), 0) + 1 FROM dbo."TDepense" WHERE "Typ_dep" = :t'), {"t": reglement.typ_dep}).scalar()
     db.execute(
         text(
-            'INSERT INTO dbo."TRegCli" (num_reg_cli, date_reg_cli, code_client, type_reg_cli, num_piece, mont_reg_cli, code_banque, "Fectif", "Create_User", "Create_Date") '
-            "VALUES (:numero, :date, :client, 'C', :piece, :montant, :compte, 'N', :user, now())"
+            'INSERT INTO dbo."TDepense" (num_dep, "Typ_dep", date_dep, mont_dep, objet_dep, code_banque, num_cheq, date_cheq, code_client, '
+            'num_police, sinistre, num_quittance, mod_dep, code_type, "Comptabiliser", "Validation", "Montant_RS", "Create_User", "Create_Date") '
+            "VALUES (:num, :typ, :date, :montant, :objet, :compte, :piece, :date, :client, :police, :sinistre, '', :mode, :type, 'N', 'N', 0, :user, now())"
         ),
-        {"numero": numero, "date": reglement.date_reglement, "client": client[:8], "piece": piece, "montant": montant, "compte": compte, "user": login},
+        {
+            "num": num_dep, "typ": reglement.typ_dep, "date": reglement.date_reglement, "montant": montant,
+            "objet": (f"SIN{sinistre} : {nom}" if nom else f"SIN{sinistre}")[:50], "compte": compte, "piece": piece, "client": client[:8],
+            "police": (police or None) and police[:15], "sinistre": sinistre, "mode": reglement.mod_dep,
+            "type": CLAIM_EXPENSE_TYPES.get(int(claim["Code_Type_Branche"]), "T05"), "user": login,
+        },
     )
 
 
@@ -444,7 +473,7 @@ def create_sinistre(payload: dict[str, Any], user: dict[str, Any] = Depends(requ
         columns = ", ".join(f'"{key}"' for key in values)
         db.execute(text(f'INSERT INTO dbo."Sinistre" ({columns}) VALUES ({", ".join(f":{key}" for key in values)})'), values)
         if reglement:
-            _store_settlement(db, reglement, values, login)
+            _store_settlement(db, reglement, values["Num_Sinistre_Agence"], login)
         # Like the legacy software, a new file starts its follow-up with the opening step(s) (Etape_Ouverture = 'O').
         for (code,) in db.execute(text('SELECT "Code_Etape" FROM dbo."TEtape_Siniste" WHERE "Etape_Ouverture" = \'O\' ORDER BY 1')).all():
             _insert_follow_up(db, "Sinistre_Suivi", {
@@ -483,7 +512,7 @@ def update_sinistre(numero: str, payload: dict[str, Any], user: dict[str, Any] =
             db.rollback()
             raise
         if reglement:
-            _store_settlement(db, reglement, values, values["Update_User"])
+            _store_settlement(db, reglement, numero, values["Update_User"])
         db.commit()
     except SQLAlchemyError as exc:
         db.rollback()

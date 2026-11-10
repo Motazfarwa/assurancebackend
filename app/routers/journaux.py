@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from app.auth import require_current_user
 from app.database import get_db
+from app.routers.access import is_admin
 
 
 router = APIRouter(prefix="/api/journaux", tags=["Journaux techniques"], dependencies=[Depends(require_current_user)])
@@ -69,16 +70,24 @@ def companies(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
 # Journal d'encaissement
 # ---------------------------------------------------------------------------------------------
 
-# Receipts of the company still to declare (due in the year of the journal date, by that date), and with `done` the ones
-# declared on that date.
+# Receipts of the company still to declare: every quittance a client paid something on (dbo."RDetRegCli", one line per
+# quittance settled, with the TRegCli date) by the journal date and not declared yet, whatever its échéance; with `done`
+# the ones declared on that date.
 # declared_before / at_day / pending: the settlement lines declared before the date, on the date, not yet.
 RECEIPTS_SQL = """
-WITH q AS MATERIALIZED (
+WITH paid AS MATERIALIZED (
+    -- the client settlement lines not declared yet, paid by the journal date (since 1 January of the year before: older
+    -- lines never declared are leftovers of 2005-2006 test quittances, not encaissements to declare now)
+    SELECT DISTINCT TRIM(d."Num_quitance") AS num_quittance
+    FROM dbo."RDetRegCli" d JOIN dbo."TRegCli" t ON t.num_reg_cli = d."Num_reg_cli"
+    WHERE COALESCE(d."Comptabiliser", 'N') <> 'O' AND t.date_reg_cli < :next_day
+      AND t.date_reg_cli >= date_trunc('year', CAST(:day AS date)) - INTERVAL '1 year'
+),
+q AS MATERIALIZED (
     SELECT q.* FROM dbo."TQuittance" q
     WHERE TRIM(q.type_quittance) = 'P' AND COALESCE(q.annule, 'N') <> 'O'
       AND (
-        -- due in the journal date's year, by that date (01/01/2026 → 15/11/2026)
-        (COALESCE(q."Comptabiliser", 'N') <> 'O' AND q.echeance >= date_trunc('year', CAST(:day AS date)) AND q.echeance < :next_day)
+        (COALESCE(q."Comptabiliser", 'N') <> 'O' AND TRIM(q.num_quittance) IN (SELECT num_quittance FROM paid))
         OR (:done AND q."Date_Comptabiliser" >= :day AND q."Date_Comptabiliser" < :next_day)
         OR (:done AND EXISTS (
             SELECT 1 FROM dbo."RDetRegCli" d WHERE TRIM(d."Num_quitance") = TRIM(q.num_quittance)
@@ -707,6 +716,44 @@ ORDER BY COALESCE(quit.prime, 0) DESC, 1
 """
 ACCOUNT_TOTALS = ("prime", "ristourne", "sinistre", "reglement", "commission")
 
+# The detail (what an employee sees): every quittance of the same selection, with its company, échéance, police and
+# prime; the ristournes only when they are asked for.
+ACCOUNT_LINES_SQL = """
+WITH pol AS MATERIALIZED (
+    SELECT TRIM(num_int) AS num_int, TRIM(num_police) AS num_police FROM dbo."TPolice"
+    WHERE (CAST(:compagnie AS int) IS NOT NULL OR CAST(:police AS text) IS NOT NULL)
+      AND (CAST(:compagnie AS int) IS NULL OR code_compagnie = CAST(:compagnie AS int))
+      AND (CAST(:police AS text) IS NULL OR TRIM(num_int) = CAST(:police AS text) OR TRIM(num_police) = CAST(:police AS text))
+),
+q AS MATERIALIZED (
+    SELECT TRIM(q.code_client) AS code_client, q.echeance::date AS echeance, TRIM(q.num_int) AS num_int,
+           TRIM(q.num_quittance) AS num_quittance, COALESCE(q.prime_total, 0) AS prime
+    FROM dbo."TQuittance" q
+    WHERE COALESCE(q.annule, 'N') <> 'O'
+      AND q."Date_Retour" IS NULL
+      AND (CAST(:debut AS date) IS NULL OR (q.echeance >= CAST(:debut AS date) AND q.echeance < CAST(:fin AS date)))
+      AND (CAST(:client AS text) IS NULL OR TRIM(q.code_client) = CAST(:client AS text))
+      AND (CAST(:compagnie AS int) IS NULL AND CAST(:police AS text) IS NULL OR TRIM(q.num_int) IN (SELECT num_int FROM pol))
+      AND (TRIM(COALESCE(q.type_quittance, '')) = 'R') = (CAST(:etat AS text) = 'ristourne')
+      AND CASE CAST(:etat AS text)
+            WHEN 'comptabilise' THEN COALESCE(q."Comptabiliser", 'N') = 'O'
+            WHEN 'instance' THEN COALESCE(q."Comptabiliser", 'N') <> 'O'
+            ELSE TRUE END
+),
+p AS (
+    SELECT DISTINCT ON (TRIM(num_int)) TRIM(num_int) AS num_int, TRIM(num_police) AS num_police, code_compagnie
+    FROM dbo."TPolice" WHERE TRIM(num_int) IN (SELECT num_int FROM q)
+    ORDER BY TRIM(num_int), effet DESC NULLS LAST
+)
+SELECT q.code_client,
+       (SELECT TRIM(c.nom_client) FROM dbo."TClient" c WHERE TRIM(c.code_client) = q.code_client LIMIT 1) AS nom_client,
+       p.code_compagnie, (SELECT TRIM(k.nom_compagnie) FROM dbo."TCompagnie" k WHERE k.code_compagnie = p.code_compagnie) AS nom_compagnie,
+       q.echeance, COALESCE(p.num_police, q.num_int) AS num_police, q.num_quittance, ROUND(q.prime::numeric, 3) AS prime
+FROM q LEFT JOIN p ON p.num_int = q.num_int
+ORDER BY CASE WHEN q.code_client ~ '^[0-9]+$' THEN CAST(q.code_client AS bigint) END NULLS LAST, q.code_client,
+         nom_compagnie NULLS LAST, q.echeance, q.num_quittance
+"""
+
 
 @router.get("/comptes-clients")
 def client_accounts(
@@ -716,9 +763,15 @@ def client_accounts(
     code_client: str | None = Query(default=None, max_length=20),
     police: str | None = Query(default=None, max_length=30),
     etat: str = Query("tous", pattern="^(tous|comptabilise|instance|ristourne)$"),
+    presentation: str = Query("synthese", pattern="^(synthese|detail)$"),
+    user: dict[str, Any] = Depends(require_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Etat des comptes client: one line per client with its primes, ristournes, sinistres, règlements and commissions."""
+    """Etat des comptes client. Administrator: one line per client with its primes, ristournes, sinistres, règlements
+    and commissions (or the detail). Any other user: the detail only, client by client and company by company, the
+    quittances and their primes (no commission), as in the legacy software."""
+    if not is_admin(user):
+        presentation = "detail"
     if (debut is None) != (fin is None):
         raise HTTPException(status_code=422, detail="Donnez la date de début et la date de fin.")
     if debut and fin and fin < debut:
@@ -728,11 +781,13 @@ def client_accounts(
         "client": (code_client or "").strip() or None, "police": (police or "").strip() or None, "etat": etat,
     }
     try:
-        rows = db.execute(text(ACCOUNTS_SQL), params).mappings().all()
+        rows = db.execute(text(ACCOUNT_LINES_SQL if presentation == "detail" else ACCOUNTS_SQL), params).mappings().all()
     except SQLAlchemyError as exc:
         raise _fail(exc) from exc
     items = [_plain(row) for row in rows]
-    return {"items": items, "totals": {key: round(sum(float(row[key] or 0) for row in items), 3) for key in ACCOUNT_TOTALS}}
+    if presentation == "detail":
+        return {"presentation": "detail", "lines": items, "total": round(sum(float(row["prime"] or 0) for row in items), 3)}
+    return {"presentation": "synthese", "items": items, "totals": {key: round(sum(float(row[key] or 0) for row in items), 3) for key in ACCOUNT_TOTALS}}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -992,3 +1047,52 @@ def bank_statement(
         "banque": {key: account[key] for key in ("code_banque", "nom_banque", "num_compte")},
         "solde_depart": depart, "total_credit": credit, "total_debit": debit, "solde_final": solde, "items": items,
     }
+
+
+# ---------------------------------------------------------------------------------------------
+# Etat des dépenses techniques
+# ---------------------------------------------------------------------------------------------
+# The technical payments (TDepense 'T': claims, rebates, experts) of a company's policies dated in a month, as the legacy
+# "ETAT DES DEPENSES TECHNIQUES" (ImpDepTech). Its Observation column gives the feuille de caisse the payment went into:
+# the day it was comptabilisé (Journal de dépense), or "en instance" while it is not.
+TECH_EXPENSES_SQL = """
+WITH d AS MATERIALIZED (
+    SELECT d.*, TRIM(t.libelle) AS libelle, TRIM(t."Nat_quit") AS nature
+    FROM dbo."TDepense" d JOIN dbo.ttype_dep t ON TRIM(t.code_type) = TRIM(d.code_type)
+    WHERE TRIM(d."Typ_dep") = 'T' AND d.date_dep >= :debut AND d.date_dep < :fin
+),
+pol AS (
+    SELECT DISTINCT ON (TRIM(num_police)) TRIM(num_police) AS num_police, code_compagnie
+    FROM dbo."TPolice" WHERE TRIM(num_police) IN (SELECT TRIM(num_police) FROM d)
+    ORDER BY TRIM(num_police), effet DESC NULLS LAST
+)
+SELECT d.num_dep, d.date_dep::date AS date_dep, TRIM(d.num_police) AS num_police, TRIM(d.code_client) AS code_client,
+       (SELECT TRIM(c.nom_client) FROM dbo."TClient" c WHERE TRIM(c.code_client) = TRIM(d.code_client) LIMIT 1) AS assure,
+       d.libelle, d.nature, ROUND(COALESCE(d.mont_dep, 0)::numeric, 3) AS montant, TRIM(d.num_cheq) AS num_cheq,
+       TRIM(d.code_banque) AS banque, NULLIF(TRIM(d.sinistre), '') AS sinistre,
+       COALESCE(d."Comptabiliser", 'N') = 'O' AS comptabilise, d."Date_Comptabiliser"::date AS date_feuille
+FROM d JOIN pol p ON p.num_police = TRIM(d.num_police)
+WHERE p.code_compagnie = :compagnie
+ORDER BY d.date_dep, d.num_dep
+"""
+
+
+@router.get("/depenses-techniques")
+def technical_expenses(
+    compagnie: int = Query(...),
+    mois: str = Query(..., pattern=r"^\d{4}-\d{2}$", description="AAAA-MM"),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    year, month = (int(part) for part in mois.split("-"))
+    if not 1 <= month <= 12:
+        raise HTTPException(status_code=422, detail="Mois invalide.")
+    debut = date(year, month, 1)
+    fin = date(year + month // 12, month % 12 + 1, 1)
+    try:
+        db.execute(text("SET LOCAL enable_nestloop = off"))  # same planner issue as the feuille de caisse
+        items = [_plain(row) for row in db.execute(text(TECH_EXPENSES_SQL), {"compagnie": compagnie, "debut": debut, "fin": fin}).mappings().all()]
+    except SQLAlchemyError as exc:
+        raise _fail(exc) from exc
+    finally:
+        db.rollback()
+    return {"items": items, "total": round(sum(float(row["montant"] or 0) for row in items), 3)}
