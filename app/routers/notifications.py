@@ -179,6 +179,9 @@ INCOMPLETE_SQL = f"""
 def incomplete_clients(
     limit: int = Query(default=50, ge=1, le=200),
     q: str = Query(default="", max_length=100),  # code or name of a client; the counters stay those of the whole list
+    # Module "Clients à compléter": one kind of gap only, the next pages, and every entry of each client
+    categorie: str = Query(default="", pattern="^(|coordonnees|sans_police|polices|quittances|sinistres)$"),
+    offset: int = Query(default=0, ge=0),
     user: dict[str, Any] = Depends(require_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
@@ -188,9 +191,11 @@ def incomplete_clients(
     # Every word typed must be in the code or the name, in any order; the exact code comes first.
     search = q.strip().lower()
     found = [row for row in rows if all(word in f'{row["code_client"]} {row["nom_client"] or ""}'.lower() for word in search.split())]
+    if categorie:
+        found = [row for row in found if row[categorie]]
     found.sort(key=lambda row: row["code_client"].lower() != search)
     items = []
-    for row in found[:limit]:
+    for row in found[offset:offset + limit]:
         manques = list(row["coordonnees"])
         if row["sans_police"]:
             manques.append("aucune police")
@@ -198,7 +203,13 @@ def incomplete_clients(
         manques.extend(f"police {entry}" for entry in row["polices"][:3])
         manques.extend(f"quittance {entry}" for entry in row["quittances"][:3])
         manques.extend(f"sinistre {entry}" for entry in row["sinistres"][:3])
-        items.append({"code_client": row["code_client"], "nom_client": row["nom_client"], "manques": manques})
+        items.append({
+            "code_client": row["code_client"], "nom_client": row["nom_client"], "manques": manques,
+            "details": {
+                "coordonnees": list(row["coordonnees"]), "sans_police": bool(row["sans_police"]),
+                "polices": list(row["polices"]), "quittances": list(row["quittances"]), "sinistres": list(row["sinistres"]),
+            },
+        })
     return {
         "total": len(rows),
         "found": len(found),
