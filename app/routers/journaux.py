@@ -91,6 +91,8 @@ WITH paid AS MATERIALIZED (
     FROM dbo."RDetRegCli" d JOIN dbo."TRegCli" t ON t.num_reg_cli = d."Num_reg_cli"
     WHERE COALESCE(d."Comptabiliser", 'N') <> 'O' AND t.date_reg_cli < :next_day
       AND t.date_reg_cli >= date_trunc('year', CAST(:day AS date)) - INTERVAL '1 year'
+      -- the journal of a period: only what was paid in it (from its first day)
+      AND (CAST(:pending_from AS date) IS NULL OR t.date_reg_cli >= CAST(:pending_from AS date))
 ),
 q AS MATERIALIZED (
     SELECT q.* FROM dbo."TQuittance" q
@@ -184,13 +186,13 @@ def _receipt(row: Any) -> dict[str, Any]:
 
 def _receipts(db: Session, compagnie: int | None, day: date, done: bool, numbers: list[str] | None = None,
               regles: bool = False, reg_debut: date | None = None, reg_fin: date | None = None,
-              done_from: date | None = None) -> list[dict[str, Any]]:
+              done_from: date | None = None, pending_from: date | None = None) -> list[dict[str, Any]]:
     """The lines to declare on `day`, and with `done` those declared from `done_from` (default: that day) to `day`."""
     _ensure_validated(db)
     rows = db.execute(
         text(RECEIPTS_SQL),
         {"compagnie": compagnie, "day": day, "next_day": day + timedelta(days=1), "done": done, "numbers": numbers,
-         "done_from": done_from or day,
+         "done_from": done_from or day, "pending_from": pending_from,
          "excluded": EXCLUDED_COMPANIES, "regles": regles, "reg_debut": reg_debut, "reg_fin": reg_fin},
     ).mappings().all()
     return [_receipt(row) for row in rows]
@@ -205,6 +207,7 @@ def receipts_journal(
     debut: date | None = Query(default=None, description="With fin: settled between the two dates"),
     fin: date | None = None,
     periode: bool = Query(default=False, description="Declared lines of the half month of the date (1-15, 16-end), not only of the date"),
+    journal: bool = Query(default=False, description="The journal of the half month: only the lines to declare paid in it"),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     if bool(debut) != bool(fin):
@@ -213,7 +216,8 @@ def receipts_journal(
         raise HTTPException(status_code=422, detail="La date de fin précède la date de début.")
     try:
         done_from = _period_start(date_journal) if periode else None
-        items = _receipts(db, compagnie, date_journal, comptabilises, regles=regles, reg_debut=debut, reg_fin=fin, done_from=done_from)
+        items = _receipts(db, compagnie, date_journal, comptabilises, regles=regles, reg_debut=debut, reg_fin=fin, done_from=done_from,
+                          pending_from=_period_start(date_journal) if journal else None)
     except SQLAlchemyError as exc:
         raise _fail(exc) from exc
     return {"items": items, "num_jeq": date_journal.strftime("%Y%m%d"), "debut_periode": (done_from or date_journal).isoformat()}
@@ -435,8 +439,9 @@ WITH d AS MATERIALIZED (
     WHERE TRIM(d."Typ_dep") = 'T' AND TRIM(t."Nat_quit") IN ('S', 'R')
       AND (CAST(:nature AS text) IS NULL OR TRIM(t."Nat_quit") = CAST(:nature AS text))
       AND (
-        (COALESCE(d."Comptabiliser", 'N') <> 'O' AND d.date_dep < :next_day)
-        OR (:done AND d."Date_Comptabiliser" >= :day AND d."Date_Comptabiliser" < :next_day)
+        (COALESCE(d."Comptabiliser", 'N') <> 'O' AND d.date_dep < :next_day
+         AND (CAST(:pending_from AS date) IS NULL OR d.date_dep >= CAST(:pending_from AS date)))
+        OR (:done AND d."Date_Comptabiliser" >= :done_from AND d."Date_Comptabiliser" < :next_day)
       )
       AND (CAST(:ids AS int[]) IS NULL OR d.num_dep = ANY(CAST(:ids AS int[])))
 ),
@@ -465,11 +470,12 @@ ORDER BY TRIM(k.nom_compagnie), TRIM(d.num_police), d.num_dep  -- as the legacy 
 """
 
 
-def _expenses(db: Session, compagnie: int | None, day: date, done: bool, nature: str | None = None, ids: list[int] | None = None) -> list[dict[str, Any]]:
+def _expenses(db: Session, compagnie: int | None, day: date, done: bool, nature: str | None = None, ids: list[int] | None = None,
+              done_from: date | None = None, pending_from: date | None = None) -> list[dict[str, Any]]:
     rows = db.execute(
         text(EXPENSES_SQL),
         {"compagnie": compagnie, "day": day, "next_day": day + timedelta(days=1), "done": done, "nature": nature, "ids": ids,
-         "excluded": EXCLUDED_COMPANIES},
+         "done_from": done_from or day, "pending_from": pending_from, "excluded": EXCLUDED_COMPANIES},
     ).mappings().all()
     return [_plain(row) for row in rows]
 
@@ -480,10 +486,12 @@ def expenses_journal(
     date_journal: date = Query(..., alias="date"),
     nature: str = Query(default="", pattern="^[SR]?$", description="S = sinistres, R = ristournes, empty = both"),
     comptabilises: bool = Query(default=False, description="Also the expenses comptabilisées on that date"),
+    journal: bool = Query(default=False, description="The journal of the half month: comptabilisées in it, and to comptabiliser paid in it"),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     try:
-        items = _expenses(db, compagnie, date_journal, comptabilises, nature or None)
+        start = _period_start(date_journal) if journal else None
+        items = _expenses(db, compagnie, date_journal, comptabilises, nature or None, done_from=start, pending_from=start)
     except SQLAlchemyError as exc:
         raise _fail(exc) from exc
     return {"items": items}
@@ -1384,3 +1392,233 @@ def validate_cash_sheet(payload: ValiderFeuille, user: dict[str, Any] = Depends(
         db.rollback()
         raise _fail(exc) from exc
     return {"validation": validation, "retirees": len(withdrawn)}
+
+
+# ---------------------------------------------------------------------------------------------
+# The journals of the half months (1st-15th, 16th-end of the month), listed one line each, and their validation
+# ---------------------------------------------------------------------------------------------
+# A journal (encaissement or dépense) of the date D (the 15th or the last day of the month) holds what was declared in its
+# half month, and what was paid in it and is still to declare. "Valider" declares those on D: they are then in the
+# feuille de caisse of D (which counts what is declared on its date).
+JOURNAL_VALIDATED_DDL = """
+CREATE TABLE IF NOT EXISTS dbo."TJournalValide" (
+    id serial PRIMARY KEY,
+    type_journal char(1) NOT NULL,
+    jour date NOT NULL,
+    code_compagnie integer,
+    lignes integer NOT NULL,
+    montant numeric(14, 3) NOT NULL,
+    retirees integer NOT NULL DEFAULT 0,
+    utilisateur varchar(50),
+    date_saisie timestamp NOT NULL
+)
+"""
+
+RECEIPT_PERIODS_SQL = """
+WITH per AS (SELECT * FROM unnest(CAST(:starts AS date[]), CAST(:ends AS date[])) AS p(debut, jour)),
+lines AS MATERIALIZED (
+    SELECT TRIM(d."Num_quitance") AS num_quittance, COALESCE(d."Montant", 0) AS montant, d."Comptabiliser" = 'O' AS declared,
+           CASE WHEN d."Comptabiliser" = 'O' THEN d."Date_Comptabiliser"::date ELSE t.date_reg_cli::date END AS jour_ref
+    FROM dbo."RDetRegCli" d JOIN dbo."TRegCli" t ON t.num_reg_cli = d."Num_reg_cli"
+    WHERE COALESCE(TRIM(t.type_reg_cli), '') <> 'R' AND COALESCE(d."Montant", 0) > 0.0005
+      AND ((d."Comptabiliser" = 'O' AND d."Date_Comptabiliser" >= :first AND d."Date_Comptabiliser" < CAST(:last AS date) + 1)
+           OR (COALESCE(d."Comptabiliser", 'N') <> 'O' AND t.date_reg_cli < CAST(:last AS date) + 1
+               AND t.date_reg_cli >= CAST(:first AS date) - INTERVAL '2 years'))
+),
+q AS (
+    SELECT DISTINCT ON (TRIM(q.num_quittance)) TRIM(q.num_quittance) AS num_quittance, TRIM(q.num_int) AS num_int
+    FROM dbo."TQuittance" q
+    WHERE TRIM(q.num_quittance) IN (SELECT num_quittance FROM lines) AND TRIM(q.type_quittance) = 'P' AND COALESCE(q.annule, 'N') <> 'O'
+    ORDER BY TRIM(q.num_quittance)
+),
+pol AS (
+    SELECT DISTINCT ON (TRIM(num_int)) TRIM(num_int) AS num_int, code_compagnie
+    FROM dbo."TPolice" WHERE TRIM(num_int) IN (SELECT num_int FROM q)
+    ORDER BY TRIM(num_int), effet DESC NULLS LAST
+),
+kept AS (
+    SELECT l.* FROM lines l JOIN q ON q.num_quittance = l.num_quittance JOIN pol p ON p.num_int = q.num_int
+    JOIN dbo."TCompagnie" k ON k.code_compagnie = p.code_compagnie
+    WHERE (CAST(:compagnie AS integer) IS NULL OR p.code_compagnie = CAST(:compagnie AS integer))
+      AND UPPER(TRIM(k.nom_compagnie)) <> ALL(:excluded)
+)
+SELECT per.jour, per.debut,
+       COUNT(DISTINCT k.num_quittance) FILTER (WHERE k.declared) AS declarees,
+       COALESCE(ROUND(SUM(k.montant) FILTER (WHERE k.declared)::numeric, 3), 0) AS montant_declare,
+       COUNT(DISTINCT k.num_quittance) FILTER (WHERE NOT k.declared) AS a_declarer,
+       COALESCE(ROUND(SUM(k.montant) FILTER (WHERE NOT k.declared)::numeric, 3), 0) AS montant_a_declarer
+FROM per LEFT JOIN kept k ON k.jour_ref BETWEEN per.debut AND per.jour
+GROUP BY per.jour, per.debut
+UNION ALL
+-- still to declare, paid before the oldest journal listed (jour NULL)
+SELECT NULL, NULL, 0, 0, COUNT(DISTINCT k.num_quittance), COALESCE(ROUND(SUM(k.montant)::numeric, 3), 0)
+FROM kept k WHERE NOT k.declared AND k.jour_ref < :first
+ORDER BY 1 DESC NULLS LAST
+"""
+
+EXPENSE_PERIODS_SQL = """
+WITH per AS (SELECT * FROM unnest(CAST(:starts AS date[]), CAST(:ends AS date[])) AS p(debut, jour)),
+pol AS (
+    SELECT DISTINCT ON (TRIM(num_police)) TRIM(num_police) AS num_police, code_compagnie
+    FROM dbo."TPolice" ORDER BY TRIM(num_police), effet DESC NULLS LAST
+),
+kept AS MATERIALIZED (
+    SELECT d.num_dep, COALESCE(d.mont_dep, 0) AS montant, d."Comptabiliser" = 'O' AS declared,
+           CASE WHEN d."Comptabiliser" = 'O' THEN d."Date_Comptabiliser"::date ELSE d.date_dep::date END AS jour_ref
+    FROM dbo."TDepense" d
+    JOIN dbo.ttype_dep t ON TRIM(t.code_type) = TRIM(d.code_type)
+    JOIN pol p ON p.num_police = TRIM(d.num_police)
+    JOIN dbo."TCompagnie" k ON k.code_compagnie = p.code_compagnie
+    WHERE TRIM(d."Typ_dep") = 'T' AND TRIM(t."Nat_quit") IN ('S', 'R')
+      AND (CAST(:nature AS text) IS NULL OR TRIM(t."Nat_quit") = CAST(:nature AS text))
+      AND (CAST(:compagnie AS integer) IS NULL OR p.code_compagnie = CAST(:compagnie AS integer))
+      AND UPPER(TRIM(k.nom_compagnie)) <> ALL(:excluded)
+      AND ((d."Comptabiliser" = 'O' AND d."Date_Comptabiliser" >= :first AND d."Date_Comptabiliser" < CAST(:last AS date) + 1)
+           OR (COALESCE(d."Comptabiliser", 'N') <> 'O' AND d.date_dep < CAST(:last AS date) + 1))
+)
+SELECT per.jour, per.debut,
+       COUNT(k.num_dep) FILTER (WHERE k.declared) AS declarees,
+       COALESCE(ROUND(SUM(k.montant) FILTER (WHERE k.declared)::numeric, 3), 0) AS montant_declare,
+       COUNT(k.num_dep) FILTER (WHERE NOT k.declared) AS a_declarer,
+       COALESCE(ROUND(SUM(k.montant) FILTER (WHERE NOT k.declared)::numeric, 3), 0) AS montant_a_declarer
+FROM per LEFT JOIN kept k ON k.jour_ref BETWEEN per.debut AND per.jour
+GROUP BY per.jour, per.debut
+UNION ALL
+SELECT NULL, NULL, 0, 0, COUNT(k.num_dep), COALESCE(ROUND(SUM(k.montant)::numeric, 3), 0)
+FROM kept k WHERE NOT k.declared AND k.jour_ref < :first
+ORDER BY 1 DESC NULLS LAST
+"""
+
+
+def _journal_days(last: date, count: int) -> list[date]:
+    """The journal dates (15th, last day of the month) from the one of `last` back, `count` of them."""
+    def end_of(day: date) -> date:
+        return (day.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+    day = last.replace(day=15) if last.day <= 15 else end_of(last)
+    days = []
+    for _ in range(count):
+        days.append(day)
+        day = day.replace(day=1) - timedelta(days=1) if day.day == 15 else day.replace(day=15)
+    return days
+
+
+def _journal_validations(db: Session, kind: str, compagnie: int | None, days: list[date]) -> dict[str, dict[str, Any]]:
+    rows = db.execute(text(
+        'SELECT DISTINCT ON (jour) jour, lignes, montant, retirees, utilisateur, date_saisie FROM dbo."TJournalValide" '
+        'WHERE type_journal = :t AND jour = ANY(CAST(:days AS date[])) AND code_compagnie IS NOT DISTINCT FROM CAST(:c AS integer) '
+        'ORDER BY jour, date_saisie DESC'
+    ), {"t": kind, "days": days, "c": compagnie}).mappings().all()
+    out = {}
+    for row in rows:
+        item = _plain(row)
+        item["date_saisie"] = row["date_saisie"].isoformat(timespec="minutes") if row["date_saisie"] else None
+        out[row["jour"].isoformat()] = item
+    return out
+
+
+def _ensure_journal_validated(db: Session) -> None:
+    _ensure_validated(db)
+    db.execute(text(JOURNAL_VALIDATED_DDL))
+    db.commit()
+
+
+@router.get("/periodes")
+def journal_periods(
+    type_journal: str = Query(..., alias="type", pattern="^(encaissement|depense)$"),
+    date_journal: date = Query(..., alias="date", description="The most recent journal listed is the one of this date"),
+    compagnie: int | None = Query(default=None, description="Without it, every company"),
+    nature: str = Query(default="", pattern="^[SR]?$"),
+    nombre: int = Query(default=12, ge=1, le=48),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """One line per journal of the half months, from the one of the date back: declared in it, still to declare (paid in
+    it), and its last validation."""
+    _ensure_journal_validated(db)
+    days = _journal_days(date_journal, nombre)
+    starts = [_period_start(day) for day in days]
+    params = {"starts": starts, "ends": days, "first": starts[-1], "last": days[0], "compagnie": compagnie, "excluded": EXCLUDED_COMPANIES}
+    kind = "E" if type_journal == "encaissement" else "D"
+    try:
+        db.execute(text("SET LOCAL enable_nestloop = off"))
+        if kind == "E":
+            rows = db.execute(text(RECEIPT_PERIODS_SQL), params).mappings().all()
+        else:
+            rows = db.execute(text(EXPENSE_PERIODS_SQL), {**params, "nature": nature or None}).mappings().all()
+        validations = _journal_validations(db, kind, compagnie, days)
+    except SQLAlchemyError as exc:
+        raise _fail(exc) from exc
+    finally:
+        db.rollback()
+    items, older = [], None
+    for row in rows:
+        item = _plain(row)
+        if row["jour"] is None:
+            older = {"a_declarer": item["a_declarer"], "montant_a_declarer": item["montant_a_declarer"], "avant": starts[-1].isoformat()}
+            continue
+        item["jour"] = row["jour"].isoformat()
+        item["debut"] = row["debut"].isoformat()
+        item["lignes"] = item["declarees"] + item["a_declarer"]
+        item["montant"] = round(float(item["montant_declare"]) + float(item["montant_a_declarer"]), 3)
+        item["validation"] = validations.get(item["jour"])
+        items.append(item)
+    return {"items": items, "anterieur": older}
+
+
+class ValiderJournal(BaseModel):
+    type: str = Field(pattern="^(encaissement|depense)$")
+    jour: date
+    compagnie: int | None = None
+    nature: str = Field(default="", pattern="^[SR]?$")
+
+
+@router.post("/valider-journal")
+def validate_journal(payload: ValiderJournal, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Validates the journal of the half month ending on `jour`: what was paid in it and is still to declare is declared on
+    `jour` (encaissements: the quittances not unticked in the journal of that day; the ones declared in it then unticked
+    are taken out). They are then in the feuille de caisse of `jour`."""
+    jour, compagnie = payload.jour, payload.compagnie
+    if jour.day != 15 and (jour + timedelta(days=1)).day != 1:
+        raise HTTPException(status_code=422, detail="Un journal est daté du 15 ou du dernier jour du mois.")
+    _ensure_journal_validated(db)
+    name = str(user.get("sub", ""))[:50]
+    start = _period_start(jour)
+    kind = "E" if payload.type == "encaissement" else "D"
+    withdrawn: list[str] = []
+    try:
+        db.execute(text("SELECT pg_advisory_xact_lock(hashtext('journal:' || :t || ':' || :j))"), {"t": kind, "j": jour.isoformat()})
+        if kind == "E":
+            unticked = _unticked(db, jour)
+            lines = [line for line in _receipts(db, compagnie, jour, True, regles=True, done_from=start, pending_from=start)]
+            to_declare = [line for line in lines if not line["comptabilise"] and (line["paye"] or line["a_s"] == "A")
+                          and line["num_quittance"] not in unticked]
+            for line in to_declare:
+                _declare_receipt(db, line, jour, name)
+            withdrawn = [line["num_quittance"] for line in lines if line["comptabilise"] and line["num_quittance"] in unticked]
+            for number in withdrawn:
+                for day in {str(line.get("date_comptabilise") or "")[:10] for line in lines if line["num_quittance"] == number}:
+                    if day:
+                        _undeclare_receipt(db, number, date.fromisoformat(day))
+            count, amount = len(to_declare), round(sum(line["montant"] for line in to_declare), 3)
+        else:
+            lines = [line for line in _expenses(db, compagnie, jour, False, payload.nature or None, pending_from=start) if not line["comptabilise"]]
+            ids = [line["num_dep"] for line in lines]
+            if ids:
+                db.execute(text(
+                    'UPDATE dbo."TDepense" SET "Comptabiliser" = \'O\', "Date_Comptabiliser" = :d '
+                    'WHERE TRIM("Typ_dep") = \'T\' AND num_dep = ANY(CAST(:ids AS int[])) AND COALESCE("Comptabiliser", \'N\') <> \'O\''
+                ), {"d": jour, "ids": ids})
+                for num_dep in ids:
+                    db.execute(text(
+                        'INSERT INTO dbo."TDepenseValide" (num_dep, jour, utilisateur, date_saisie) '
+                        "VALUES (:n, :j, :u, now() AT TIME ZONE 'Africa/Tunis') ON CONFLICT DO NOTHING"
+                    ), {"n": num_dep, "j": jour, "u": name})
+            count, amount = len(ids), round(sum(float(line["montant"] or 0) for line in lines), 3)
+        db.execute(text(
+            'INSERT INTO dbo."TJournalValide" (type_journal, jour, code_compagnie, lignes, montant, retirees, utilisateur, date_saisie) '
+            "VALUES (:t, :j, :c, :n, :m, :r, :u, now() AT TIME ZONE 'Africa/Tunis')"
+        ), {"t": kind, "j": jour, "c": compagnie, "n": count, "m": amount, "r": len(withdrawn), "u": name})
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise _fail(exc) from exc
+    return {"jour": jour.isoformat(), "declarees": count, "montant": amount, "retirees": len(withdrawn)}
