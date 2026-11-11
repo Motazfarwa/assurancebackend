@@ -23,6 +23,7 @@ import re
 import smtplib
 import ssl
 from email.message import EmailMessage
+import datetime as dt
 from datetime import date, timedelta
 from typing import Any
 from urllib.parse import quote
@@ -98,6 +99,15 @@ def _ensure(db: Session) -> None:
 class Tache(BaseModel):
     texte: str = Field(min_length=1, max_length=300)
     statut: str = Field(default="fait", pattern="^(fait|en_cours|a_faire)$")
+    # when the task was done: its day and time (HH:MM)
+    date: dt.date | None = None
+    heure: str | None = Field(default=None, pattern=r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
+
+
+def when(task: dict[str, Any]) -> str:
+    """'11/11 à 14:30' (the day and time the task was done), or ''."""
+    day = date.fromisoformat(task["date"]).strftime("%d/%m") if task.get("date") else ""
+    return " à ".join(part for part in (day, task.get("heure") or "") if part)
 
 
 class DemandeJour(BaseModel):
@@ -176,7 +186,7 @@ def report_text(journal: dict[str, Any], activity: dict[str, Any]) -> str:
     day = date.fromisoformat(journal["date_jour"]).strftime("%d/%m/%Y")
     lines = [f"📋 Journal du {day} — {journal['utilisateur']}"]
     for key, label in STATES.items():
-        tasks = [t["texte"] for t in journal["taches"] if t.get("statut") == key]
+        tasks = [t["texte"] + (f" ({when(t)})" if when(t) else "") for t in journal["taches"] if t.get("statut") == key]
         if tasks:
             lines.append(f"\n{'✅' if key == 'fait' else '⏳' if key == 'en_cours' else '📌'} {label} ({len(tasks)})")
             lines += [f"• {task}" for task in tasks]
@@ -216,7 +226,7 @@ def _report_html(journal: dict[str, Any], activity: dict[str, Any]) -> str:
     colors = {"fait": "#17705f", "en_cours": "#8a5a10", "a_faire": "#2a5d9c"}
     rows = "".join(
         f'<tr><td style="padding:6px 10px;color:{colors.get(t.get("statut"), "#233c4b")};font-weight:700;white-space:nowrap">{e(STATES.get(t.get("statut"), ""))}</td>'
-        f'<td style="padding:6px 10px">{e(t["texte"])}</td></tr>' for t in journal["taches"])
+        f'<td style="padding:6px 10px">{e(t["texte"])}</td><td style="padding:6px 10px;color:#587079;white-space:nowrap">{e(when(t))}</td></tr>' for t in journal["taches"])
     parts = [f'<h2 style="margin:0 0 4px;color:#173247">Journal du {day}</h2><p style="margin:0 0 14px;color:#587079">{e(journal["utilisateur"])}</p>',
              f'<table style="border-collapse:collapse;font-size:14px;border:1px solid #e3eaec">{rows}</table>' if rows else '<p>Aucune tâche saisie.</p>']
     if journal.get("demandes"):
@@ -318,7 +328,8 @@ def _save(db: Session, name: str, payload: JournalIn, validate: bool) -> None:
     current = _row(db, name, payload.date_jour)
     if current and current["Statut"] == "valide":
         raise HTTPException(status_code=409, detail="Ce journal est déjà validé : demandez à l’administrateur de le rouvrir pour le modifier.")
-    taches = json.dumps([{"texte": t.texte.strip(), "statut": t.statut} for t in payload.taches if t.texte.strip()], ensure_ascii=False)
+    taches = json.dumps([{"texte": t.texte.strip(), "statut": t.statut, "date": t.date.isoformat() if t.date else None, "heure": t.heure}
+                         for t in payload.taches if t.texte.strip()], ensure_ascii=False)
     demandes = json.dumps(_day_requests(payload.demandes), ensure_ascii=False)
     db.execute(text(f'''
         INSERT INTO dbo."TJournalEmploye" ("Nom_Utilisateur", "Date_Jour", "Taches", "Demandes", "Remarques", "Demain", "Statut", "Date_Maj", "Date_Validation")
