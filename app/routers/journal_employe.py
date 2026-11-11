@@ -9,9 +9,13 @@ WhatsApp:
 The administrator's number is set in the module (dbo."TParamApp"), else ADMIN_WHATSAPP_NUMBER.
 The report also counts what the employee did in the software that day (dbo."TMouchard").
 """
+import html
 import json
 import logging
 import re
+import smtplib
+import ssl
+from email.message import EmailMessage
 from datetime import date, timedelta
 from typing import Any
 from urllib.parse import quote
@@ -45,6 +49,7 @@ DDL = [
         PRIMARY KEY ("Nom_Utilisateur", "Date_Jour")
     )""",
     'CREATE TABLE IF NOT EXISTS dbo."TParamApp" ("Cle" varchar(50) PRIMARY KEY, "Valeur" text)',
+    'ALTER TABLE dbo."TJournalEmploye" ADD COLUMN IF NOT EXISTS "Envoi_Email" varchar(10)',
 ]
 NOW = "(now() AT TIME ZONE 'Africa/Tunis')"
 STATES = {"fait": "Fait", "en_cours": "En cours", "a_faire": "À faire"}
@@ -75,7 +80,8 @@ class JournalIn(BaseModel):
 
 
 class ParamsIn(BaseModel):
-    whatsapp_admin: str = Field(default="", max_length=30)
+    whatsapp_admin: str | None = Field(default=None, max_length=30)
+    email_admin: str | None = Field(default=None, max_length=120)
 
 
 def _today() -> date:
@@ -120,12 +126,12 @@ def _admin_number(db: Session) -> str:
 def _out(row: dict[str, Any] | None, name: str, day: date) -> dict[str, Any]:
     if not row:
         return {"utilisateur": name, "date_jour": day.isoformat(), "taches": [], "remarques": "", "demain": "", "statut": "vide",
-                "date_maj": None, "date_validation": None, "envoi": None, "vu_admin": None}
+                "date_maj": None, "date_validation": None, "envoi": None, "envoi_email": None, "vu_admin": None}
     taches = row["Taches"] if isinstance(row["Taches"], list) else json.loads(row["Taches"] or "[]")
     stamp = lambda value: value.isoformat(timespec="minutes") if value else None  # noqa: E731
     return {"utilisateur": row["Nom_Utilisateur"], "date_jour": row["Date_Jour"].isoformat(), "taches": taches,
             "remarques": row["Remarques"] or "", "demain": row["Demain"] or "", "statut": row["Statut"],
-            "date_maj": stamp(row["Date_Maj"]), "date_validation": stamp(row["Date_Validation"]), "envoi": row["Envoi"], "vu_admin": stamp(row["Vu_Admin"])}
+            "date_maj": stamp(row["Date_Maj"]), "date_validation": stamp(row["Date_Validation"]), "envoi": row["Envoi"], "envoi_email": row.get("Envoi_Email"), "vu_admin": stamp(row["Vu_Admin"])}
 
 
 def report_text(journal: dict[str, Any], activity: dict[str, Any]) -> str:
@@ -150,6 +156,60 @@ def report_text(journal: dict[str, Any], activity: dict[str, Any]) -> str:
         lines.append("\n🖥️ Aucune action enregistrée dans le logiciel ce jour.")
     report = "\n".join(lines)
     return report if len(report) <= 3500 else report[:3490].rstrip() + "\n…"
+
+
+def _report_email(db: Session) -> str:
+    """The address the submitted days are emailed to: set in the module, else JOURNAL_REPORT_EMAIL."""
+    return (_param(db, "email_admin") or settings.journal_report_email or "").strip()
+
+
+def _email_configured() -> bool:
+    return bool(settings.brevo_api_key or (settings.smtp_host and settings.smtp_user and settings.smtp_password))
+
+
+def _report_html(journal: dict[str, Any], activity: dict[str, Any]) -> str:
+    """The same report as an email page: tasks by state, remarks, the activity in the software."""
+    e = html.escape
+    day = date.fromisoformat(journal["date_jour"]).strftime("%d/%m/%Y")
+    colors = {"fait": "#17705f", "en_cours": "#8a5a10", "a_faire": "#2a5d9c"}
+    rows = "".join(
+        f'<tr><td style="padding:6px 10px;color:{colors.get(t.get("statut"), "#233c4b")};font-weight:700;white-space:nowrap">{e(STATES.get(t.get("statut"), ""))}</td>'
+        f'<td style="padding:6px 10px">{e(t["texte"])}</td></tr>' for t in journal["taches"])
+    parts = [f'<h2 style="margin:0 0 4px;color:#173247">Journal du {day}</h2><p style="margin:0 0 14px;color:#587079">{e(journal["utilisateur"])}</p>',
+             f'<table style="border-collapse:collapse;font-size:14px;border:1px solid #e3eaec">{rows}</table>' if rows else '<p>Aucune tâche saisie.</p>']
+    if journal["remarques"].strip():
+        parts.append(f'<p style="margin:14px 0 0"><b>Remarques :</b> {e(journal["remarques"].strip())}</p>')
+    if journal["demain"].strip():
+        parts.append(f'<p style="margin:8px 0 0"><b>Prévu ensuite :</b> {e(journal["demain"].strip())}</p>')
+    detail = ", ".join(f"{t['nombre']} {t['libelle']}" for t in activity["par_type"])
+    parts.append(f'<p style="margin:14px 0 0;color:#587079">Dans le logiciel : {activity["total"]} action(s){f" ({e(detail)})" if detail else ""}</p>')
+    return f'<div style="font-family:Arial,sans-serif;color:#233c4b;font-size:14px">{"".join(parts)}</div>'
+
+
+def _send_email(to: str, subject: str, body: str, body_html: str) -> None:
+    """Sends the report (raises on failure): the Brevo API when its key is set, else SMTP."""
+    sender = settings.smtp_from or settings.smtp_user or to
+    if settings.brevo_api_key:
+        answer = httpx.post("https://api.brevo.com/v3/smtp/email", timeout=20, headers={"api-key": settings.brevo_api_key, "accept": "application/json"},
+                            json={"sender": {"name": "Gestion Assurances", "email": sender}, "to": [{"email": to}], "subject": subject,
+                                  "textContent": body, "htmlContent": body_html})
+        if answer.status_code >= 300:
+            raise RuntimeError(f"Brevo {answer.status_code} : {answer.text[:200]}")
+        return
+    message = EmailMessage()
+    message["Subject"], message["From"], message["To"] = subject, f"Gestion Assurances <{sender}>", to
+    message.set_content(body)
+    message.add_alternative(body_html, subtype="html")
+    context = ssl.create_default_context()
+    if settings.smtp_port == 465:
+        with smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port, timeout=20, context=context) as server:
+            server.login(settings.smtp_user, settings.smtp_password)
+            server.send_message(message)
+    else:
+        with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=20) as server:
+            server.starttls(context=context)
+            server.login(settings.smtp_user, settings.smtp_password)
+            server.send_message(message)
 
 
 def _link(number: str, report: str) -> str | None:
@@ -216,7 +276,7 @@ def validate_journal(payload: JournalIn, user: dict[str, Any] = Depends(require_
     _ensure(db)
     _check_day(payload.date_jour)
     if not any(t.texte.strip() for t in payload.taches):
-        raise HTTPException(status_code=422, detail="Ajoutez au moins une tâche avant de valider la journée.")
+        raise HTTPException(status_code=422, detail="Ajoutez au moins une tâche avant de soumettre la journée.")
     name = str(user["sub"])
     _save(db, name, payload, validate=True)
     db.commit()
@@ -235,6 +295,24 @@ def validate_journal(payload: JournalIn, user: dict[str, Any] = Depends(require_
     db.commit()
     result["journal"]["envoi"] = "api" if sent else "lien" if number else None
     result["whatsapp"] = {"numero": bool(number), "envoye": sent, "erreur": error, "lien": None if sent else _link(number, result["rapport"])}
+    # The report is also emailed to the administrator.
+    to = _report_email(db)
+    mailed, mail_error = False, None
+    if to and _email_configured():
+        day = payload.date_jour.strftime("%d/%m/%Y")
+        try:
+            _send_email(to, f"Journal du {day} — {name}", result["rapport"], _report_html(result["journal"], result["activite"]))
+            mailed = True
+        except (OSError, smtplib.SMTPException, httpx.HTTPError, RuntimeError) as exc:
+            mail_error = f"L’email à l’administrateur n’a pas pu être envoyé ({str(exc)[:160]}) : le journal est bien enregistré."
+            log.warning("journal %s %s: email %s", name, payload.date_jour, exc)
+    elif to:
+        mail_error = "Envoi d’email non configuré sur le serveur : le journal est bien enregistré, l’administrateur le voit dans ce module."
+    db.execute(text('UPDATE dbo."TJournalEmploye" SET "Envoi_Email" = :e WHERE LOWER("Nom_Utilisateur") = LOWER(:u) AND "Date_Jour" = :d'),
+               {"e": "envoye" if mailed else "echec" if to else None, "u": name, "d": payload.date_jour})
+    db.commit()
+    result["journal"]["envoi_email"] = "envoye" if mailed else "echec" if to else None
+    result["email"] = {"destinataire": to, "envoye": mailed, "erreur": mail_error}
     return result
 
 
@@ -266,7 +344,8 @@ def team_day(day: date | None = Query(default=None, alias="date"), user: dict[st
     return {"date_jour": day.isoformat(), "items": items,
             "compteurs": {k: sum(1 for i in items if i["statut"] == k) for k in order},
             "whatsapp": {"numero": _param(db, "whatsapp_admin") or settings.admin_whatsapp_number or "",
-                         "api": bool(settings.whatsapp_token and settings.whatsapp_phone_number_id)}}
+                         "api": bool(settings.whatsapp_token and settings.whatsapp_phone_number_id)},
+            "email": {"adresse": _report_email(db), "configure": _email_configured()}}
 
 
 @router.get("/equipe/{name}")
@@ -294,7 +373,7 @@ def reopen(name: str, day: date, user: dict[str, Any] = Depends(require_current_
     """The employee may correct a validated day again (it must be validated again)."""
     _require_admin(user)
     _ensure(db)
-    db.execute(text('''UPDATE dbo."TJournalEmploye" SET "Statut" = 'brouillon', "Date_Validation" = NULL, "Envoi" = NULL, "Vu_Admin" = NULL
+    db.execute(text('''UPDATE dbo."TJournalEmploye" SET "Statut" = 'brouillon', "Date_Validation" = NULL, "Envoi" = NULL, "Envoi_Email" = NULL, "Vu_Admin" = NULL
                        WHERE LOWER("Nom_Utilisateur") = LOWER(:u) AND "Date_Jour" = :d'''), {"u": name.strip(), "d": day})
     db.commit()
     return _out(_row(db, name.strip(), day), name, day)
@@ -302,12 +381,19 @@ def reopen(name: str, day: date, user: dict[str, Any] = Depends(require_current_
 
 @router.put("/parametres")
 def set_params(payload: ParamsIn, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
-    """The administrator's WhatsApp number, which receives the reports."""
+    """The administrator's WhatsApp number and email address, which receive the reports (only those sent are changed)."""
     _require_admin(user)
     _ensure(db)
-    value = payload.whatsapp_admin.strip()
-    if value and len(re.sub(r"\D", "", value)) < 8:
-        raise HTTPException(status_code=422, detail="Numéro WhatsApp invalide : 8 chiffres (Tunisie) ou le numéro international.")
-    db.execute(text('INSERT INTO dbo."TParamApp" ("Cle", "Valeur") VALUES (\'whatsapp_admin\', :v) ON CONFLICT ("Cle") DO UPDATE SET "Valeur" = EXCLUDED."Valeur"'), {"v": value})
+    values = {}
+    if payload.whatsapp_admin is not None:
+        values["whatsapp_admin"] = payload.whatsapp_admin.strip()
+        if values["whatsapp_admin"] and len(re.sub(r"\D", "", values["whatsapp_admin"])) < 8:
+            raise HTTPException(status_code=422, detail="Numéro WhatsApp invalide : 8 chiffres (Tunisie) ou le numéro international.")
+    if payload.email_admin is not None:
+        values["email_admin"] = payload.email_admin.strip()
+        if values["email_admin"] and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", values["email_admin"]):
+            raise HTTPException(status_code=422, detail="Adresse email invalide.")
+    for key, value in values.items():
+        db.execute(text('INSERT INTO dbo."TParamApp" ("Cle", "Valeur") VALUES (:k, :v) ON CONFLICT ("Cle") DO UPDATE SET "Valeur" = EXCLUDED."Valeur"'), {"k": key, "v": value})
     db.commit()
-    return {"numero": value}
+    return {"numero": _param(db, "whatsapp_admin"), "email": _report_email(db)}

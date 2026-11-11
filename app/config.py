@@ -51,6 +51,16 @@ class Settings(BaseSettings):
     whatsapp_phone_number_id: str | None = None
     whatsapp_template: str | None = None
     whatsapp_template_language: str = "fr"
+    # "Journal du jour": each submitted day is also emailed to the administrator (JOURNAL_REPORT_EMAIL, or the address set in
+    # the module). Sending: SMTP (SMTP_HOST, SMTP_PORT 587 STARTTLS or 465 SSL, SMTP_USER, SMTP_PASSWORD, SMTP_FROM; for Gmail
+    # an "app password"), or the Brevo API (BREVO_API_KEY, over HTTPS, for hosts that block the SMTP ports).
+    journal_report_email: str = "farwamotez@gmail.com"
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_user: str | None = None
+    smtp_password: str | None = None
+    smtp_from: str | None = None
+    brevo_api_key: str | None = None
     # Predefined administrator, authenticated without the user table (override with ADMIN_PASSWORD).
     admin_username: str = "admin"
     admin_password: str = "123"
