@@ -305,6 +305,73 @@ def unpaid_statement(
     return {"items": items, "count": len(items), "limit": limit}
 
 
+RECOVERY_SQL = """
+WITH q AS MATERIALIZED (
+    SELECT TRIM(q.num_quittance) AS num_quittance, TRIM(q.num_int) AS num_int, TRIM(q.code_client) AS code_client,
+           COALESCE(q.montant_quittance, 0) AS montant, q.echeance
+    FROM "{schema}"."TQuittance" q
+    WHERE TRIM(q.type_quittance) = 'P' AND COALESCE(q.annule, 'N') <> 'O'
+      AND (:code = '' OR TRIM(q.code_client) = :code)
+),
+pol AS (
+    SELECT DISTINCT ON (TRIM(num_int)) TRIM(num_int) AS num_int, code_compagnie
+    FROM "{schema}"."TPolice" WHERE CAST(:compagnie AS integer) IS NOT NULL AND TRIM(num_int) IN (SELECT num_int FROM q)
+    ORDER BY TRIM(num_int), effet DESC NULLS LAST
+),
+scope AS MATERIALIZED (
+    -- the quittances of the statement's client / company / type of client
+    SELECT q.* FROM q
+    LEFT JOIN pol p ON p.num_int = q.num_int
+    WHERE (CAST(:compagnie AS integer) IS NULL OR p.code_compagnie = CAST(:compagnie AS integer))
+      AND (:type_client = '' OR q.code_client IN (SELECT TRIM(code_client) FROM "{schema}"."TClient" WHERE TRIM("Type_Client") = :type_client))
+),
+paid AS (
+    -- what the clients paid in the year (client settlements dated from 1 January to today; ristournes "R" left out)
+    SELECT COALESCE(SUM(d."Montant"), 0) AS encaissements
+    FROM "{schema}"."RDetRegCli" d JOIN "{schema}"."TRegCli" t ON t.num_reg_cli = d."Num_reg_cli"
+    WHERE t.date_reg_cli >= :debut AND t.date_reg_cli < :lendemain AND COALESCE(TRIM(t.type_reg_cli), '') <> 'R'
+      AND TRIM(d."Num_quitance") IN (SELECT num_quittance FROM scope)
+)
+SELECT (SELECT encaissements FROM paid) AS encaissements,
+       COALESCE(SUM(montant) FILTER (WHERE echeance >= :debut AND echeance < :lendemain), 0) AS primes_exigibles,
+       COUNT(*) FILTER (WHERE echeance >= :debut AND echeance < :lendemain) AS quittances_exigibles
+FROM scope
+"""
+
+
+@router.get("/taux-recouvrement")
+def recovery_rate(
+    code_client: str = Query(default="", max_length=8),
+    type_client: str = Query(default="", pattern="^(|P|S)$"),
+    code_compagnie: int | None = None,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Taux de recouvrement = encaissements de l'année en cours / primes de l'année en cours exigibles.
+    Encaissements: what the clients paid from 1 January to today (RDetRegCli lines of the TRegCli settlements of the year).
+    Primes exigibles: the premium quittances (type P, not cancelled) whose échéance falls from 1 January to today.
+    For the statement's client, company or type of client when given, else for the whole agency."""
+    try:
+        today = db.execute(text("SELECT (now() AT TIME ZONE 'Africa/Tunis')::date")).scalar()
+        start = today.replace(month=1, day=1)
+        # TRIM joins on legacy tables: hash joins only (nested loops take minutes over all the quittances).
+        db.execute(text("SET LOCAL enable_nestloop = off"))
+        row = db.execute(text(RECOVERY_SQL.format(schema=settings.db_schema)), {
+            "code": code_client.strip(), "type_client": type_client, "compagnie": code_compagnie,
+            "debut": datetime.combine(start, time.min), "lendemain": datetime.combine(today + timedelta(days=1), time.min),
+        }).mappings().one()
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Impossible de calculer le taux de recouvrement.") from exc
+    finally:
+        db.rollback()  # ends the read transaction, and with it the SET LOCAL
+    encaissements, primes = float(row["encaissements"] or 0), float(row["primes_exigibles"] or 0)
+    return {
+        "annee": today.year, "du": start.isoformat(), "au": today.isoformat(),
+        "encaissements": round(encaissements, 3), "primes_exigibles": round(primes, 3),
+        "quittances_exigibles": int(row["quittances_exigibles"] or 0),
+        "taux": round(encaissements / primes * 100, 2) if primes > 0.0005 else None,
+    }
+
+
 @router.get("/etat/liens/{code_client}")
 def unpaid_statement_links(code_client: str, db: Session = Depends(get_db)) -> dict[str, Any]:
     """The clients linked to a client, for its Etat des impayés: the client of its own "Lien" (code_locuteur, as stored
