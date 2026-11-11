@@ -8,6 +8,10 @@
   comptabilisées the same way.
 
 The journal number is the date (yyyymmdd), Validation stays 'N' (validated by the company later), like the legacy software.
+
+Encaissements validated one by one ("Valider" in the journal d'encaissement) are declared on the day of the validation;
+dbo."TEncaissementValide" keeps which client settlement lines were validated and when, so the feuille de caisse counts
+them on that day instead of the day the client paid (the client's payment itself, TRegCli, is not changed).
 """
 from datetime import date, timedelta
 from typing import Any
@@ -88,10 +92,10 @@ q AS MATERIALIZED (
     WHERE TRIM(q.type_quittance) = 'P' AND COALESCE(q.annule, 'N') <> 'O'
       AND (
         (COALESCE(q."Comptabiliser", 'N') <> 'O' AND TRIM(q.num_quittance) IN (SELECT num_quittance FROM paid))
-        OR (:done AND q."Date_Comptabiliser" >= :day AND q."Date_Comptabiliser" < :next_day)
+        OR (:done AND q."Date_Comptabiliser" >= :done_from AND q."Date_Comptabiliser" < :next_day)
         OR (:done AND EXISTS (
             SELECT 1 FROM dbo."RDetRegCli" d WHERE TRIM(d."Num_quitance") = TRIM(q.num_quittance)
-              AND d."Comptabiliser" = 'O' AND d."Date_Comptabiliser" >= :day AND d."Date_Comptabiliser" < :next_day))
+              AND d."Comptabiliser" = 'O' AND d."Date_Comptabiliser" >= :done_from AND d."Date_Comptabiliser" < :next_day))
       )
       AND (CAST(:numbers AS text[]) IS NULL OR TRIM(q.num_quittance) = ANY(CAST(:numbers AS text[])))
 ),
@@ -102,8 +106,9 @@ pol AS (
 ),
 reg AS (
     SELECT TRIM(d."Num_quitance") AS num_quittance,
-           SUM(CASE WHEN d."Comptabiliser" = 'O' AND d."Date_Comptabiliser" < :day THEN d."Montant" ELSE 0 END) AS declared_before,
-           SUM(CASE WHEN d."Comptabiliser" = 'O' AND d."Date_Comptabiliser" >= :day AND d."Date_Comptabiliser" < :next_day THEN d."Montant" ELSE 0 END) AS at_day,
+           SUM(CASE WHEN d."Comptabiliser" = 'O' AND d."Date_Comptabiliser" < :done_from THEN d."Montant" ELSE 0 END) AS declared_before,
+           SUM(CASE WHEN d."Comptabiliser" = 'O' AND d."Date_Comptabiliser" >= :done_from AND d."Date_Comptabiliser" < :next_day THEN d."Montant" ELSE 0 END) AS at_day,
+           MAX(CASE WHEN d."Comptabiliser" = 'O' AND d."Date_Comptabiliser" >= :done_from AND d."Date_Comptabiliser" < :next_day THEN d."Date_Comptabiliser" END) AS declared_on,
            SUM(CASE WHEN COALESCE(d."Comptabiliser", 'N') <> 'O' THEN d."Montant" ELSE 0 END) AS pending
     FROM dbo."RDetRegCli" d
     WHERE TRIM(d."Num_quitance") IN (SELECT TRIM(num_quittance) FROM q)
@@ -126,7 +131,10 @@ SELECT TRIM(q.num_quittance) AS num_quittance, TRIM(q.tc) AS tc, q.echeance, p.n
        (SELECT TRIM(c.nom_client) FROM dbo."TClient" c WHERE TRIM(c.code_client) = TRIM(q.code_client) LIMIT 1) AS assure,
        COALESCE(q.prime_net, 0) AS prime_net, COALESCE(q.frais_quit, 0) AS frais_quit, COALESCE(q.montant_quittance, 0) AS montant_quittance,
        COALESCE(q.solde_quittance, 0) AS solde_quittance, COALESCE(q.commission, 0) AS commission, COALESCE(q.timbre, 0) AS timbre,
-       COALESCE(q.cout_attestation, 0) AS frais, q."Comptabiliser" = 'O' AND q."Date_Comptabiliser" >= :day AND q."Date_Comptabiliser" < :next_day AS declared_today,
+       COALESCE(q.cout_attestation, 0) AS frais, q."Comptabiliser" = 'O' AND q."Date_Comptabiliser" >= :done_from AND q."Date_Comptabiliser" < :next_day AS declared_today,
+       COALESCE(r.declared_on, q."Date_Comptabiliser") AS date_comptabilise,
+       (SELECT MAX(TRIM(v."Utilisateur")) FROM dbo."TEncaissementValide" v WHERE TRIM(v."Num_quitance") = TRIM(q.num_quittance)
+          AND v."Date_Validation" >= :done_from AND v."Date_Validation" < :next_day) AS valide_par,
        COALESCE(r.declared_before, 0) AS declared_before, COALESCE(r.at_day, 0) AS at_day, COALESCE(r.pending, 0) AS pending
 FROM q
 JOIN pol p ON p.num_int = TRIM(q.num_int)
@@ -155,6 +163,8 @@ def _receipt(row: Any) -> dict[str, Any]:
         done, kind, amount = False, "A", item["pending"]
     else:
         done, kind, amount = False, "S", item["montant_quittance"] - item["declared_before"]
+    if not done:
+        item["date_comptabilise"] = None
     item.update({
         "comptabilise": done,
         "a_s": kind,
@@ -168,10 +178,14 @@ def _receipt(row: Any) -> dict[str, Any]:
 
 
 def _receipts(db: Session, compagnie: int | None, day: date, done: bool, numbers: list[str] | None = None,
-              regles: bool = False, reg_debut: date | None = None, reg_fin: date | None = None) -> list[dict[str, Any]]:
+              regles: bool = False, reg_debut: date | None = None, reg_fin: date | None = None,
+              done_from: date | None = None) -> list[dict[str, Any]]:
+    """The lines to declare on `day`, and with `done` those declared from `done_from` (default: that day) to `day`."""
+    _ensure_validated(db)
     rows = db.execute(
         text(RECEIPTS_SQL),
         {"compagnie": compagnie, "day": day, "next_day": day + timedelta(days=1), "done": done, "numbers": numbers,
+         "done_from": done_from or day,
          "excluded": EXCLUDED_COMPANIES, "regles": regles, "reg_debut": reg_debut, "reg_fin": reg_fin},
     ).mappings().all()
     return [_receipt(row) for row in rows]
@@ -185,6 +199,7 @@ def receipts_journal(
     regles: bool = Query(default=False, description="Only the receipts with a client settlement"),
     debut: date | None = Query(default=None, description="With fin: settled between the two dates"),
     fin: date | None = None,
+    periode: bool = Query(default=False, description="Declared lines of the half month of the date (1-15, 16-end), not only of the date"),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     if bool(debut) != bool(fin):
@@ -192,10 +207,85 @@ def receipts_journal(
     if debut and fin and fin < debut:
         raise HTTPException(status_code=422, detail="La date de fin précède la date de début.")
     try:
-        items = _receipts(db, compagnie, date_journal, comptabilises, regles=regles, reg_debut=debut, reg_fin=fin)
+        done_from = _period_start(date_journal) if periode else None
+        items = _receipts(db, compagnie, date_journal, comptabilises, regles=regles, reg_debut=debut, reg_fin=fin, done_from=done_from)
     except SQLAlchemyError as exc:
         raise _fail(exc) from exc
-    return {"items": items, "num_jeq": date_journal.strftime("%Y%m%d")}
+    return {"items": items, "num_jeq": date_journal.strftime("%Y%m%d"), "debut_periode": (done_from or date_journal).isoformat()}
+
+
+def _period_start(day: date) -> date:
+    """The journals are made on the 15th and at the end of the month: the period of a date starts on the 1st or the 16th."""
+    return day.replace(day=1 if day.day <= 15 else 16)
+
+
+VALIDATED_DDL = """
+CREATE TABLE IF NOT EXISTS dbo."TEncaissementValide" (
+    "Num_reg_cli" integer NOT NULL,
+    "Num_quitance" varchar(30) NOT NULL,
+    "Date_Validation" date NOT NULL,
+    "Montant" double precision,
+    "Utilisateur" varchar(50),
+    "Date_Saisie" timestamp,
+    PRIMARY KEY ("Num_reg_cli", "Num_quitance")
+)
+"""
+_validated_ready = False
+
+
+def _ensure_validated(db: Session) -> None:
+    global _validated_ready
+    if not _validated_ready:
+        db.execute(text(VALIDATED_DDL))
+        db.commit()
+        _validated_ready = True
+
+
+class ValiderEncaissement(BaseModel):
+    num_quittance: str = Field(min_length=1, max_length=30)
+
+
+@router.post("/encaissement/valider")
+def validate_receipt(payload: ValiderEncaissement, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Validates one encaissement on the day of the validation (agency time): its client settlement lines are declared
+    on that day (and the quittance when it is paid in full) and counted in that day's feuille de caisse."""
+    _ensure_validated(db)
+    number = payload.num_quittance.strip()
+    name = str(user.get("sub", ""))[:50]
+    try:
+        day = db.execute(text("SELECT (now() AT TIME ZONE 'Africa/Tunis')::date")).scalar()
+        db.execute(text("SELECT pg_advisory_xact_lock(hashtext('encaissement:' || :n))"), {"n": number})  # one validation at a time
+        lines = [line for line in _receipts(db, None, day, False, [number], regles=True) if not line["comptabilise"]]
+        if not lines:
+            raise HTTPException(status_code=409, detail=f"L’encaissement de la quittance {number} est déjà validé (ou n’a pas de règlement client à déclarer).")
+        line = lines[0]
+        if not line["paye"] and line["a_s"] != "A":
+            raise HTTPException(status_code=409, detail=f"Quittance {number} : le client n’a pas encore payé ce reste, il n’y a pas d’encaissement à valider.")
+        settlements = db.execute(text(
+            'SELECT d."Num_reg_cli" AS reg, COALESCE(d."Montant", 0) AS montant FROM dbo."RDetRegCli" d '
+            'WHERE TRIM(d."Num_quitance") = :n AND COALESCE(d."Comptabiliser", \'N\') <> \'O\''
+        ), {"n": number}).all()
+        params = {"d": day, "n": number}
+        if line["a_s"] == "S":
+            db.execute(text(
+                'UPDATE dbo."TQuittance" SET "Comptabiliser" = \'O\', "Date_Comptabiliser" = :d '
+                'WHERE TRIM(num_quittance) = :n AND COALESCE("Comptabiliser", \'N\') <> \'O\''
+            ), params)
+        db.execute(text(
+            'UPDATE dbo."RDetRegCli" SET "Comptabiliser" = \'O\', "Date_Comptabiliser" = :d '
+            'WHERE TRIM("Num_quitance") = :n AND COALESCE("Comptabiliser", \'N\') <> \'O\''
+        ), params)
+        for reg, montant in settlements:
+            db.execute(text(
+                'INSERT INTO dbo."TEncaissementValide" ("Num_reg_cli", "Num_quitance", "Date_Validation", "Montant", "Utilisateur", "Date_Saisie") '
+                "VALUES (:r, :n, :d, :m, :u, now() AT TIME ZONE 'Africa/Tunis') ON CONFLICT DO NOTHING"
+            ), {"r": reg, "n": number, "d": day, "m": montant, "u": name})
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise _fail(exc) from exc
+    return {"num_quittance": number, "date_validation": day.isoformat(), "montant": line["montant"], "a_s": line["a_s"],
+            "code_compagnie": line["code_compagnie"], "valide_par": name, "lignes_reglement": len(settlements)}
 
 
 class ComptabiliserQuittances(BaseModel):
@@ -374,7 +464,11 @@ def received_gaps(
 # line per quittance paid; the 'R' moins perçus are not cash): primes = what the clients paid, and the commission of a
 # quittance on the line that settles it (Acompte_Solde 'S'; an acompte carries none). Without dates: every day.
 CASH_RECEIPTS_SQL = """
-WITH r AS MATERIALIZED (
+WITH v AS MATERIALIZED (
+    -- the settlement lines validated in the journal d'encaissement: counted on the day of their validation
+    SELECT "Num_reg_cli" AS num_reg_cli, TRIM("Num_quitance") AS num_quittance, "Date_Validation" AS jour FROM dbo."TEncaissementValide"
+),
+r AS MATERIALIZED (
     SELECT r.num_reg_cli, r.date_reg_cli::date AS jour
     FROM dbo."TRegCli" r
     WHERE COALESCE(TRIM(r.type_reg_cli), '') <> 'R'
@@ -385,6 +479,14 @@ lines AS MATERIALIZED (
     SELECT r.jour, TRIM(d."Num_quitance") AS num_quittance, COALESCE(d."Montant", 0) AS montant,
            COALESCE(NULLIF(TRIM(d."Acompte_Solde"), ''), 'S') = 'S' AS settles
     FROM r JOIN dbo."RDetRegCli" d ON d."Num_reg_cli" = r.num_reg_cli
+    WHERE NOT EXISTS (SELECT 1 FROM v WHERE v.num_reg_cli = d."Num_reg_cli" AND v.num_quittance = TRIM(d."Num_quitance"))
+    UNION ALL
+    SELECT v.jour, v.num_quittance, COALESCE(d."Montant", 0) AS montant,
+           COALESCE(NULLIF(TRIM(d."Acompte_Solde"), ''), 'S') = 'S' AS settles
+    FROM v JOIN dbo."RDetRegCli" d ON d."Num_reg_cli" = v.num_reg_cli AND TRIM(d."Num_quitance") = v.num_quittance
+    JOIN dbo."TRegCli" t ON t.num_reg_cli = v.num_reg_cli AND COALESCE(TRIM(t.type_reg_cli), '') <> 'R'
+    WHERE (CAST(:debut AS date) IS NULL OR v.jour >= CAST(:debut AS date))
+      AND (CAST(:fin AS date) IS NULL OR v.jour <= CAST(:fin AS date))
 ),
 q AS (
     SELECT DISTINCT ON (TRIM(q.num_quittance)) TRIM(q.num_quittance) AS num_quittance, TRIM(q.num_int) AS num_int,
@@ -443,6 +545,7 @@ def cash_sheet(
     if debut and fin and fin < debut:
         raise HTTPException(status_code=422, detail="La date de fin précède la date de début.")
     params = {"compagnie": compagnie, "debut": debut, "fin": fin}
+    _ensure_validated(db)
     try:
         # The legacy tables have no statistics-friendly keys (TRIM joins): the planner underestimates them and picks
         # nested loops (minutes over all dates). Hash joins only, for this read-only transaction.
