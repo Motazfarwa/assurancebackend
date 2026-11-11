@@ -253,6 +253,16 @@ CASH_VALIDATED_DDL = [
         date_saisie timestamp NOT NULL,
         PRIMARY KEY (code_compagnie, jour)
     )""",
+    # The ticks of the journal d'encaissement of a day (every line is ticked until it is unticked): kept so the journal
+    # of that day shows the same choice when it is opened again, and used by "Valider" on the feuille of that day.
+    """CREATE TABLE IF NOT EXISTS dbo."TJournalChoix" (
+        jour date NOT NULL,
+        num_quittance varchar(30) NOT NULL,
+        coche boolean NOT NULL,
+        utilisateur varchar(50),
+        date_maj timestamp NOT NULL,
+        PRIMARY KEY (jour, num_quittance)
+    )""",
 ]
 _validated_ready = False
 
@@ -291,6 +301,67 @@ def _declare_receipt(db: Session, line: dict[str, Any], day: date, name: str) ->
             "VALUES (:r, :n, :d, :m, :u, now() AT TIME ZONE 'Africa/Tunis') ON CONFLICT DO NOTHING"
         ), {"r": reg, "n": number, "d": day, "m": montant, "u": name})
     return len(settlements)
+
+
+def _undeclare_receipt(db: Session, number: str, day: date) -> int:
+    """Takes a quittance out of the journal of `day` (it was declared on that day, then unticked): its settlement lines
+    declared on that day are to declare again, and so is the quittance. Returns the number of settlement lines."""
+    params = {"n": number, "d": day}
+    count = db.execute(text(
+        "UPDATE dbo.\"RDetRegCli\" SET \"Comptabiliser\" = 'N', \"Date_Comptabiliser\" = NULL "
+        "WHERE TRIM(\"Num_quitance\") = :n AND \"Comptabiliser\" = 'O' AND CAST(\"Date_Comptabiliser\" AS date) = :d"
+    ), params).rowcount
+    db.execute(text(
+        "UPDATE dbo.\"TQuittance\" SET \"Comptabiliser\" = 'N', \"Date_Comptabiliser\" = NULL "
+        "WHERE TRIM(num_quittance) = :n AND \"Comptabiliser\" = 'O' AND CAST(\"Date_Comptabiliser\" AS date) = :d"
+    ), params)
+    db.execute(text('DELETE FROM dbo."TEncaissementValide" WHERE TRIM("Num_quitance") = :n AND "Date_Validation" = :d'), params)
+    return count
+
+
+def _unticked(db: Session, day: date) -> set[str]:
+    rows = db.execute(text('SELECT TRIM(num_quittance) FROM dbo."TJournalChoix" WHERE jour = :d AND NOT coche'), {"d": day}).scalars()
+    return set(rows)
+
+
+@router.get("/encaissement/choix")
+def receipt_choices(date_journal: date = Query(..., alias="date"), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """The ticks kept for the journal d'encaissement of the day: {num_quittance: ticked}; a quittance absent is ticked."""
+    _ensure_validated(db)
+    try:
+        rows = db.execute(text('SELECT TRIM(num_quittance) AS n, coche FROM dbo."TJournalChoix" WHERE jour = :d'), {"d": date_journal}).all()
+    except SQLAlchemyError as exc:
+        raise _fail(exc) from exc
+    return {"choix": {n: bool(coche) for n, coche in rows}}
+
+
+class Choix(BaseModel):
+    num_quittance: str = Field(min_length=1, max_length=30)
+    coche: bool
+
+
+class ChoixJournal(BaseModel):
+    date: date
+    items: list[Choix] = Field(min_length=1, max_length=5000)
+
+
+@router.put("/encaissement/choix")
+def save_receipt_choices(payload: ChoixJournal, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Keeps ticks of the journal d'encaissement of the day (the last one wins)."""
+    _ensure_validated(db)
+    name = str(user.get("sub", ""))[:50]
+    try:
+        for item in payload.items:
+            db.execute(text(
+                'INSERT INTO dbo."TJournalChoix" (jour, num_quittance, coche, utilisateur, date_maj) '
+                "VALUES (:d, :n, :c, :u, now() AT TIME ZONE 'Africa/Tunis') "
+                'ON CONFLICT (jour, num_quittance) DO UPDATE SET coche = EXCLUDED.coche, utilisateur = EXCLUDED.utilisateur, date_maj = EXCLUDED.date_maj'
+            ), {"d": payload.date, "n": item.num_quittance.strip(), "c": item.coche, "u": name})
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise _fail(exc) from exc
+    return {"enregistres": len(payload.items)}
 
 
 class ValiderEncaissement(BaseModel):
@@ -1278,8 +1349,17 @@ def validate_cash_sheet(payload: ValiderFeuille, user: dict[str, Any] = Depends(
             line for line in _receipts(db, payload.compagnie, jour, False, numbers, regles=True)
             if not line["comptabilise"] and (line["paye"] or line["a_s"] == "A")
         ]
+        # The quittances unticked in the journal of the day are left out; those it had already declared on that day are
+        # taken out of it (to declare again).
+        unticked = _unticked(db, jour)
+        receipts = [line for line in receipts if line["num_quittance"] not in unticked]
         for line in receipts:
             _declare_receipt(db, line, jour, name)
+        withdrawn = [line["num_quittance"] for line in _receipts(db, payload.compagnie, jour, True, sorted(unticked), regles=True)
+                     if line["comptabilise"] and line["num_quittance"] in unticked
+                     and str(line.get("date_comptabilise") or "")[:10] == jour.isoformat()] if unticked else []
+        for number in withdrawn:
+            _undeclare_receipt(db, number, jour)
         ids = sorted(set(payload.depenses)) if payload.depenses is not None else None
         expenses = [] if ids == [] else [line for line in _expenses(db, payload.compagnie, jour, False, None, ids) if not line["comptabilise"]]
         if expenses:
@@ -1303,4 +1383,4 @@ def validate_cash_sheet(payload: ValiderFeuille, user: dict[str, Any] = Depends(
     except SQLAlchemyError as exc:
         db.rollback()
         raise _fail(exc) from exc
-    return {"validation": validation}
+    return {"validation": validation, "retirees": len(withdrawn)}
