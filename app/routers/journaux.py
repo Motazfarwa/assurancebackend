@@ -503,29 +503,17 @@ def received_gaps(
 # line per quittance paid; the 'R' moins perçus are not cash): primes = what the clients paid, and the commission of a
 # quittance on the line that settles it (Acompte_Solde 'S'; an acompte carries none). Without dates: every day.
 CASH_RECEIPTS_SQL = """
-WITH v AS MATERIALIZED (
-    -- the settlement lines validated in the journal d'encaissement: counted on the day of their validation
-    SELECT "Num_reg_cli" AS num_reg_cli, TRIM("Num_quitance") AS num_quittance, "Date_Validation" AS jour FROM dbo."TEncaissementValide"
-),
-r AS MATERIALIZED (
-    SELECT r.num_reg_cli, r.date_reg_cli::date AS jour
-    FROM dbo."TRegCli" r
-    WHERE COALESCE(TRIM(r.type_reg_cli), '') <> 'R'
-      AND (CAST(:debut AS date) IS NULL OR r.date_reg_cli >= CAST(:debut AS date))
-      AND (CAST(:fin AS date) IS NULL OR r.date_reg_cli < CAST(:fin AS date) + 1)
-),
-lines AS MATERIALIZED (
-    SELECT r.jour, TRIM(d."Num_quitance") AS num_quittance, COALESCE(d."Montant", 0) AS montant,
+-- The feuille de caisse of a day is what the journal d'encaissement declared that day (as the legacy feuille): the client
+-- settlement lines comptabilisées on that date (RDetRegCli.Date_Comptabiliser), whatever the day the client paid.
+-- "Valider" on a feuille declares the lines still to declare on its date, so they are counted here too.
+WITH lines AS MATERIALIZED (
+    SELECT d."Date_Comptabiliser"::date AS jour, TRIM(d."Num_quitance") AS num_quittance, COALESCE(d."Montant", 0) AS montant,
            COALESCE(NULLIF(TRIM(d."Acompte_Solde"), ''), 'S') = 'S' AS settles
-    FROM r JOIN dbo."RDetRegCli" d ON d."Num_reg_cli" = r.num_reg_cli
-    WHERE NOT EXISTS (SELECT 1 FROM v WHERE v.num_reg_cli = d."Num_reg_cli" AND v.num_quittance = TRIM(d."Num_quitance"))
-    UNION ALL
-    SELECT v.jour, v.num_quittance, COALESCE(d."Montant", 0) AS montant,
-           COALESCE(NULLIF(TRIM(d."Acompte_Solde"), ''), 'S') = 'S' AS settles
-    FROM v JOIN dbo."RDetRegCli" d ON d."Num_reg_cli" = v.num_reg_cli AND TRIM(d."Num_quitance") = v.num_quittance
-    JOIN dbo."TRegCli" t ON t.num_reg_cli = v.num_reg_cli AND COALESCE(TRIM(t.type_reg_cli), '') <> 'R'
-    WHERE (CAST(:debut AS date) IS NULL OR v.jour >= CAST(:debut AS date))
-      AND (CAST(:fin AS date) IS NULL OR v.jour <= CAST(:fin AS date))
+    FROM dbo."RDetRegCli" d JOIN dbo."TRegCli" t ON t.num_reg_cli = d."Num_reg_cli"
+    WHERE d."Comptabiliser" = 'O' AND d."Date_Comptabiliser" IS NOT NULL
+      AND COALESCE(TRIM(t.type_reg_cli), '') <> 'R'
+      AND (CAST(:debut AS date) IS NULL OR d."Date_Comptabiliser" >= CAST(:debut AS date))
+      AND (CAST(:fin AS date) IS NULL OR d."Date_Comptabiliser" < CAST(:fin AS date) + 1)
 ),
 q AS (
     SELECT DISTINCT ON (TRIM(q.num_quittance)) TRIM(q.num_quittance) AS num_quittance, TRIM(q.num_int) AS num_int,
@@ -546,31 +534,21 @@ GROUP BY l.jour ORDER BY l.jour
 """
 
 CASH_EXPENSES_SQL = """
+-- The claims and rebates comptabilisées that day in the journal de dépense (TDepense.Date_Comptabiliser), whatever the
+-- day they were paid; "Valider" on a feuille comptabilises the ones still to declare on its date.
 WITH pol AS (
     SELECT DISTINCT ON (TRIM(num_police)) TRIM(num_police) AS num_police, code_compagnie
     FROM dbo."TPolice" ORDER BY TRIM(num_police), effet DESC NULLS LAST
 ), d AS MATERIALIZED (
-    -- the claims and rebates paid that day (date of the dépense), like the client settlements
-    SELECT d.num_dep, TRIM(t."Nat_quit") AS nature, d.date_dep::date AS jour, d.date_dep, COALESCE(d.mont_dep, 0) AS montant,
+    SELECT d.num_dep, TRIM(t."Nat_quit") AS nature, d."Date_Comptabiliser"::date AS jour, d.date_dep, COALESCE(d.mont_dep, 0) AS montant,
            COALESCE(NULLIF(TRIM(d.sinistre), ''), TRIM(d.num_quittance)) AS numero, TRIM(d.num_quittance) AS num_quittance
     FROM dbo."TDepense" d
     JOIN dbo.ttype_dep t ON TRIM(t.code_type) = TRIM(d.code_type)
     JOIN pol p ON p.num_police = TRIM(d.num_police)
     WHERE p.code_compagnie = :compagnie AND TRIM(d."Typ_dep") = 'T' AND TRIM(t."Nat_quit") IN ('S', 'R')
-      AND NOT EXISTS (SELECT 1 FROM dbo."TDepenseValide" v WHERE v.num_dep = d.num_dep)
-      AND (CAST(:debut AS date) IS NULL OR d.date_dep >= CAST(:debut AS date))
-      AND (CAST(:fin AS date) IS NULL OR d.date_dep < CAST(:fin AS date) + 1)
-    UNION ALL
-    -- the ones comptabilisées by the validation of a feuille de caisse: counted on the day of that feuille
-    SELECT d.num_dep, TRIM(t."Nat_quit"), v.jour, d.date_dep, COALESCE(d.mont_dep, 0),
-           COALESCE(NULLIF(TRIM(d.sinistre), ''), TRIM(d.num_quittance)), TRIM(d.num_quittance)
-    FROM dbo."TDepenseValide" v
-    JOIN dbo."TDepense" d ON d.num_dep = v.num_dep
-    JOIN dbo.ttype_dep t ON TRIM(t.code_type) = TRIM(d.code_type)
-    JOIN pol p ON p.num_police = TRIM(d.num_police)
-    WHERE p.code_compagnie = :compagnie
-      AND (CAST(:debut AS date) IS NULL OR v.jour >= CAST(:debut AS date))
-      AND (CAST(:fin AS date) IS NULL OR v.jour <= CAST(:fin AS date))
+      AND d."Comptabiliser" = 'O' AND d."Date_Comptabiliser" IS NOT NULL
+      AND (CAST(:debut AS date) IS NULL OR d."Date_Comptabiliser" >= CAST(:debut AS date))
+      AND (CAST(:fin AS date) IS NULL OR d."Date_Comptabiliser" < CAST(:fin AS date) + 1)
 ), rebated AS (
     -- D.Com: on a rebate, the commission of the rebated receipt
     SELECT TRIM(q.num_quittance) AS num_quittance, MAX(ABS(COALESCE(q.commission, 0))) AS d_com
