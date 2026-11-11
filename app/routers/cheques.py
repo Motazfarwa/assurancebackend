@@ -6,6 +6,8 @@ it pays in RDetRegCli, and their balance (TQuittance.solde_quittance) goes down,
 """
 import json
 import re
+import unicodedata
+from difflib import SequenceMatcher
 from datetime import date, datetime
 from typing import Any, Literal
 
@@ -245,6 +247,57 @@ def client_overview(code_client: str, exclude_nump: str | None = Query(default=N
         {"c": code_client.strip()},
     ).mappings().all()
     return {"client": _plain(client), "quittances": _open_quittances(db, code_client, exclude_nump), "pieces": [_plain(row) for row in pieces]}
+
+
+# ---------------------------------------------------------------------------------------------
+# The client who pays a scanned cheque: its account holder, found among the existing clients
+# ---------------------------------------------------------------------------------------------
+# The bank prints the holder's name its own way ("CHIKHROUHOU" for the client "CHEIKHROUHOU", "MED" for "MOHAMED"): the
+# names are compared word by word, in any order, allowing a letter or two of difference. Only existing clients are proposed;
+# one is chosen only when it is the only client whose name has exactly the words of the holder.
+_NAME_ALIASES = {"MED": "MOHAMED", "MHD": "MOHAMED", "MOHAMMED": "MOHAMED", "MOHAMAD": "MOHAMED", "MOHAMMAD": "MOHAMED", "MUHAMMAD": "MOHAMED"}
+_NAME_TITLES = {"MR", "MME", "MLLE", "MONSIEUR", "MADAME", "STE"}
+_SAME_WORD = 0.85
+
+
+def _name_words(value: str | None) -> list[str]:
+    folded = unicodedata.normalize("NFD", value or "").encode("ascii", "ignore").decode().upper()
+    words = [word for word in re.split(r"[^A-Z]+", folded) if len(word) >= 2 and word not in _NAME_TITLES]
+    return [_NAME_ALIASES.get(word, word) for word in words]
+
+
+def _word_likeness(a: str, b: str) -> float:
+    if a == b:
+        return 1.0
+    return SequenceMatcher(None, a, b).ratio() if min(len(a), len(b)) >= 4 else 0.0
+
+
+@router.get("/tireur")
+def find_drawer(nom: str = Query(min_length=3, max_length=80), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """{ client: the client of this account holder or null, candidats: the existing clients whose name is close }."""
+    wanted = _name_words(nom)
+    if len(wanted) < 2:
+        return {"nom": nom, "client": None, "candidats": []}
+    rows = db.execute(text("""
+        SELECT TRIM(code_client) AS code, COALESCE(NULLIF(TRIM(CONCAT_WS(' ', TRIM("Nom"), TRIM("Prenom"))), ''), TRIM(nom_client)) AS nom
+        FROM dbo."TClient" WHERE TRIM(COALESCE(code_client, '')) <> ''
+    """)).all()
+    candidates = []
+    for code, name in rows:
+        have = _name_words(name)
+        if not have:
+            continue
+        scores = [max(_word_likeness(word, other) for other in have) for word in wanted]
+        if min(scores) < _SAME_WORD:
+            continue
+        complete = len(have) == len(wanted) and all(max(_word_likeness(other, word) for word in wanted) >= _SAME_WORD for other in have)
+        candidates.append({"code_client": code, "nom": name, "score": round(sum(scores) / len(scores), 3),
+                           "complet": complete, "exact": sorted(have) == sorted(wanted)})
+    candidates.sort(key=lambda item: (not item["exact"], not item["complet"], -item["score"]))
+    complete = [item for item in candidates if item["complet"]]
+    exact = [item for item in complete if item["exact"]]
+    chosen = exact[0] if len(exact) == 1 else complete[0] if not exact and len(complete) == 1 else None
+    return {"nom": nom, "client": chosen, "candidats": candidates[:6]}
 
 
 @router.get("/piece")
