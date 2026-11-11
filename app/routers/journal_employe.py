@@ -502,10 +502,21 @@ def _staff(db: Session) -> list[dict[str, str]]:
     return [dict(row) for row in rows]
 
 
-def _request_out(row: dict[str, Any], assignments: list[dict[str, Any]]) -> dict[str, Any]:
+def _client_names(db: Session, rows: list[dict[str, Any]]) -> dict[str, str]:
+    """The name of each client code entered on the requests (dbo."TClient"), to show it and search by name."""
+    codes = sorted({(r["Client"] or "").strip() for r in rows if (r["Client"] or "").strip()})
+    if not codes:
+        return {}
+    found = db.execute(text("SELECT TRIM(code_client) AS code, MIN(TRIM(COALESCE(nom_client, ''))) AS nom FROM dbo.\"TClient\" "
+                            "WHERE TRIM(code_client) = ANY(:c) GROUP BY 1"), {"c": codes}).mappings().all()
+    return {f["code"]: f["nom"] for f in found if f["nom"]}
+
+
+def _request_out(row: dict[str, Any], assignments: list[dict[str, Any]], names: dict[str, str] | None = None) -> dict[str, Any]:
     stamp = lambda value: value.isoformat(timespec="minutes") if value else None  # noqa: E731
     canaux = row["Canaux"] if isinstance(row["Canaux"], list) else json.loads(row["Canaux"] or "[]")
-    return {"id": row["Id"], "client": row["Client"] or "", "canaux": canaux, "demande": row["Demande"], "observation": row["Observation"] or "",
+    client = (row["Client"] or "").strip()
+    return {"id": row["Id"], "client": client, "client_nom": (names or {}).get(client, ""), "canaux": canaux, "demande": row["Demande"], "observation": row["Observation"] or "",
             "cible_type": row["Cible_Type"], "cible": row["Cible"] or "", "cree_par": row["Cree_Par"], "date_creation": stamp(row["Date_Creation"]),
             "affectations": [{"utilisateur": a["Nom_Utilisateur"], "statut": a["Statut"], "reponse": a["Reponse"] or "",
                               "date_traitement": stamp(a["Date_Traitement"])} for a in assignments]}
@@ -532,7 +543,8 @@ def list_requests(jours: int = Query(default=30, ge=1, le=365), user: dict[str, 
     if ids:
         for a in db.execute(text('SELECT * FROM dbo."TDemandeAffectation" WHERE "Demande_Id" = ANY(:ids) ORDER BY LOWER("Nom_Utilisateur")'), {"ids": ids}).mappings():
             assignments.setdefault(a["Demande_Id"], []).append(dict(a))
-    return {"items": [_request_out(dict(r), assignments.get(r["Id"], [])) for r in rows]}
+    names = _client_names(db, [dict(r) for r in rows])
+    return {"items": [_request_out(dict(r), assignments.get(r["Id"], []), names) for r in rows]}
 
 
 @router.post("/demandes")
@@ -566,7 +578,7 @@ def create_request(payload: DemandeIn, user: dict[str, Any] = Depends(require_cu
     db.commit()
     row = db.execute(text('SELECT * FROM dbo."TDemandeClient" WHERE "Id" = :i'), {"i": new_id}).mappings().first()
     assignments = db.execute(text('SELECT * FROM dbo."TDemandeAffectation" WHERE "Demande_Id" = :i ORDER BY LOWER("Nom_Utilisateur")'), {"i": new_id}).mappings().all()
-    return _request_out(dict(row), [dict(a) for a in assignments])
+    return _request_out(dict(row), [dict(a) for a in assignments], _client_names(db, [dict(row)]))
 
 
 @router.delete("/demandes/{request_id}")
@@ -589,8 +601,9 @@ def my_requests(user: dict[str, Any] = Depends(require_current_user), db: Sessio
         WHERE LOWER(a."Nom_Utilisateur") = LOWER(:u) AND (a."Statut" <> \'traitee\' OR a."Date_Traitement" >= {NOW} - INTERVAL \'7 days\')
         ORDER BY a."Statut" = \'traitee\', d."Id" DESC'''), {"u": str(user["sub"])}).mappings().all()
     items = []
+    names = _client_names(db, [dict(r) for r in rows])
     for r in rows:
-        out = _request_out(dict(r), [])
+        out = _request_out(dict(r), [], names)
         out.pop("affectations")
         out.update({"statut": r["Statut"], "reponse": r["Reponse"] or "",
                     "date_traitement": r["Date_Traitement"].isoformat(timespec="minutes") if r["Date_Traitement"] else None})

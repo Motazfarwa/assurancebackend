@@ -4,7 +4,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import MetaData, Table, text, update
+from sqlalchemy import MetaData, Table, func, text, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -35,6 +35,22 @@ class PoliceUpdate(BaseModel):
     prime_net: float | None = None
     commission: float | None = None
     prime_total: float | None = None
+    # The other fields of the "Gestion des polices" window (Modifier).
+    date_creation: datetime | None = None
+    heure_effet: datetime | None = None
+    date_mvt: datetime | None = None
+    renouvelable: bool | None = None
+    participation: bool | None = None
+    tous_risque: bool | None = None
+    hors_taxe: bool | None = None
+    neuf: float | None = None
+    venale: float | None = None
+
+
+# API field -> TPolice column (mixed case, or an O/N flag).
+POLICE_COLUMNS = {"heure_effet": "Heure_Effet", "date_mvt": "Date_Mvt", "renouvelable": "Renouv_An", "participation": "Participation",
+                  "tous_risque": "TousRisque", "hors_taxe": "HorsTaxe", "garantie": "Garantie", "franchise": "Franchise"}
+POLICE_FLAGS = {"renouvelable", "participation", "tous_risque", "hors_taxe"}
 
 
 class QuittanceUpdate(BaseModel):
@@ -71,7 +87,7 @@ def _update_row(db: Session, table_name: str, key_column: str, key_value: str, v
         missing = [name for name in columns if name not in table.c]
         if missing:
             raise HTTPException(status_code=503, detail=f"Colonnes absentes de {settings.db_schema}.{table_name} : {', '.join(missing)}.")
-        result = db.execute(update(table).where(table.c[key_column] == key_value).values(**columns))
+        result = db.execute(update(table).where(func.trim(table.c[key_column]) == key_value.strip()).values(**columns))
         if result.rowcount == 0:
             db.rollback()
             raise HTTPException(status_code=404, detail="Enregistrement introuvable.")
@@ -96,7 +112,12 @@ def _employee_commission_only(db: Session, user: dict[str, Any], table_name: str
 def update_police(num_int: str, payload: PoliceUpdate, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, str]:
     values = payload.model_dump(exclude_unset=True)
     _employee_commission_only(db, user, "TPolice", "num_int", num_int, values)
-    _update_row(db, "TPolice", "num_int", num_int, values)
+    values = {key: (None if value is None else "O" if value else "N") if key in POLICE_FLAGS else value for key, value in values.items()}
+    if values.get("etat"):
+        values["etat"] = values["etat"].strip().upper()[:2]
+    # Who changed the policy, and when (as the legacy software does).
+    values.update({"Update_User": str(user.get("sub") or "")[:20], "Update_Date": datetime.now()})
+    _update_row(db, "TPolice", "num_int", num_int.strip(), values, POLICE_COLUMNS)
     return {"num_int": num_int}
 
 
