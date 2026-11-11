@@ -42,6 +42,15 @@ class Settings(BaseSettings):
     azure_vision_endpoint: str | None = None
     azure_vision_key: str | None = None
     assistant_model: str = "claude-opus-5-5"
+    # "Journal du jour": the reports of the employees go to the administrator's WhatsApp. ADMIN_WHATSAPP_NUMBER is the
+    # default number (the administrator can set it in the module). WhatsApp Business Cloud API (optional, Meta): with
+    # WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID the server sends the report itself; WHATSAPP_TEMPLATE is an approved
+    # template with one body parameter. Without them, the employee sends the written report with a wa.me link.
+    admin_whatsapp_number: str | None = None
+    whatsapp_token: str | None = None
+    whatsapp_phone_number_id: str | None = None
+    whatsapp_template: str | None = None
+    whatsapp_template_language: str = "fr"
     # Predefined administrator, authenticated without the user table (override with ADMIN_PASSWORD).
     admin_username: str = "admin"
     admin_password: str = "123"

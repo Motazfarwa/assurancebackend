@@ -1,0 +1,313 @@
+"""Journal du jour: each employee writes down what they did in the day; the administrator follows every employee's days.
+
+An employee keeps one journal per day (dbo."TJournalEmploye", key: user + day): the tasks with their state (fait, en cours,
+à faire), remarks and what is planned next. "Valider" locks the day and sends a short report to the administrator's
+WhatsApp:
+ - through the WhatsApp Business Cloud API when WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID are set on the server
+   (WHATSAPP_TEMPLATE: an approved template with one body parameter, needed outside the 24 h window of Meta);
+ - otherwise a wa.me link is returned: it opens WhatsApp with the report written, the employee only presses "Envoyer".
+The administrator's number is set in the module (dbo."TParamApp"), else ADMIN_WHATSAPP_NUMBER.
+The report also counts what the employee did in the software that day (dbo."TMouchard").
+"""
+import json
+import logging
+import re
+from datetime import date, timedelta
+from typing import Any
+from urllib.parse import quote
+
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from app.auth import require_current_user
+from app.config import settings
+from app.database import get_db
+from app.routers.access import is_admin
+
+log = logging.getLogger("app.journal")
+router = APIRouter(prefix="/api/journal-employe", tags=["Journal du jour"])
+
+DDL = [
+    """CREATE TABLE IF NOT EXISTS dbo."TJournalEmploye" (
+        "Nom_Utilisateur" varchar(50) NOT NULL,
+        "Date_Jour" date NOT NULL,
+        "Taches" jsonb NOT NULL DEFAULT '[]'::jsonb,
+        "Remarques" text,
+        "Demain" text,
+        "Statut" varchar(10) NOT NULL DEFAULT 'brouillon',
+        "Date_Maj" timestamp,
+        "Date_Validation" timestamp,
+        "Envoi" varchar(10),
+        "Vu_Admin" timestamp,
+        PRIMARY KEY ("Nom_Utilisateur", "Date_Jour")
+    )""",
+    'CREATE TABLE IF NOT EXISTS dbo."TParamApp" ("Cle" varchar(50) PRIMARY KEY, "Valeur" text)',
+]
+NOW = "(now() AT TIME ZONE 'Africa/Tunis')"
+STATES = {"fait": "Fait", "en_cours": "En cours", "a_faire": "À faire"}
+ACTIONS = {"Ajout": "ajouts", "Modification": "modifications", "Suppresion": "suppressions", "Impression": "impressions",
+           "Consultation": "consultations", "Annulation": "annulations", "Tentative": "tentatives refusées"}
+_ready = False
+
+
+def _ensure(db: Session) -> None:
+    global _ready
+    if not _ready:
+        for statement in DDL:
+            db.execute(text(statement))
+        db.commit()
+        _ready = True
+
+
+class Tache(BaseModel):
+    texte: str = Field(min_length=1, max_length=300)
+    statut: str = Field(default="fait", pattern="^(fait|en_cours|a_faire)$")
+
+
+class JournalIn(BaseModel):
+    date_jour: date
+    taches: list[Tache] = Field(default_factory=list, max_length=60)
+    remarques: str = Field(default="", max_length=1500)
+    demain: str = Field(default="", max_length=1000)
+
+
+class ParamsIn(BaseModel):
+    whatsapp_admin: str = Field(default="", max_length=30)
+
+
+def _today() -> date:
+    return date.today()
+
+
+def _check_day(day: date) -> None:
+    if day > _today() + timedelta(days=1):  # a day ahead at most: the server and the agency may not share the date
+        raise HTTPException(status_code=422, detail="Le journal ne peut pas être saisi pour une date future.")
+
+
+def _row(db: Session, name: str, day: date) -> dict[str, Any] | None:
+    row = db.execute(text('SELECT * FROM dbo."TJournalEmploye" WHERE LOWER("Nom_Utilisateur") = LOWER(:u) AND "Date_Jour" = :d'),
+                     {"u": name, "d": day}).mappings().first()
+    return dict(row) if row else None
+
+
+def _activity(db: Session, name: str, day: date) -> dict[str, Any]:
+    """What the user did in the software that day: actions counted by kind, and the last ones."""
+    params = {"u": name, "d": day, "n": day + timedelta(days=1)}
+    where = 'LOWER(TRIM(utilisateur)) = LOWER(TRIM(:u)) AND dmvt >= :d AND dmvt < :n'
+    counts = db.execute(text(f'SELECT TRIM("Mvt") AS mvt, COUNT(*) AS n FROM dbo."TMouchard" WHERE {where} GROUP BY 1 ORDER BY 2 DESC'), params).all()
+    last = db.execute(text(f'SELECT "Hmvt" AS h, TRIM(design) AS design FROM dbo."TMouchard" WHERE {where} AND TRIM("Mvt") IN (\'Ajout\', \'Modification\', \'Suppresion\') ORDER BY "N" DESC LIMIT 12'), params).mappings().all()
+    return {
+        "total": sum(n for _, n in counts),
+        "par_type": [{"type": mvt, "libelle": ACTIONS.get(mvt, (mvt or "autres").lower()), "nombre": n} for mvt, n in counts],
+        "dernieres": [{"heure": r["h"].strftime("%H:%M") if r["h"] else None, "design": r["design"]} for r in last],
+    }
+
+
+def _param(db: Session, key: str) -> str:
+    return db.execute(text('SELECT "Valeur" FROM dbo."TParamApp" WHERE "Cle" = :k'), {"k": key}).scalar() or ""
+
+
+def _admin_number(db: Session) -> str:
+    """The administrator's WhatsApp number in international form, digits only (8 digits: a Tunisian number, 216 added)."""
+    digits = re.sub(r"\D", "", _param(db, "whatsapp_admin") or settings.admin_whatsapp_number or "")
+    digits = digits[2:] if digits.startswith("00") else digits
+    return "216" + digits if len(digits) == 8 else digits
+
+
+def _out(row: dict[str, Any] | None, name: str, day: date) -> dict[str, Any]:
+    if not row:
+        return {"utilisateur": name, "date_jour": day.isoformat(), "taches": [], "remarques": "", "demain": "", "statut": "vide",
+                "date_maj": None, "date_validation": None, "envoi": None, "vu_admin": None}
+    taches = row["Taches"] if isinstance(row["Taches"], list) else json.loads(row["Taches"] or "[]")
+    stamp = lambda value: value.isoformat(timespec="minutes") if value else None  # noqa: E731
+    return {"utilisateur": row["Nom_Utilisateur"], "date_jour": row["Date_Jour"].isoformat(), "taches": taches,
+            "remarques": row["Remarques"] or "", "demain": row["Demain"] or "", "statut": row["Statut"],
+            "date_maj": stamp(row["Date_Maj"]), "date_validation": stamp(row["Date_Validation"]), "envoi": row["Envoi"], "vu_admin": stamp(row["Vu_Admin"])}
+
+
+def report_text(journal: dict[str, Any], activity: dict[str, Any]) -> str:
+    """The short report sent to the administrator."""
+    day = date.fromisoformat(journal["date_jour"]).strftime("%d/%m/%Y")
+    lines = [f"📋 Journal du {day} — {journal['utilisateur']}"]
+    for key, label in STATES.items():
+        tasks = [t["texte"] for t in journal["taches"] if t.get("statut") == key]
+        if tasks:
+            lines.append(f"\n{'✅' if key == 'fait' else '⏳' if key == 'en_cours' else '📌'} {label} ({len(tasks)})")
+            lines += [f"• {task}" for task in tasks]
+    if not journal["taches"]:
+        lines.append("\nAucune tâche saisie.")
+    if journal["remarques"].strip():
+        lines.append(f"\n📝 Remarques : {journal['remarques'].strip()}")
+    if journal["demain"].strip():
+        lines.append(f"\n➡️ Prévu ensuite : {journal['demain'].strip()}")
+    if activity["total"]:
+        detail = ", ".join(f"{t['nombre']} {t['libelle']}" for t in activity["par_type"])
+        lines.append(f"\n🖥️ Dans le logiciel : {activity['total']} actions ({detail})")
+    else:
+        lines.append("\n🖥️ Aucune action enregistrée dans le logiciel ce jour.")
+    report = "\n".join(lines)
+    return report if len(report) <= 3500 else report[:3490].rstrip() + "\n…"
+
+
+def _link(number: str, report: str) -> str | None:
+    return f"https://wa.me/{number}?text={quote(report)}" if number else None
+
+
+def _send_api(number: str, report: str) -> None:
+    """Sends the report through the WhatsApp Business Cloud API (raises on failure)."""
+    url = f"https://graph.facebook.com/v21.0/{settings.whatsapp_phone_number_id}/messages"
+    if settings.whatsapp_template:
+        # A template parameter may not hold line breaks: the report is written on one line.
+        flat = re.sub(r"\s*\n+\s*", " | ", report).strip(" |")[:1000]
+        body = {"messaging_product": "whatsapp", "to": number, "type": "template", "template": {
+            "name": settings.whatsapp_template, "language": {"code": settings.whatsapp_template_language},
+            "components": [{"type": "body", "parameters": [{"type": "text", "text": flat}]}]}}
+    else:
+        body = {"messaging_product": "whatsapp", "to": number, "type": "text", "text": {"body": report, "preview_url": False}}
+    answer = httpx.post(url, json=body, headers={"Authorization": f"Bearer {settings.whatsapp_token}"}, timeout=20)
+    if answer.status_code >= 300:
+        try:
+            reason = answer.json().get("error", {}).get("message") or answer.text
+        except ValueError:
+            reason = answer.text
+        raise RuntimeError(reason[:300])
+
+
+@router.get("/moi")
+def my_journal(day: date | None = Query(default=None, alias="date"), user: dict[str, Any] = Depends(require_current_user),
+               db: Session = Depends(get_db)) -> dict[str, Any]:
+    _ensure(db)
+    name, day = str(user["sub"]), day or _today()
+    journal = _out(_row(db, name, day), name, day)
+    activity = _activity(db, name, day)
+    report = report_text(journal, activity)
+    return {"journal": journal, "activite": activity, "rapport": report,
+            "whatsapp": {"numero": bool(_admin_number(db)), "lien": _link(_admin_number(db), report) if journal["statut"] == "valide" else None}}
+
+
+def _save(db: Session, name: str, payload: JournalIn, validate: bool) -> None:
+    current = _row(db, name, payload.date_jour)
+    if current and current["Statut"] == "valide":
+        raise HTTPException(status_code=409, detail="Ce journal est déjà validé : demandez à l’administrateur de le rouvrir pour le modifier.")
+    taches = json.dumps([{"texte": t.texte.strip(), "statut": t.statut} for t in payload.taches if t.texte.strip()], ensure_ascii=False)
+    db.execute(text(f'''
+        INSERT INTO dbo."TJournalEmploye" ("Nom_Utilisateur", "Date_Jour", "Taches", "Remarques", "Demain", "Statut", "Date_Maj", "Date_Validation")
+        VALUES (:u, :d, CAST(:t AS jsonb), :r, :m, CAST(:s AS varchar), {NOW}, CASE WHEN CAST(:s AS varchar) = 'valide' THEN {NOW} END)
+        ON CONFLICT ("Nom_Utilisateur", "Date_Jour") DO UPDATE SET "Taches" = EXCLUDED."Taches", "Remarques" = EXCLUDED."Remarques",
+            "Demain" = EXCLUDED."Demain", "Statut" = EXCLUDED."Statut", "Date_Maj" = EXCLUDED."Date_Maj", "Date_Validation" = EXCLUDED."Date_Validation"
+    '''), {"u": current["Nom_Utilisateur"] if current else name, "d": payload.date_jour, "t": taches, "r": payload.remarques.strip(),
+           "m": payload.demain.strip(), "s": "valide" if validate else "brouillon"})
+
+
+@router.put("/moi")
+def save_journal(payload: JournalIn, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    _ensure(db)
+    _check_day(payload.date_jour)
+    _save(db, str(user["sub"]), payload, validate=False)
+    db.commit()
+    return my_journal(payload.date_jour, user, db)
+
+
+@router.post("/moi/valider")
+def validate_journal(payload: JournalIn, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    _ensure(db)
+    _check_day(payload.date_jour)
+    if not any(t.texte.strip() for t in payload.taches):
+        raise HTTPException(status_code=422, detail="Ajoutez au moins une tâche avant de valider la journée.")
+    name = str(user["sub"])
+    _save(db, name, payload, validate=True)
+    db.commit()
+    result = my_journal(payload.date_jour, user, db)
+    number = _admin_number(db)
+    sent, error = False, None
+    if number and settings.whatsapp_token and settings.whatsapp_phone_number_id:
+        try:
+            _send_api(number, result["rapport"])
+            sent = True
+        except (httpx.HTTPError, RuntimeError) as exc:
+            error = f"Envoi automatique WhatsApp impossible ({exc}). Envoyez le rapport avec le bouton WhatsApp."
+            log.warning("journal %s %s: WhatsApp %s", name, payload.date_jour, exc)
+    db.execute(text('UPDATE dbo."TJournalEmploye" SET "Envoi" = :e WHERE LOWER("Nom_Utilisateur") = LOWER(:u) AND "Date_Jour" = :d'),
+               {"e": "api" if sent else "lien" if number else None, "u": name, "d": payload.date_jour})
+    db.commit()
+    result["journal"]["envoi"] = "api" if sent else "lien" if number else None
+    result["whatsapp"] = {"numero": bool(number), "envoye": sent, "erreur": error, "lien": None if sent else _link(number, result["rapport"])}
+    return result
+
+
+# ---- Administrator: every employee's day ----
+
+def _require_admin(user: dict[str, Any]) -> None:
+    if not is_admin(user):
+        raise HTTPException(status_code=403, detail="Accès réservé à l’administrateur.")
+
+
+@router.get("/equipe")
+def team_day(day: date | None = Query(default=None, alias="date"), user: dict[str, Any] = Depends(require_current_user),
+             db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Every employee (the users of the agency, plus anyone who wrote a journal that day) and their journal of the day."""
+    _require_admin(user)
+    _ensure(db)
+    day = day or _today()
+    users = [r[0] for r in db.execute(text('''
+        SELECT MIN(TRIM("Nom_Utilisateur")) FROM dbo."RUtilisateur_Depot" WHERE TRIM(COALESCE("Nom_Utilisateur", '')) <> ''
+        GROUP BY LOWER(TRIM("Nom_Utilisateur"))''')).all()]
+    rows = {r["Nom_Utilisateur"].strip().lower(): r for r in db.execute(text('SELECT * FROM dbo."TJournalEmploye" WHERE "Date_Jour" = :d'), {"d": day}).mappings()}
+    names = sorted({*(u for u in users if u.lower() != "admin"), *(r["Nom_Utilisateur"].strip() for r in rows.values())}, key=str.lower)
+    items = []
+    for name in names:
+        journal = _out(dict(rows[name.lower()]) if name.lower() in rows else None, name, day)
+        items.append({**journal, "activite": _activity(db, name, day)})
+    order = {"valide": 0, "brouillon": 1, "vide": 2}
+    items.sort(key=lambda item: (order[item["statut"]], item["utilisateur"].lower()))
+    return {"date_jour": day.isoformat(), "items": items,
+            "compteurs": {k: sum(1 for i in items if i["statut"] == k) for k in order},
+            "whatsapp": {"numero": _param(db, "whatsapp_admin") or settings.admin_whatsapp_number or "",
+                         "api": bool(settings.whatsapp_token and settings.whatsapp_phone_number_id)}}
+
+
+@router.get("/equipe/{name}")
+def employee_history(name: str, jours: int = Query(default=14, ge=1, le=90), user: dict[str, Any] = Depends(require_current_user),
+                     db: Session = Depends(get_db)) -> dict[str, Any]:
+    """One employee's last journals."""
+    _require_admin(user)
+    _ensure(db)
+    rows = db.execute(text('SELECT * FROM dbo."TJournalEmploye" WHERE LOWER("Nom_Utilisateur") = LOWER(:u) AND "Date_Jour" > :since ORDER BY "Date_Jour" DESC'),
+                      {"u": name.strip(), "since": _today() - timedelta(days=jours)}).mappings().all()
+    return {"utilisateur": name.strip(), "items": [_out(dict(r), name, r["Date_Jour"]) for r in rows]}
+
+
+@router.post("/equipe/{name}/{day}/vu")
+def mark_seen(name: str, day: date, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    _require_admin(user)
+    _ensure(db)
+    db.execute(text(f'UPDATE dbo."TJournalEmploye" SET "Vu_Admin" = {NOW} WHERE LOWER("Nom_Utilisateur") = LOWER(:u) AND "Date_Jour" = :d'), {"u": name.strip(), "d": day})
+    db.commit()
+    return _out(_row(db, name.strip(), day), name, day)
+
+
+@router.post("/equipe/{name}/{day}/rouvrir")
+def reopen(name: str, day: date, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """The employee may correct a validated day again (it must be validated again)."""
+    _require_admin(user)
+    _ensure(db)
+    db.execute(text('''UPDATE dbo."TJournalEmploye" SET "Statut" = 'brouillon', "Date_Validation" = NULL, "Envoi" = NULL, "Vu_Admin" = NULL
+                       WHERE LOWER("Nom_Utilisateur") = LOWER(:u) AND "Date_Jour" = :d'''), {"u": name.strip(), "d": day})
+    db.commit()
+    return _out(_row(db, name.strip(), day), name, day)
+
+
+@router.put("/parametres")
+def set_params(payload: ParamsIn, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """The administrator's WhatsApp number, which receives the reports."""
+    _require_admin(user)
+    _ensure(db)
+    value = payload.whatsapp_admin.strip()
+    if value and len(re.sub(r"\D", "", value)) < 8:
+        raise HTTPException(status_code=422, detail="Numéro WhatsApp invalide : 8 chiffres (Tunisie) ou le numéro international.")
+    db.execute(text('INSERT INTO dbo."TParamApp" ("Cle", "Valeur") VALUES (\'whatsapp_admin\', :v) ON CONFLICT ("Cle") DO UPDATE SET "Valeur" = EXCLUDED."Valeur"'), {"v": value})
+    db.commit()
+    return {"numero": value}
