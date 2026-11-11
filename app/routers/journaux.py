@@ -12,6 +12,11 @@ The journal number is the date (yyyymmdd), Validation stays 'N' (validated by th
 Encaissements validated one by one ("Valider" in the journal d'encaissement) are declared on the day of the validation;
 dbo."TEncaissementValide" keeps which client settlement lines were validated and when, so the feuille de caisse counts
 them on that day instead of the day the client paid (the client's payment itself, TRegCli, is not changed).
+
+"Valider" in the feuille de caisse of a company on a day (the 15th or the end of the month) declares on that day every
+encaissement still to declare (or the ones chosen in the journal d'encaissement) and every claim and rebate payment
+still to comptabiliser (dbo."TDepenseValide": counted in that day's feuille); dbo."TFeuilleCaisseValide" keeps the
+validated feuilles (one per company and day).
 """
 from datetime import date, timedelta
 from typing import Any
@@ -230,6 +235,25 @@ CREATE TABLE IF NOT EXISTS dbo."TEncaissementValide" (
     PRIMARY KEY ("Num_reg_cli", "Num_quitance")
 )
 """
+CASH_VALIDATED_DDL = [
+    """CREATE TABLE IF NOT EXISTS dbo."TDepenseValide" (
+        num_dep integer PRIMARY KEY,
+        jour date NOT NULL,
+        utilisateur varchar(50),
+        date_saisie timestamp
+    )""",
+    """CREATE TABLE IF NOT EXISTS dbo."TFeuilleCaisseValide" (
+        code_compagnie integer NOT NULL,
+        jour date NOT NULL,
+        quittances integer NOT NULL,
+        encaissements numeric(14, 3) NOT NULL,
+        depenses integer NOT NULL,
+        montant_depenses numeric(14, 3) NOT NULL,
+        utilisateur varchar(50),
+        date_saisie timestamp NOT NULL,
+        PRIMARY KEY (code_compagnie, jour)
+    )""",
+]
 _validated_ready = False
 
 
@@ -237,8 +261,36 @@ def _ensure_validated(db: Session) -> None:
     global _validated_ready
     if not _validated_ready:
         db.execute(text(VALIDATED_DDL))
+        for statement in CASH_VALIDATED_DDL:
+            db.execute(text(statement))
         db.commit()
         _validated_ready = True
+
+
+def _declare_receipt(db: Session, line: dict[str, Any], day: date, name: str) -> int:
+    """Declares one encaissement on `day`: its client settlement lines (and the quittance when it is paid in full), kept in
+    TEncaissementValide so the feuille de caisse counts them on that day. Returns the number of settlement lines."""
+    number = line["num_quittance"]
+    settlements = db.execute(text(
+        'SELECT d."Num_reg_cli" AS reg, COALESCE(d."Montant", 0) AS montant FROM dbo."RDetRegCli" d '
+        'WHERE TRIM(d."Num_quitance") = :n AND COALESCE(d."Comptabiliser", \'N\') <> \'O\''
+    ), {"n": number}).all()
+    params = {"d": day, "n": number}
+    if line["a_s"] == "S":
+        db.execute(text(
+            'UPDATE dbo."TQuittance" SET "Comptabiliser" = \'O\', "Date_Comptabiliser" = :d '
+            'WHERE TRIM(num_quittance) = :n AND COALESCE("Comptabiliser", \'N\') <> \'O\''
+        ), params)
+    db.execute(text(
+        'UPDATE dbo."RDetRegCli" SET "Comptabiliser" = \'O\', "Date_Comptabiliser" = :d '
+        'WHERE TRIM("Num_quitance") = :n AND COALESCE("Comptabiliser", \'N\') <> \'O\''
+    ), params)
+    for reg, montant in settlements:
+        db.execute(text(
+            'INSERT INTO dbo."TEncaissementValide" ("Num_reg_cli", "Num_quitance", "Date_Validation", "Montant", "Utilisateur", "Date_Saisie") '
+            "VALUES (:r, :n, :d, :m, :u, now() AT TIME ZONE 'Africa/Tunis') ON CONFLICT DO NOTHING"
+        ), {"r": reg, "n": number, "d": day, "m": montant, "u": name})
+    return len(settlements)
 
 
 class ValiderEncaissement(BaseModel):
@@ -261,31 +313,13 @@ def validate_receipt(payload: ValiderEncaissement, user: dict[str, Any] = Depend
         line = lines[0]
         if not line["paye"] and line["a_s"] != "A":
             raise HTTPException(status_code=409, detail=f"Quittance {number} : le client n’a pas encore payé ce reste, il n’y a pas d’encaissement à valider.")
-        settlements = db.execute(text(
-            'SELECT d."Num_reg_cli" AS reg, COALESCE(d."Montant", 0) AS montant FROM dbo."RDetRegCli" d '
-            'WHERE TRIM(d."Num_quitance") = :n AND COALESCE(d."Comptabiliser", \'N\') <> \'O\''
-        ), {"n": number}).all()
-        params = {"d": day, "n": number}
-        if line["a_s"] == "S":
-            db.execute(text(
-                'UPDATE dbo."TQuittance" SET "Comptabiliser" = \'O\', "Date_Comptabiliser" = :d '
-                'WHERE TRIM(num_quittance) = :n AND COALESCE("Comptabiliser", \'N\') <> \'O\''
-            ), params)
-        db.execute(text(
-            'UPDATE dbo."RDetRegCli" SET "Comptabiliser" = \'O\', "Date_Comptabiliser" = :d '
-            'WHERE TRIM("Num_quitance") = :n AND COALESCE("Comptabiliser", \'N\') <> \'O\''
-        ), params)
-        for reg, montant in settlements:
-            db.execute(text(
-                'INSERT INTO dbo."TEncaissementValide" ("Num_reg_cli", "Num_quitance", "Date_Validation", "Montant", "Utilisateur", "Date_Saisie") '
-                "VALUES (:r, :n, :d, :m, :u, now() AT TIME ZONE 'Africa/Tunis') ON CONFLICT DO NOTHING"
-            ), {"r": reg, "n": number, "d": day, "m": montant, "u": name})
+        settlements = _declare_receipt(db, line, day, name)
         db.commit()
     except SQLAlchemyError as exc:
         db.rollback()
         raise _fail(exc) from exc
     return {"num_quittance": number, "date_validation": day.isoformat(), "montant": line["montant"], "a_s": line["a_s"],
-            "code_compagnie": line["code_compagnie"], "valide_par": name, "lignes_reglement": len(settlements)}
+            "code_compagnie": line["code_compagnie"], "valide_par": name, "lignes_reglement": settlements}
 
 
 class ComptabiliserQuittances(BaseModel):
@@ -346,27 +380,32 @@ SELECT d.num_dep, d.nature, d.libelle, d.date_dep, COALESCE(d.mont_dep, 0) AS mo
        (SELECT TRIM(c.nom_client) FROM dbo."TClient" c WHERE TRIM(c.code_client) = TRIM(d.code_client) LIMIT 1) AS assure,
        TRIM(d.num_cheq) AS num_cheq, TRIM(d.code_banque) AS code_banque,
        COALESCE(d."Comptabiliser", 'N') = 'O' AS comptabilise, d."Date_Comptabiliser" AS date_comptabilise,
+       p.code_compagnie, TRIM(k.nom_compagnie) AS nom_compagnie,
        -- D.Com: on a rebate, the commission of the rebated receipt
        CASE WHEN d.nature = 'R' THEN ABS(COALESCE((
            SELECT q.commission FROM dbo."TQuittance" q WHERE TRIM(q.num_quittance) = TRIM(d.num_quittance) LIMIT 1), 0)) ELSE 0 END AS d_com
 FROM d
 JOIN pol p ON p.num_police = TRIM(d.num_police)
-WHERE p.code_compagnie = :compagnie
-ORDER BY TRIM(d.num_police), d.num_dep  -- as the legacy "Liste des dépenses": by police
+JOIN dbo."TCompagnie" k ON k.code_compagnie = p.code_compagnie
+-- One company, or all those the agency keeps journals for.
+WHERE (CAST(:compagnie AS integer) IS NULL OR p.code_compagnie = CAST(:compagnie AS integer))
+  AND UPPER(TRIM(k.nom_compagnie)) <> ALL(:excluded)
+ORDER BY TRIM(k.nom_compagnie), TRIM(d.num_police), d.num_dep  -- as the legacy "Liste des dépenses": by police
 """
 
 
-def _expenses(db: Session, compagnie: int, day: date, done: bool, nature: str | None = None, ids: list[int] | None = None) -> list[dict[str, Any]]:
+def _expenses(db: Session, compagnie: int | None, day: date, done: bool, nature: str | None = None, ids: list[int] | None = None) -> list[dict[str, Any]]:
     rows = db.execute(
         text(EXPENSES_SQL),
-        {"compagnie": compagnie, "day": day, "next_day": day + timedelta(days=1), "done": done, "nature": nature, "ids": ids},
+        {"compagnie": compagnie, "day": day, "next_day": day + timedelta(days=1), "done": done, "nature": nature, "ids": ids,
+         "excluded": EXCLUDED_COMPANIES},
     ).mappings().all()
     return [_plain(row) for row in rows]
 
 
 @router.get("/depense")
 def expenses_journal(
-    compagnie: int = Query(...),
+    compagnie: int | None = Query(default=None, description="Without it, every company"),
     date_journal: date = Query(..., alias="date"),
     nature: str = Query(default="", pattern="^[SR]?$", description="S = sinistres, R = ristournes, empty = both"),
     comptabilises: bool = Query(default=False, description="Also the expenses comptabilisées on that date"),
@@ -518,8 +557,20 @@ WITH pol AS (
     JOIN dbo.ttype_dep t ON TRIM(t.code_type) = TRIM(d.code_type)
     JOIN pol p ON p.num_police = TRIM(d.num_police)
     WHERE p.code_compagnie = :compagnie AND TRIM(d."Typ_dep") = 'T' AND TRIM(t."Nat_quit") IN ('S', 'R')
+      AND NOT EXISTS (SELECT 1 FROM dbo."TDepenseValide" v WHERE v.num_dep = d.num_dep)
       AND (CAST(:debut AS date) IS NULL OR d.date_dep >= CAST(:debut AS date))
       AND (CAST(:fin AS date) IS NULL OR d.date_dep < CAST(:fin AS date) + 1)
+    UNION ALL
+    -- the ones comptabilisées by the validation of a feuille de caisse: counted on the day of that feuille
+    SELECT d.num_dep, TRIM(t."Nat_quit"), v.jour, d.date_dep, COALESCE(d.mont_dep, 0),
+           COALESCE(NULLIF(TRIM(d.sinistre), ''), TRIM(d.num_quittance)), TRIM(d.num_quittance)
+    FROM dbo."TDepenseValide" v
+    JOIN dbo."TDepense" d ON d.num_dep = v.num_dep
+    JOIN dbo.ttype_dep t ON TRIM(t.code_type) = TRIM(d.code_type)
+    JOIN pol p ON p.num_police = TRIM(d.num_police)
+    WHERE p.code_compagnie = :compagnie
+      AND (CAST(:debut AS date) IS NULL OR v.jour >= CAST(:debut AS date))
+      AND (CAST(:fin AS date) IS NULL OR v.jour <= CAST(:fin AS date))
 ), rebated AS (
     -- D.Com: on a rebate, the commission of the rebated receipt
     SELECT TRIM(q.num_quittance) AS num_quittance, MAX(ABS(COALESCE(q.commission, 0))) AS d_com
@@ -1199,3 +1250,79 @@ def technical_expenses(
     finally:
         db.rollback()
     return {"items": items, "total": round(sum(float(row["montant"] or 0) for row in items), 3)}
+
+
+# ---------------------------------------------------------------------------------------------
+# Validation of the feuille de caisse
+# ---------------------------------------------------------------------------------------------
+
+def _cash_validation(db: Session, compagnie: int, jour: date) -> dict[str, Any] | None:
+    row = db.execute(text('SELECT * FROM dbo."TFeuilleCaisseValide" WHERE code_compagnie = :c AND jour = :j'), {"c": compagnie, "j": jour}).mappings().first()
+    if not row:
+        return None
+    item = _plain(row)
+    item["date_saisie"] = row["date_saisie"].isoformat(timespec="minutes") if row["date_saisie"] else None
+    return item
+
+
+@router.get("/feuille/validation")
+def cash_validation(compagnie: int, jour: date, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Whether the feuille de caisse of the company on the day is validated (by whom, when, what it declared)."""
+    _ensure_validated(db)
+    try:
+        return {"validation": _cash_validation(db, compagnie, jour)}
+    except SQLAlchemyError as exc:
+        raise _fail(exc) from exc
+
+
+class ValiderFeuille(BaseModel):
+    compagnie: int
+    jour: date
+    # The lines chosen in the journal d'encaissement / de dépense; null: every line still to declare.
+    quittances: list[str] | None = Field(default=None, max_length=5000)
+    depenses: list[int] | None = Field(default=None, max_length=5000)
+
+
+@router.post("/feuille/valider")
+def validate_cash_sheet(payload: ValiderFeuille, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Validates the feuille de caisse of the company on the day: the encaissements paid by then and not declared yet (a
+    quittance paid in full, or its new acomptes) and the claim and rebate payments not comptabilisées yet are declared on
+    that day, and the feuille is kept as validated (once per company and day)."""
+    _ensure_validated(db)
+    name = str(user.get("sub", ""))[:50]
+    jour = payload.jour
+    try:
+        db.execute(text("SELECT pg_advisory_xact_lock(hashtext('feuille:' || :c || ':' || :j))"), {"c": str(payload.compagnie), "j": jour.isoformat()})
+        if _cash_validation(db, payload.compagnie, jour):
+            raise HTTPException(status_code=409, detail=f"La feuille de caisse du {jour.strftime('%d/%m/%Y')} de cette compagnie est déjà validée.")
+        numbers = sorted({n.strip() for n in payload.quittances if n.strip()}) if payload.quittances is not None else None
+        receipts = [] if numbers == [] else [
+            line for line in _receipts(db, payload.compagnie, jour, False, numbers, regles=True)
+            if not line["comptabilise"] and (line["paye"] or line["a_s"] == "A")
+        ]
+        for line in receipts:
+            _declare_receipt(db, line, jour, name)
+        ids = sorted(set(payload.depenses)) if payload.depenses is not None else None
+        expenses = [] if ids == [] else [line for line in _expenses(db, payload.compagnie, jour, False, None, ids) if not line["comptabilise"]]
+        if expenses:
+            expense_ids = [line["num_dep"] for line in expenses]
+            db.execute(text(
+                'UPDATE dbo."TDepense" SET "Comptabiliser" = \'O\', "Date_Comptabiliser" = :d '
+                'WHERE TRIM("Typ_dep") = \'T\' AND num_dep = ANY(CAST(:ids AS int[])) AND COALESCE("Comptabiliser", \'N\') <> \'O\''
+            ), {"d": jour, "ids": expense_ids})
+            for num_dep in expense_ids:
+                db.execute(text(
+                    'INSERT INTO dbo."TDepenseValide" (num_dep, jour, utilisateur, date_saisie) '
+                    "VALUES (:n, :j, :u, now() AT TIME ZONE 'Africa/Tunis') ON CONFLICT DO NOTHING"
+                ), {"n": num_dep, "j": jour, "u": name})
+        db.execute(text(
+            'INSERT INTO dbo."TFeuilleCaisseValide" (code_compagnie, jour, quittances, encaissements, depenses, montant_depenses, utilisateur, date_saisie) '
+            "VALUES (:c, :j, :q, :e, :n, :m, :u, now() AT TIME ZONE 'Africa/Tunis')"
+        ), {"c": payload.compagnie, "j": jour, "q": len(receipts), "e": round(sum(line["montant"] for line in receipts), 3),
+            "n": len(expenses), "m": round(sum(float(line["montant"] or 0) for line in expenses), 3), "u": name})
+        validation = _cash_validation(db, payload.compagnie, jour)
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise _fail(exc) from exc
+    return {"validation": validation}

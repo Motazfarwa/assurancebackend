@@ -76,7 +76,7 @@ def my_notifications(
 # Clients to complete (administrator), what each one lacks:
 #  - coordonnées: an address, city and postal code (at home or at the office), and at least one phone and one email on
 #    the address chosen for correspondence (Correspondant 'B': the office, otherwise home);
-#  - polices: no police at all, or a police in force (etat AN) without company, code branche, effect date, risk, or its
+#  - polices: no police at all, or a police in force (etat AN) without company, effect date, risk, or its
 #    term (échéance if renewable, expiration if not);
 #  - quittances of a police in force without date d'émission, échéance, prime nette, prime totale, montant or solde;
 #  - sinistres not closed without date, police, company or the company's claim number.
@@ -116,7 +116,6 @@ INCOMPLETE_SQL = f"""
             SELECT TRIM(p.code_client) AS code, TRIM(p.num_police) AS numero,
                    CASE WHEN UPPER(TRIM(p.etat)) = 'AN' THEN ARRAY_REMOVE(ARRAY[
                        CASE WHEN p.code_compagnie IS NULL THEN 'compagnie' END,
-                       CASE WHEN {_empty('p.code_branche')} THEN 'code branche' END,
                        CASE WHEN p.effet IS NULL THEN 'date effet' END,
                        CASE WHEN {_empty('p.risque')} THEN 'risque' END,
                        CASE WHEN TRIM(COALESCE(p."Renouv_An", '')) = 'O' AND {_empty('p.echeance')} THEN 'échéance' END,
@@ -199,7 +198,7 @@ def incomplete_clients(
         manques = list(row["coordonnees"])
         if row["sans_police"]:
             manques.append("aucune police")
-        # "police 074202646653 : code branche, risque"
+        # "police 074202646653 : date effet, risque"
         manques.extend(f"police {entry}" for entry in row["polices"][:3])
         manques.extend(f"quittance {entry}" for entry in row["quittances"][:3])
         manques.extend(f"sinistre {entry}" for entry in row["sinistres"][:3])

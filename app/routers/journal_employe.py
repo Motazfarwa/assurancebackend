@@ -8,6 +8,13 @@ WhatsApp:
  - otherwise a wa.me link is returned: it opens WhatsApp with the report written, the employee only presses "Envoyer".
 The administrator's number is set in the module (dbo."TParamApp"), else ADMIN_WHATSAPP_NUMBER.
 The report also counts what the employee did in the software that day (dbo."TMouchard").
+
+Client requests:
+ - the employee notes in the day the requests received (by phone, email or WhatsApp), the request and an observation
+   ("Demandes" of the day's journal);
+ - the administrator records a client request and assigns it to chosen users, or to every user of an agency (the "lieu"
+   of the users: Tunis, Hammamet): dbo."TDemandeClient" and one dbo."TDemandeAffectation" line per user, who marks it
+   "traitée" (with a reply) from their journal.
 """
 import html
 import json
@@ -50,7 +57,28 @@ DDL = [
     )""",
     'CREATE TABLE IF NOT EXISTS dbo."TParamApp" ("Cle" varchar(50) PRIMARY KEY, "Valeur" text)',
     'ALTER TABLE dbo."TJournalEmploye" ADD COLUMN IF NOT EXISTS "Envoi_Email" varchar(10)',
+    'ALTER TABLE dbo."TJournalEmploye" ADD COLUMN IF NOT EXISTS "Demandes" jsonb NOT NULL DEFAULT \'[]\'::jsonb',
+    """CREATE TABLE IF NOT EXISTS dbo."TDemandeClient" (
+        "Id" serial PRIMARY KEY,
+        "Client" varchar(150),
+        "Canaux" jsonb NOT NULL DEFAULT '[]'::jsonb,
+        "Demande" text NOT NULL,
+        "Observation" text,
+        "Cible_Type" varchar(12) NOT NULL,
+        "Cible" varchar(150),
+        "Cree_Par" varchar(50),
+        "Date_Creation" timestamp NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS dbo."TDemandeAffectation" (
+        "Demande_Id" integer NOT NULL REFERENCES dbo."TDemandeClient"("Id") ON DELETE CASCADE,
+        "Nom_Utilisateur" varchar(50) NOT NULL,
+        "Statut" varchar(10) NOT NULL DEFAULT 'a_traiter',
+        "Reponse" text,
+        "Date_Traitement" timestamp,
+        PRIMARY KEY ("Demande_Id", "Nom_Utilisateur")
+    )""",
 ]
+CHANNELS = {"telephone": "Téléphone", "email": "Email", "whatsapp": "WhatsApp"}
 NOW = "(now() AT TIME ZONE 'Africa/Tunis')"
 STATES = {"fait": "Fait", "en_cours": "En cours", "a_faire": "À faire"}
 ACTIONS = {"Ajout": "ajouts", "Modification": "modifications", "Suppresion": "suppressions", "Impression": "impressions",
@@ -72,9 +100,16 @@ class Tache(BaseModel):
     statut: str = Field(default="fait", pattern="^(fait|en_cours|a_faire)$")
 
 
+class DemandeJour(BaseModel):
+    canaux: list[str] = Field(default_factory=list, max_length=3)
+    demande: str = Field(default="", max_length=500)
+    observation: str = Field(default="", max_length=1500)
+
+
 class JournalIn(BaseModel):
     date_jour: date
     taches: list[Tache] = Field(default_factory=list, max_length=60)
+    demandes: list[DemandeJour] = Field(default_factory=list, max_length=40)
     remarques: str = Field(default="", max_length=1500)
     demain: str = Field(default="", max_length=1000)
 
@@ -125,11 +160,13 @@ def _admin_number(db: Session) -> str:
 
 def _out(row: dict[str, Any] | None, name: str, day: date) -> dict[str, Any]:
     if not row:
-        return {"utilisateur": name, "date_jour": day.isoformat(), "taches": [], "remarques": "", "demain": "", "statut": "vide",
+        return {"utilisateur": name, "date_jour": day.isoformat(), "taches": [], "demandes": [], "remarques": "", "demain": "", "statut": "vide",
                 "date_maj": None, "date_validation": None, "envoi": None, "envoi_email": None, "vu_admin": None}
     taches = row["Taches"] if isinstance(row["Taches"], list) else json.loads(row["Taches"] or "[]")
+    demandes = row.get("Demandes") or []
+    demandes = demandes if isinstance(demandes, list) else json.loads(demandes)
     stamp = lambda value: value.isoformat(timespec="minutes") if value else None  # noqa: E731
-    return {"utilisateur": row["Nom_Utilisateur"], "date_jour": row["Date_Jour"].isoformat(), "taches": taches,
+    return {"utilisateur": row["Nom_Utilisateur"], "date_jour": row["Date_Jour"].isoformat(), "taches": taches, "demandes": demandes,
             "remarques": row["Remarques"] or "", "demain": row["Demain"] or "", "statut": row["Statut"],
             "date_maj": stamp(row["Date_Maj"]), "date_validation": stamp(row["Date_Validation"]), "envoi": row["Envoi"], "envoi_email": row.get("Envoi_Email"), "vu_admin": stamp(row["Vu_Admin"])}
 
@@ -145,6 +182,11 @@ def report_text(journal: dict[str, Any], activity: dict[str, Any]) -> str:
             lines += [f"• {task}" for task in tasks]
     if not journal["taches"]:
         lines.append("\nAucune tâche saisie.")
+    if journal.get("demandes"):
+        lines.append(f"\n📞 Demandes clients ({len(journal['demandes'])})")
+        for item in journal["demandes"]:
+            line = f"• {item['demande']}" + (f" [{channels_text(item.get('canaux'))}]" if item.get("canaux") else "")
+            lines.append(line + (f" — {item['observation']}" if item.get("observation") else ""))
     if journal["remarques"].strip():
         lines.append(f"\n📝 Remarques : {journal['remarques'].strip()}")
     if journal["demain"].strip():
@@ -177,6 +219,13 @@ def _report_html(journal: dict[str, Any], activity: dict[str, Any]) -> str:
         f'<td style="padding:6px 10px">{e(t["texte"])}</td></tr>' for t in journal["taches"])
     parts = [f'<h2 style="margin:0 0 4px;color:#173247">Journal du {day}</h2><p style="margin:0 0 14px;color:#587079">{e(journal["utilisateur"])}</p>',
              f'<table style="border-collapse:collapse;font-size:14px;border:1px solid #e3eaec">{rows}</table>' if rows else '<p>Aucune tâche saisie.</p>']
+    if journal.get("demandes"):
+        items = ""
+        for item in journal["demandes"]:
+            via = " <span style='color:#587079'>(reçue par " + e(channels_text(item.get("canaux"))) + ")</span>" if item.get("canaux") else ""
+            note = "<br><span style='color:#587079'>" + e(item["observation"]) + "</span>" if item.get("observation") else ""
+            items += "<li style='margin:0 0 6px'><b>" + e(item["demande"]) + "</b>" + via + note + "</li>"
+        parts.append(f'<h3 style="margin:16px 0 6px;color:#173247;font-size:15px">Demandes clients</h3><ul style="margin:0;padding-left:18px">{items}</ul>')
     if journal["remarques"].strip():
         parts.append(f'<p style="margin:14px 0 0"><b>Remarques :</b> {e(journal["remarques"].strip())}</p>')
     if journal["demain"].strip():
@@ -210,6 +259,23 @@ def _send_email(to: str, subject: str, body: str, body_html: str) -> None:
             server.starttls(context=context)
             server.login(settings.smtp_user, settings.smtp_password)
             server.send_message(message)
+
+
+def channels_text(channels: list[str] | None) -> str:
+    return ", ".join(CHANNELS[c] for c in CHANNELS if c in (channels or []))
+
+
+def _day_requests(items: list[DemandeJour]) -> list[dict[str, Any]]:
+    """The client requests of the day that are written (a request, or at least an observation)."""
+    out = []
+    for item in items:
+        demande, observation = item.demande.strip(), item.observation.strip()
+        if not demande and not observation:
+            continue
+        if not demande:
+            raise HTTPException(status_code=422, detail="Chaque demande client doit avoir sa demande (pas seulement une observation).")
+        out.append({"canaux": [c for c in CHANNELS if c in item.canaux], "demande": demande, "observation": observation})
+    return out
 
 
 def _link(number: str, report: str) -> str | None:
@@ -253,12 +319,13 @@ def _save(db: Session, name: str, payload: JournalIn, validate: bool) -> None:
     if current and current["Statut"] == "valide":
         raise HTTPException(status_code=409, detail="Ce journal est déjà validé : demandez à l’administrateur de le rouvrir pour le modifier.")
     taches = json.dumps([{"texte": t.texte.strip(), "statut": t.statut} for t in payload.taches if t.texte.strip()], ensure_ascii=False)
+    demandes = json.dumps(_day_requests(payload.demandes), ensure_ascii=False)
     db.execute(text(f'''
-        INSERT INTO dbo."TJournalEmploye" ("Nom_Utilisateur", "Date_Jour", "Taches", "Remarques", "Demain", "Statut", "Date_Maj", "Date_Validation")
-        VALUES (:u, :d, CAST(:t AS jsonb), :r, :m, CAST(:s AS varchar), {NOW}, CASE WHEN CAST(:s AS varchar) = 'valide' THEN {NOW} END)
-        ON CONFLICT ("Nom_Utilisateur", "Date_Jour") DO UPDATE SET "Taches" = EXCLUDED."Taches", "Remarques" = EXCLUDED."Remarques",
+        INSERT INTO dbo."TJournalEmploye" ("Nom_Utilisateur", "Date_Jour", "Taches", "Demandes", "Remarques", "Demain", "Statut", "Date_Maj", "Date_Validation")
+        VALUES (:u, :d, CAST(:t AS jsonb), CAST(:q AS jsonb), :r, :m, CAST(:s AS varchar), {NOW}, CASE WHEN CAST(:s AS varchar) = 'valide' THEN {NOW} END)
+        ON CONFLICT ("Nom_Utilisateur", "Date_Jour") DO UPDATE SET "Taches" = EXCLUDED."Taches", "Demandes" = EXCLUDED."Demandes", "Remarques" = EXCLUDED."Remarques",
             "Demain" = EXCLUDED."Demain", "Statut" = EXCLUDED."Statut", "Date_Maj" = EXCLUDED."Date_Maj", "Date_Validation" = EXCLUDED."Date_Validation"
-    '''), {"u": current["Nom_Utilisateur"] if current else name, "d": payload.date_jour, "t": taches, "r": payload.remarques.strip(),
+    '''), {"u": current["Nom_Utilisateur"] if current else name, "d": payload.date_jour, "t": taches, "q": demandes, "r": payload.remarques.strip(),
            "m": payload.demain.strip(), "s": "valide" if validate else "brouillon"})
 
 
@@ -275,8 +342,8 @@ def save_journal(payload: JournalIn, user: dict[str, Any] = Depends(require_curr
 def validate_journal(payload: JournalIn, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     _ensure(db)
     _check_day(payload.date_jour)
-    if not any(t.texte.strip() for t in payload.taches):
-        raise HTTPException(status_code=422, detail="Ajoutez au moins une tâche avant de soumettre la journée.")
+    if not any(t.texte.strip() for t in payload.taches) and not _day_requests(payload.demandes):
+        raise HTTPException(status_code=422, detail="Ajoutez au moins une tâche ou une demande client avant de soumettre la journée.")
     name = str(user["sub"])
     _save(db, name, payload, validate=True)
     db.commit()
@@ -397,3 +464,137 @@ def set_params(payload: ParamsIn, user: dict[str, Any] = Depends(require_current
         db.execute(text('INSERT INTO dbo."TParamApp" ("Cle", "Valeur") VALUES (:k, :v) ON CONFLICT ("Cle") DO UPDATE SET "Valeur" = EXCLUDED."Valeur"'), {"k": key, "v": value})
     db.commit()
     return {"numero": _param(db, "whatsapp_admin"), "email": _report_email(db)}
+
+
+# ---- Client requests assigned by the administrator ----
+
+class DemandeIn(BaseModel):
+    client: str = Field(default="", max_length=150)
+    canaux: list[str] = Field(default_factory=list, max_length=3)
+    demande: str = Field(min_length=1, max_length=1000)
+    observation: str = Field(default="", max_length=1500)
+    cible_type: str = Field(pattern="^(utilisateur|agence)$")
+    utilisateurs: list[str] = Field(default_factory=list, max_length=100)
+    agence: str = Field(default="", max_length=100)
+
+
+class TraiterIn(BaseModel):
+    reponse: str = Field(default="", max_length=1500)
+
+
+def _staff(db: Session) -> list[dict[str, str]]:
+    """The agency's users (not the administrator) and their agency (lieu)."""
+    rows = db.execute(text('''
+        SELECT MIN(TRIM("Nom_Utilisateur")) AS nom, MIN(TRIM(COALESCE(lieu, \'\'))) AS agence FROM dbo."RUtilisateur_Depot"
+        WHERE TRIM(COALESCE("Nom_Utilisateur", \'\')) <> \'\' AND LOWER(TRIM("Nom_Utilisateur")) <> \'admin\'
+        GROUP BY LOWER(TRIM("Nom_Utilisateur")) ORDER BY 1''')).mappings().all()
+    return [dict(row) for row in rows]
+
+
+def _request_out(row: dict[str, Any], assignments: list[dict[str, Any]]) -> dict[str, Any]:
+    stamp = lambda value: value.isoformat(timespec="minutes") if value else None  # noqa: E731
+    canaux = row["Canaux"] if isinstance(row["Canaux"], list) else json.loads(row["Canaux"] or "[]")
+    return {"id": row["Id"], "client": row["Client"] or "", "canaux": canaux, "demande": row["Demande"], "observation": row["Observation"] or "",
+            "cible_type": row["Cible_Type"], "cible": row["Cible"] or "", "cree_par": row["Cree_Par"], "date_creation": stamp(row["Date_Creation"]),
+            "affectations": [{"utilisateur": a["Nom_Utilisateur"], "statut": a["Statut"], "reponse": a["Reponse"] or "",
+                              "date_traitement": stamp(a["Date_Traitement"])} for a in assignments]}
+
+
+@router.get("/demandes/destinataires")
+def request_targets(user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Who a request can be assigned to: the users, and the agencies with their users."""
+    _require_admin(user)
+    staff = _staff(db)
+    agencies = sorted({s["agence"] for s in staff if s["agence"]}, key=str.lower)
+    return {"utilisateurs": staff, "agences": [{"agence": a, "utilisateurs": [s["nom"] for s in staff if s["agence"] == a]} for a in agencies]}
+
+
+@router.get("/demandes")
+def list_requests(jours: int = Query(default=30, ge=1, le=365), user: dict[str, Any] = Depends(require_current_user),
+                  db: Session = Depends(get_db)) -> dict[str, Any]:
+    """The requests recorded by the administrator in the last days, with each assigned user's state."""
+    _require_admin(user)
+    _ensure(db)
+    rows = db.execute(text(f'SELECT * FROM dbo."TDemandeClient" WHERE "Date_Creation" >= {NOW} - make_interval(days => :j) ORDER BY "Id" DESC'), {"j": jours}).mappings().all()
+    ids = [r["Id"] for r in rows]
+    assignments: dict[int, list[dict[str, Any]]] = {}
+    if ids:
+        for a in db.execute(text('SELECT * FROM dbo."TDemandeAffectation" WHERE "Demande_Id" = ANY(:ids) ORDER BY LOWER("Nom_Utilisateur")'), {"ids": ids}).mappings():
+            assignments.setdefault(a["Demande_Id"], []).append(dict(a))
+    return {"items": [_request_out(dict(r), assignments.get(r["Id"], [])) for r in rows]}
+
+
+@router.post("/demandes")
+def create_request(payload: DemandeIn, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Records a client request and assigns it to the chosen users, or to every user of the agency."""
+    _require_admin(user)
+    _ensure(db)
+    staff = _staff(db)
+    if payload.cible_type == "agence":
+        agence = payload.agence.strip()
+        names = [s["nom"] for s in staff if s["agence"].lower() == agence.lower()]
+        if not names:
+            raise HTTPException(status_code=422, detail=f"Aucun utilisateur dans l’agence {agence or 'choisie'}.")
+        target = agence
+    else:
+        known = {s["nom"].lower(): s["nom"] for s in staff}
+        names = list(dict.fromkeys(known[n.strip().lower()] for n in payload.utilisateurs if n.strip().lower() in known))
+        if not names:
+            raise HTTPException(status_code=422, detail="Choisissez au moins un utilisateur.")
+        target = ", ".join(names)
+    demande = payload.demande.strip()
+    if not demande:
+        raise HTTPException(status_code=422, detail="Écrivez la demande du client.")
+    new_id = db.execute(text(f'''
+        INSERT INTO dbo."TDemandeClient" ("Client", "Canaux", "Demande", "Observation", "Cible_Type", "Cible", "Cree_Par", "Date_Creation")
+        VALUES (:c, CAST(:k AS jsonb), :d, :o, :t, :g, :u, {NOW}) RETURNING "Id"'''),
+        {"c": payload.client.strip(), "k": json.dumps([c for c in CHANNELS if c in payload.canaux]), "d": demande,
+         "o": payload.observation.strip(), "t": payload.cible_type, "g": target[:150], "u": str(user["sub"])[:50]}).scalar()
+    for name in names:
+        db.execute(text('INSERT INTO dbo."TDemandeAffectation" ("Demande_Id", "Nom_Utilisateur") VALUES (:i, :u)'), {"i": new_id, "u": name[:50]})
+    db.commit()
+    row = db.execute(text('SELECT * FROM dbo."TDemandeClient" WHERE "Id" = :i'), {"i": new_id}).mappings().first()
+    assignments = db.execute(text('SELECT * FROM dbo."TDemandeAffectation" WHERE "Demande_Id" = :i ORDER BY LOWER("Nom_Utilisateur")'), {"i": new_id}).mappings().all()
+    return _request_out(dict(row), [dict(a) for a in assignments])
+
+
+@router.delete("/demandes/{request_id}")
+def delete_request(request_id: int, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    _require_admin(user)
+    _ensure(db)
+    deleted = db.execute(text('DELETE FROM dbo."TDemandeClient" WHERE "Id" = :i'), {"i": request_id}).rowcount
+    db.commit()
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Demande introuvable.")
+    return {"supprimee": request_id}
+
+
+@router.get("/moi/demandes")
+def my_requests(user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """The requests assigned to me: those to handle, and those handled in the last 7 days."""
+    _ensure(db)
+    rows = db.execute(text(f'''
+        SELECT d.*, a."Statut", a."Reponse", a."Date_Traitement" FROM dbo."TDemandeAffectation" a JOIN dbo."TDemandeClient" d ON d."Id" = a."Demande_Id"
+        WHERE LOWER(a."Nom_Utilisateur") = LOWER(:u) AND (a."Statut" <> \'traitee\' OR a."Date_Traitement" >= {NOW} - INTERVAL \'7 days\')
+        ORDER BY a."Statut" = \'traitee\', d."Id" DESC'''), {"u": str(user["sub"])}).mappings().all()
+    items = []
+    for r in rows:
+        out = _request_out(dict(r), [])
+        out.pop("affectations")
+        out.update({"statut": r["Statut"], "reponse": r["Reponse"] or "",
+                    "date_traitement": r["Date_Traitement"].isoformat(timespec="minutes") if r["Date_Traitement"] else None})
+        items.append(out)
+    return {"items": items}
+
+
+@router.post("/moi/demandes/{request_id}/traiter")
+def handle_request(request_id: int, payload: TraiterIn, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Marks a request assigned to me as handled, with a reply."""
+    _ensure(db)
+    done = db.execute(text(f'''UPDATE dbo."TDemandeAffectation" SET "Statut" = \'traitee\', "Reponse" = :r, "Date_Traitement" = {NOW}
+                              WHERE "Demande_Id" = :i AND LOWER("Nom_Utilisateur") = LOWER(:u)'''),
+                      {"i": request_id, "u": str(user["sub"]), "r": payload.reponse.strip()}).rowcount
+    db.commit()
+    if not done:
+        raise HTTPException(status_code=404, detail="Cette demande ne vous est pas affectée.")
+    return my_requests(user, db)
