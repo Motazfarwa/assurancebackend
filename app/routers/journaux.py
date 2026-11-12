@@ -87,12 +87,14 @@ RECEIPTS_SQL = """
 WITH paid AS MATERIALIZED (
     -- the client settlement lines not declared yet, paid by the journal date (since 1 January of the year before: older
     -- lines never declared are leftovers of 2005-2006 test quittances, not encaissements to declare now)
-    SELECT DISTINCT TRIM(d."Num_quitance") AS num_quittance
+    -- To declare: Comptabiliser 'N', no Date_Comptabiliser, and at least 100 millimes paid on the quittance.
+    SELECT TRIM(d."Num_quitance") AS num_quittance
     FROM dbo."RDetRegCli" d JOIN dbo."TRegCli" t ON t.num_reg_cli = d."Num_reg_cli"
-    WHERE COALESCE(d."Comptabiliser", 'N') <> 'O' AND t.date_reg_cli < :next_day
+    WHERE TRIM(d."Comptabiliser") = 'N' AND d."Date_Comptabiliser" IS NULL AND t.date_reg_cli < :next_day
       AND t.date_reg_cli >= date_trunc('year', CAST(:day AS date)) - INTERVAL '1 year'
       -- the journal of a period: only what was paid in it (from its first day)
       AND (CAST(:pending_from AS date) IS NULL OR t.date_reg_cli >= CAST(:pending_from AS date))
+    GROUP BY 1 HAVING SUM(COALESCE(d."Montant", 0)) >= 0.0995
 ),
 q AS MATERIALIZED (
     SELECT q.* FROM dbo."TQuittance" q
@@ -116,7 +118,7 @@ reg AS (
            SUM(CASE WHEN d."Comptabiliser" = 'O' AND d."Date_Comptabiliser" < :done_from THEN d."Montant" ELSE 0 END) AS declared_before,
            SUM(CASE WHEN d."Comptabiliser" = 'O' AND d."Date_Comptabiliser" >= :done_from AND d."Date_Comptabiliser" < :next_day THEN d."Montant" ELSE 0 END) AS at_day,
            MAX(CASE WHEN d."Comptabiliser" = 'O' AND d."Date_Comptabiliser" >= :done_from AND d."Date_Comptabiliser" < :next_day THEN d."Date_Comptabiliser" END) AS declared_on,
-           SUM(CASE WHEN COALESCE(d."Comptabiliser", 'N') <> 'O' THEN d."Montant" ELSE 0 END) AS pending
+           SUM(CASE WHEN TRIM(d."Comptabiliser") = 'N' AND d."Date_Comptabiliser" IS NULL THEN d."Montant" ELSE 0 END) AS pending
     FROM dbo."RDetRegCli" d
     WHERE TRIM(d."Num_quitance") IN (SELECT TRIM(num_quittance) FROM q)
     GROUP BY 1
@@ -434,12 +436,14 @@ def post_receipts(payload: ComptabiliserQuittances, db: Session = Depends(get_db
 
 EXPENSES_SQL = """
 WITH d AS MATERIALIZED (
-    SELECT d.*, TRIM(t."Nat_quit") AS nature, TRIM(t.libelle) AS libelle FROM dbo."TDepense" d
-    JOIN dbo.ttype_dep t ON TRIM(t.code_type) = TRIM(d.code_type)
-    WHERE TRIM(d."Typ_dep") = 'T' AND TRIM(t."Nat_quit") IN ('S', 'R')
-      AND (CAST(:nature AS text) IS NULL OR TRIM(t."Nat_quit") = CAST(:nature AS text))
+    SELECT d.*, TRIM(COALESCE(to_jsonb(t)->>'Nat_quit', to_jsonb(t)->>'nat_quit')) AS nature, TRIM(t.libelle) AS libelle FROM dbo."TDepense" d
+    LEFT JOIN dbo.ttype_dep t ON TRIM(t.code_type) = TRIM(d.code_type)
+    -- Every dépense of type T (Typ_dep); S/R (the Nat_quit of its type) only when chosen.
+    WHERE TRIM(d."Typ_dep") = 'T'
+      AND (CAST(:nature AS text) IS NULL OR TRIM(COALESCE(to_jsonb(t)->>'Nat_quit', to_jsonb(t)->>'nat_quit')) = CAST(:nature AS text))
       AND (
-        (COALESCE(d."Comptabiliser", 'N') <> 'O' AND d.date_dep < :next_day
+        -- To comptabiliser: Comptabiliser 'N' and no Date_Comptabiliser.
+        (TRIM(d."Comptabiliser") = 'N' AND d."Date_Comptabiliser" IS NULL AND d.date_dep < :next_day
          AND (CAST(:pending_from AS date) IS NULL OR d.date_dep >= CAST(:pending_from AS date)))
         OR (:done AND d."Date_Comptabiliser" >= :done_from AND d."Date_Comptabiliser" < :next_day)
       )
@@ -619,12 +623,12 @@ WITH pol AS (
     SELECT DISTINCT ON (TRIM(num_police)) TRIM(num_police) AS num_police, code_compagnie
     FROM dbo."TPolice" ORDER BY TRIM(num_police), effet DESC NULLS LAST
 ), d AS MATERIALIZED (
-    SELECT d.num_dep, TRIM(t."Nat_quit") AS nature, d."Date_Comptabiliser"::date AS jour, d.date_dep, COALESCE(d.mont_dep, 0) AS montant,
+    SELECT d.num_dep, TRIM(COALESCE(to_jsonb(t)->>'Nat_quit', to_jsonb(t)->>'nat_quit')) AS nature, d."Date_Comptabiliser"::date AS jour, d.date_dep, COALESCE(d.mont_dep, 0) AS montant,
            COALESCE(NULLIF(TRIM(d.sinistre), ''), TRIM(d.num_quittance)) AS numero, TRIM(d.num_quittance) AS num_quittance
     FROM dbo."TDepense" d
     JOIN dbo.ttype_dep t ON TRIM(t.code_type) = TRIM(d.code_type)
     JOIN pol p ON p.num_police = TRIM(d.num_police)
-    WHERE p.code_compagnie = :compagnie AND TRIM(d."Typ_dep") = 'T' AND TRIM(t."Nat_quit") IN ('S', 'R')
+    WHERE p.code_compagnie = :compagnie AND TRIM(d."Typ_dep") = 'T' AND TRIM(COALESCE(to_jsonb(t)->>'Nat_quit', to_jsonb(t)->>'nat_quit')) IN ('S', 'R')
       AND d."Comptabiliser" = 'O' AND d."Date_Comptabiliser" IS NOT NULL
       AND (CAST(:debut AS date) IS NULL OR d."Date_Comptabiliser" >= CAST(:debut AS date))
       AND (CAST(:fin AS date) IS NULL OR d."Date_Comptabiliser" < CAST(:fin AS date) + 1)
@@ -907,7 +911,7 @@ quit AS (
 sin AS (
     SELECT TRIM(d.code_client) AS code_client, SUM(d.mont_dep) AS sinistre
     FROM dbo."TDepense" d JOIN dbo.ttype_dep t ON TRIM(t.code_type) = TRIM(d.code_type)
-    WHERE TRIM(d."Typ_dep") = 'T' AND TRIM(t."Nat_quit") = 'S' AND CAST(:etat AS text) <> 'ristourne'
+    WHERE TRIM(d."Typ_dep") = 'T' AND TRIM(COALESCE(to_jsonb(t)->>'Nat_quit', to_jsonb(t)->>'nat_quit')) = 'S' AND CAST(:etat AS text) <> 'ristourne'
       AND (CAST(:debut AS date) IS NULL OR (d.date_dep >= CAST(:debut AS date) AND d.date_dep < CAST(:fin AS date)))
       AND (CAST(:client AS text) IS NULL OR TRIM(d.code_client) = CAST(:client AS text))
       AND (CAST(:compagnie AS int) IS NULL AND CAST(:police AS text) IS NULL OR TRIM(d.num_police) IN (SELECT num_police FROM pol))
@@ -1268,7 +1272,7 @@ def bank_statement(
 # the day it was comptabilisé (Journal de dépense), or "en instance" while it is not.
 TECH_EXPENSES_SQL = """
 WITH d AS MATERIALIZED (
-    SELECT d.*, TRIM(t.libelle) AS libelle, TRIM(t."Nat_quit") AS nature
+    SELECT d.*, TRIM(t.libelle) AS libelle, TRIM(COALESCE(to_jsonb(t)->>'Nat_quit', to_jsonb(t)->>'nat_quit')) AS nature
     FROM dbo."TDepense" d JOIN dbo.ttype_dep t ON TRIM(t.code_type) = TRIM(d.code_type)
     WHERE TRIM(d."Typ_dep") = 'T' AND d.date_dep >= :debut AND d.date_dep < :fin
 ),
@@ -1422,7 +1426,7 @@ lines AS MATERIALIZED (
     FROM dbo."RDetRegCli" d JOIN dbo."TRegCli" t ON t.num_reg_cli = d."Num_reg_cli"
     WHERE COALESCE(TRIM(t.type_reg_cli), '') <> 'R' AND COALESCE(d."Montant", 0) > 0.0005
       AND ((d."Comptabiliser" = 'O' AND d."Date_Comptabiliser" >= :first AND d."Date_Comptabiliser" < CAST(:last AS date) + 1)
-           OR (COALESCE(d."Comptabiliser", 'N') <> 'O' AND t.date_reg_cli < CAST(:last AS date) + 1
+           OR (TRIM(d."Comptabiliser") = 'N' AND d."Date_Comptabiliser" IS NULL AND t.date_reg_cli < CAST(:last AS date) + 1
                AND t.date_reg_cli >= CAST(:first AS date) - INTERVAL '2 years'))
 ),
 q AS (
@@ -1436,11 +1440,14 @@ pol AS (
     FROM dbo."TPolice" WHERE TRIM(num_int) IN (SELECT num_int FROM q)
     ORDER BY TRIM(num_int), effet DESC NULLS LAST
 ),
+-- to declare: at least 100 millimes paid on the quittance
+small AS (SELECT num_quittance FROM lines WHERE NOT declared GROUP BY 1 HAVING SUM(montant) < 0.0995),
 kept AS (
     SELECT l.* FROM lines l JOIN q ON q.num_quittance = l.num_quittance JOIN pol p ON p.num_int = q.num_int
     JOIN dbo."TCompagnie" k ON k.code_compagnie = p.code_compagnie
     WHERE (CAST(:compagnie AS integer) IS NULL OR p.code_compagnie = CAST(:compagnie AS integer))
       AND UPPER(TRIM(k.nom_compagnie)) <> ALL(:excluded)
+      AND (l.declared OR l.num_quittance NOT IN (SELECT num_quittance FROM small))
 )
 SELECT per.jour, per.debut,
        COUNT(DISTINCT k.num_quittance) FILTER (WHERE k.declared) AS declarees,
@@ -1466,15 +1473,15 @@ kept AS MATERIALIZED (
     SELECT d.num_dep, COALESCE(d.mont_dep, 0) AS montant, d."Comptabiliser" = 'O' AS declared,
            CASE WHEN d."Comptabiliser" = 'O' THEN d."Date_Comptabiliser"::date ELSE d.date_dep::date END AS jour_ref
     FROM dbo."TDepense" d
-    JOIN dbo.ttype_dep t ON TRIM(t.code_type) = TRIM(d.code_type)
+    LEFT JOIN dbo.ttype_dep t ON TRIM(t.code_type) = TRIM(d.code_type)
     JOIN pol p ON p.num_police = TRIM(d.num_police)
     JOIN dbo."TCompagnie" k ON k.code_compagnie = p.code_compagnie
-    WHERE TRIM(d."Typ_dep") = 'T' AND TRIM(t."Nat_quit") IN ('S', 'R')
-      AND (CAST(:nature AS text) IS NULL OR TRIM(t."Nat_quit") = CAST(:nature AS text))
+    WHERE TRIM(d."Typ_dep") = 'T'
+      AND (CAST(:nature AS text) IS NULL OR TRIM(COALESCE(to_jsonb(t)->>'Nat_quit', to_jsonb(t)->>'nat_quit')) = CAST(:nature AS text))
       AND (CAST(:compagnie AS integer) IS NULL OR p.code_compagnie = CAST(:compagnie AS integer))
       AND UPPER(TRIM(k.nom_compagnie)) <> ALL(:excluded)
       AND ((d."Comptabiliser" = 'O' AND d."Date_Comptabiliser" >= :first AND d."Date_Comptabiliser" < CAST(:last AS date) + 1)
-           OR (COALESCE(d."Comptabiliser", 'N') <> 'O' AND d.date_dep < CAST(:last AS date) + 1))
+           OR (TRIM(d."Comptabiliser") = 'N' AND d."Date_Comptabiliser" IS NULL AND d.date_dep < CAST(:last AS date) + 1))
 )
 SELECT per.jour, per.debut,
        COUNT(k.num_dep) FILTER (WHERE k.declared) AS declarees,

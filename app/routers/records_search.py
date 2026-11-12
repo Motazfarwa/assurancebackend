@@ -108,14 +108,14 @@ def search_receipts(
     code_client: str | None = Query(default=None, max_length=8),
     nom_client: str | None = Query(default=None, max_length=60),
     code_branche: str | None = Query(default=None, max_length=3),
-    num_int: str | None = Query(default=None, max_length=15),
-    num_quittance: str | None = Query(default=None, max_length=15),
+    num_int: str | None = Query(default=None, max_length=30),
+    num_quittance: str | None = Query(default=None, max_length=30),
     date_saisie: date | None = None,
     # Échéance between date_min and date_max (both days included).
     date_min: date | None = None,
     date_max: date | None = None,
     code_compagnie: int | None = None,
-    num_police: str | None = Query(default=None, max_length=20),
+    num_police: str | None = Query(default=None, max_length=30),
     reglement: str | None = Query(default=None, pattern="^(tous|impayees|reglees)$"),
     limit: int = Query(default=200, ge=1, le=2000),
     db: Session = Depends(get_db),
@@ -155,6 +155,8 @@ def search_receipts(
     if code_branche and code_branche.strip():
         conditions.append(f"{BRANCH_EXPRESSION} = :code_branche")
         params["code_branche"] = code_branche.strip()
+    # The joins are on TRIM(...): row by row (nested loop) they take up to a minute on Render, hashed about a second.
+    db.execute(text("SET LOCAL enable_nestloop = off"))
     rows = db.execute(
         text(
             f"SELECT q.*, TRIM(c.nom_client) AS nom_client, TRIM(p.num_police) AS num_police, {BRANCH_EXPRESSION} AS branche, "
