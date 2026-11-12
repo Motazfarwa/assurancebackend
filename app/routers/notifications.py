@@ -114,7 +114,7 @@ INCOMPLETE_SQL = f"""
         SELECT code, COALESCE(ARRAY_AGG(numero || ' : ' || ARRAY_TO_STRING(manque, ', ') ORDER BY numero) FILTER (WHERE CARDINALITY(manque) > 0), ARRAY[]::text[]) AS polices
         FROM (
             SELECT TRIM(p.code_client) AS code, TRIM(p.num_police) AS numero,
-                   CASE WHEN UPPER(TRIM(p.etat)) = 'AN' THEN ARRAY_REMOVE(ARRAY[
+                   CASE WHEN UPPER(TRIM(p.etat)) IN ('AN', 'RV') THEN ARRAY_REMOVE(ARRAY[
                        CASE WHEN p.code_compagnie IS NULL THEN 'compagnie' END,
                        CASE WHEN p.effet IS NULL THEN 'date effet' END,
                        CASE WHEN {_empty('p.risque')} THEN 'risque' END,
@@ -131,7 +131,7 @@ INCOMPLETE_SQL = f"""
                    CASE WHEN q.montant_quittance IS NULL THEN 'montant' END, CASE WHEN q.solde_quittance IS NULL THEN 'solde' END
                ], NULL), ', ') ORDER BY TRIM(q.num_quittance)) AS quittances
         FROM dbo."TQuittance" q
-        JOIN dbo."TPolice" p ON TRIM(p.num_int) = TRIM(q.num_int) AND UPPER(TRIM(p.etat)) = 'AN'
+        JOIN dbo."TPolice" p ON TRIM(p.num_int) = TRIM(q.num_int) AND UPPER(TRIM(p.etat)) IN ('AN', 'RV')
         WHERE q.date_emission IS NULL OR q.echeance IS NULL OR q.prime_net IS NULL OR q.prime_total IS NULL
            OR q.montant_quittance IS NULL OR q.solde_quittance IS NULL
         GROUP BY 1

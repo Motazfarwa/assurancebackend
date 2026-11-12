@@ -312,7 +312,7 @@ def confrontation(
         expected = db.execute(
             text(
                 policy_select
-                + "WHERE p.code_compagnie = :c AND UPPER(TRIM(p.etat)) = 'AN' AND split_part(TRIM(p.echeance), '/', 2) = :mm "
+                + "WHERE p.code_compagnie = :c AND UPPER(TRIM(p.etat)) IN ('AN', 'RV') AND split_part(TRIM(p.echeance), '/', 2) = :mm "
                 "AND p.effet < :next_first AND (p.expiration IS NULL OR p.expiration >= :first_day) "
                 "ORDER BY TRIM(p.num_int)"
             ),
@@ -391,9 +391,9 @@ def confrontation(
                 theirs = f"{line['echeance'].day:02d}/{line['echeance'].month:02d}"
                 if theirs != policy["echeance"]:
                     reasons.append(f"Échéance différente (chez nous : {policy['echeance']})")
-            if policy["etat"] != "AN":
+            if policy["etat"] not in ("AN", "RV"):
                 reasons.append(f"Police {policy['etat'] or 'sans état'} chez nous")
-            if tc == "T" and number not in expected_numbers and policy["etat"] == "AN":
+            if tc == "T" and number not in expected_numbers and policy["etat"] in ("AN", "RV"):
                 reasons.append("Hors terme pour cette période chez nous")
             receipt = receipts_by_number.get(_clean_number(line["num_quittance"])) if line["num_quittance"] else None
             receipt = receipt or receipts_by_policy.get(str(policy["num_int"]).strip())

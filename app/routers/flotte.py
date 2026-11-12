@@ -381,7 +381,7 @@ def _check_vehicle(db: Session, contract: dict[str, Any], payload: VehiculeIn, o
         policy_twin = db.execute(
             text(
                 'SELECT TRIM(p.num_int) AS num_int FROM dbo."TPolice" p '
-                "WHERE UPPER(TRIM(p.etat)) = 'AN' AND (p.expiration IS NULL OR p.expiration >= CURRENT_DATE) "
+                "WHERE UPPER(TRIM(p.etat)) IN ('AN', 'RV') AND (p.expiration IS NULL OR p.expiration >= CURRENT_DATE) "
                 f"AND {PLATE_SQL.format(col='p.num_imat')} = :plate AND TRIM(p.num_int) <> :n LIMIT 1"
             ),
             {"plate": plate, "n": contract["num_int"]},

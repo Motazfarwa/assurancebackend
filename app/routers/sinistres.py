@@ -170,7 +170,7 @@ def _find_policy(db: Session, numero: str | None = None, immat: str | None = Non
     plate = re.sub(r"\s", "", _ascii((immat or "").replace("تونس", "TU")))
     if row is None and len(plate) >= 4:
         row = db.execute(
-            text(select_policy + "WHERE REPLACE(UPPER(TRIM(p.num_imat)), ' ', '') = :i ORDER BY (UPPER(TRIM(p.etat)) = 'AN') DESC, p.effet DESC NULLS LAST LIMIT 1"),
+            text(select_policy + "WHERE REPLACE(UPPER(TRIM(p.num_imat)), ' ', '') = :i ORDER BY (UPPER(TRIM(p.etat)) IN ('AN', 'RV')) DESC, p.effet DESC NULLS LAST LIMIT 1"),
             {"i": plate},
         ).mappings().first()
     vehicle = None

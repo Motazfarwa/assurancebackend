@@ -55,7 +55,8 @@ def _fail(exc: SQLAlchemyError) -> HTTPException:
 
 
 # Companies the agency keeps no journal or feuille de caisse for.
-EXCLUDED_COMPANIES = ["STAR", "SALIM", "MAE", "EL AMANA TAKAFUL", "BH ASSURANCES", "EUROP ASSISTANCE"]
+# BH ASSURANCES has its journals and feuille de caisse like the others.
+EXCLUDED_COMPANIES = ["STAR", "SALIM", "MAE", "EL AMANA TAKAFUL", "EUROP ASSISTANCE"]
 
 
 @router.get("/compagnies")
@@ -1138,7 +1139,7 @@ WITH p AS (
            UPPER(TRIM(p.risque)) AS risque,
            CAST(SUBSTRING(TRIM(p.echeance) FROM '^[0-9]{1,2}[/-]([0-9]{1,2})') AS integer) AS mois_echeance
     FROM dbo."TPolice" p
-    WHERE UPPER(TRIM(p.etat)) = 'AN'
+    WHERE UPPER(TRIM(p.etat)) IN ('AN', 'RV')
       AND (CAST(:compagnie AS integer) IS NULL OR p.code_compagnie = CAST(:compagnie AS integer))
 )
 SELECT p.num_police, p.code_client, TRIM(c.nom_client) AS nom_client, p.echeance, p.unite, p.duree, p.tous_risque, p.etat,

@@ -17,11 +17,11 @@ router = APIRouter(prefix="/api/records", tags=["Recherche polices et quittances
 BRANCH_EXPRESSION = "COALESCE(NULLIF(TRIM(q.code_branche), ''), TRIM(p.code_branche))"
 
 # Policy status as in the legacy "Liste des polices" (Tous / En vigueur / Susp. Rés. / Expirées):
-# AN = in force (expired once its expiration date is past), SS / RE / RV = suspended or terminated.
+# AN (affaire nouvelle) and RV (remise en vigueur) = in force (expired once its expiration date is past), SS / RE = suspended or terminated.
 STATUT_SQL = {
-    "vigueur": "UPPER(TRIM(p.etat)) = 'AN' AND (p.expiration IS NULL OR p.expiration >= CURRENT_DATE)",
-    "expirees": "UPPER(TRIM(p.etat)) = 'AN' AND p.expiration < CURRENT_DATE",
-    "susp": "UPPER(TRIM(p.etat)) IN ('SS', 'RE', 'RV')",
+    "vigueur": "UPPER(TRIM(p.etat)) IN ('AN', 'RV') AND (p.expiration IS NULL OR p.expiration >= CURRENT_DATE)",
+    "expirees": "UPPER(TRIM(p.etat)) IN ('AN', 'RV') AND p.expiration < CURRENT_DATE",
+    "susp": "UPPER(TRIM(p.etat)) IN ('SS', 'RE')",
 }
 
 
