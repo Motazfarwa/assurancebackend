@@ -199,21 +199,14 @@ def _pay_in(db: Session, payload: ChequeIn, nump: str, user: str, allocations: l
     return numero
 
 
-def _journal_day(db: Session) -> date:
-    """The journal / feuille de caisse day of today (agency time): the 15th until the 15th, then the last day of the month."""
-    return db.execute(text(
-        "SELECT CASE WHEN EXTRACT(DAY FROM d) <= 15 THEN date_trunc('month', d)::date + 14 "
-        "ELSE (date_trunc('month', d) + INTERVAL '1 month - 1 day')::date END "
-        "FROM (SELECT (now() AT TIME ZONE 'Africa/Tunis')::date AS d) t"
-    )).scalar()
-
-
 def _comptabiliser(db: Session, numero: int, user: str) -> date:
-    """Comptabilises the quittances paid by the settlement `numero` in the feuille de caisse of the journal day: its
-    RDetRegCli lines get Comptabiliser 'O' and that date (kept in TEncaissementValide, like a validation in the journal),
+    """Comptabilises the quittances paid by the settlement `numero`: its RDetRegCli lines get Comptabiliser 'O' and the
+    date saisie as Date_Comptabiliser (kept in TEncaissementValide, like a validation in the journal),
     and so does each quittance it settles in full (an acompte leaves the quittance to declare, as in the journal).
     TEncaissementValide must exist (_ensure_validated, which commits: called before the settlement is written)."""
-    day = _journal_day(db)
+    # Date_Comptabiliser = the date saisie of the settlement (TRegCli.date_reg_cli); the journal d'encaissement of its half
+    # month (the 15th or the last day of the month) shows it ticked.
+    day = db.execute(text('SELECT CAST(date_reg_cli AS date) FROM dbo."TRegCli" WHERE num_reg_cli = :r'), {"r": numero}).scalar()
     params = {"r": numero, "d": day, "u": user[:50]}
     db.execute(text(
         """UPDATE dbo."RDetRegCli" SET "Comptabiliser" = 'O', "Date_Comptabiliser" = :d WHERE "Num_reg_cli" = :r"""
