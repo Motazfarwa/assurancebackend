@@ -640,7 +640,8 @@ def received_gaps(
 # Feuille de caisse over a period
 # ---------------------------------------------------------------------------------------------
 # Per day of the period, the client settlements of the company's quittances (TRegCli dated that day, one RDetRegCli
-# line per quittance paid; the 'R' moins perçus are not cash): primes = what the clients paid, and the commission of a
+# line per quittance paid, the 'R' perçu adjustments included: the legacy JEQ counts them, and the commission of a quittance
+# they settle): primes = what the clients paid, and the commission of a
 # quittance on the line that settles it (Acompte_Solde 'S'; an acompte carries none). Without dates: every day.
 CASH_RECEIPTS_SQL = """
 -- The feuille de caisse of a day is what the journal d'encaissement declared that day (as the legacy feuille): the client
@@ -651,7 +652,6 @@ WITH lines AS MATERIALIZED (
            COALESCE(NULLIF(TRIM(d."Acompte_Solde"), ''), 'S') = 'S' AS settles
     FROM dbo."RDetRegCli" d JOIN dbo."TRegCli" t ON t.num_reg_cli = d."Num_reg_cli"
     WHERE d."Comptabiliser" = 'O' AND d."Date_Comptabiliser" IS NOT NULL
-      AND COALESCE(TRIM(t.type_reg_cli), '') <> 'R'
       AND (CAST(:debut AS date) IS NULL OR d."Date_Comptabiliser" >= CAST(:debut AS date))
       AND (CAST(:fin AS date) IS NULL OR d."Date_Comptabiliser" < CAST(:fin AS date) + 1)
 ),
@@ -666,7 +666,7 @@ pol AS (
     FROM dbo."TPolice" WHERE TRIM(num_int) IN (SELECT num_int FROM q)
     ORDER BY TRIM(num_int), effet DESC NULLS LAST
 )
-SELECT l.jour, COUNT(*) AS quittances, ROUND(SUM(l.montant)::numeric, 3) AS primes, 0 AS tq,
+SELECT l.jour, COUNT(DISTINCT l.num_quittance) AS quittances, ROUND(SUM(l.montant)::numeric, 3) AS primes, 0 AS tq,
        ROUND(SUM(CASE WHEN l.settles THEN q.comm ELSE 0 END)::numeric, 3) AS commission, 0 AS frais
 FROM lines l JOIN q ON q.num_quittance = l.num_quittance JOIN pol p ON p.num_int = q.num_int
 WHERE p.code_compagnie = :compagnie
@@ -1503,7 +1503,7 @@ lines AS MATERIALIZED (
     SELECT TRIM(d."Num_quitance") AS num_quittance, COALESCE(d."Montant", 0) AS montant, d."Comptabiliser" = 'O' AS declared,
            CASE WHEN d."Comptabiliser" = 'O' THEN d."Date_Comptabiliser"::date ELSE t.date_reg_cli::date END AS jour_ref
     FROM dbo."RDetRegCli" d JOIN dbo."TRegCli" t ON t.num_reg_cli = d."Num_reg_cli"
-    WHERE COALESCE(TRIM(t.type_reg_cli), '') <> 'R' AND COALESCE(d."Montant", 0) > 0.0005
+    WHERE COALESCE(d."Montant", 0) > 0.0005
       AND ((d."Comptabiliser" = 'O' AND d."Date_Comptabiliser" >= :first AND d."Date_Comptabiliser" < CAST(:last AS date) + 1)
            OR (TRIM(d."Comptabiliser") = 'N' AND d."Date_Comptabiliser" IS NULL AND t.date_reg_cli < CAST(:last AS date) + 1
                AND t.date_reg_cli >= CAST(:first AS date) - INTERVAL '2 years'))
