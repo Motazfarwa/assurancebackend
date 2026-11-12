@@ -371,6 +371,42 @@ def save_receipt_choices(payload: ChoixJournal, user: dict[str, Any] = Depends(r
     return {"enregistres": len(payload.items)}
 
 
+@router.put("/encaissement/coche")
+def tick_receipts(payload: ChoixJournal, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """A tick in the journal d'encaissement of a journal day (the 15th or the last day of the month) comptabilises the
+    quittance on that day at once (Comptabiliser 'O', Date_Comptabiliser = the day); an untick takes a quittance declared in
+    the half month of that day back out (to declare again). The tick is kept (TJournalChoix) like the other choices."""
+    jour = payload.date
+    if jour.day != 15 and (jour + timedelta(days=1)).day != 1:
+        raise HTTPException(status_code=422, detail="Un journal est daté du 15 ou du dernier jour du mois.")
+    _ensure_validated(db)
+    name = str(user.get("sub", ""))[:50]
+    wanted = {item.num_quittance.strip(): item.coche for item in payload.items if item.num_quittance.strip()}
+    declared, withdrawn = [], []
+    try:
+        db.execute(text("SELECT pg_advisory_xact_lock(hashtext('journal:E:' || :j))"), {"j": jour.isoformat()})
+        lines = _receipts(db, None, jour, True, sorted(wanted), regles=True, done_from=_period_start(jour))
+        for line in lines:
+            number = line["num_quittance"]
+            if wanted.get(number) and not line["comptabilise"] and (line["paye"] or line["a_s"] == "A"):
+                _declare_receipt(db, line, jour, name)
+                declared.append(number)
+            elif wanted.get(number) is False and line["comptabilise"] and line.get("date_comptabilise"):
+                _undeclare_receipt(db, number, date.fromisoformat(str(line["date_comptabilise"])[:10]))
+                withdrawn.append(number)
+        for number, coche in wanted.items():
+            db.execute(text(
+                'INSERT INTO dbo."TJournalChoix" (jour, num_quittance, coche, utilisateur, date_maj) '
+                "VALUES (:d, :n, :c, :u, now() AT TIME ZONE 'Africa/Tunis') "
+                'ON CONFLICT (jour, num_quittance) DO UPDATE SET coche = EXCLUDED.coche, utilisateur = EXCLUDED.utilisateur, date_maj = EXCLUDED.date_maj'
+            ), {"d": jour, "n": number, "c": coche, "u": name})
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise _fail(exc) from exc
+    return {"date": jour.isoformat(), "comptabilisees": declared, "retirees": withdrawn}
+
+
 class ValiderEncaissement(BaseModel):
     num_quittance: str = Field(min_length=1, max_length=30)
 

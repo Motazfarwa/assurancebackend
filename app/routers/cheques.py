@@ -22,6 +22,7 @@ from app.auth import require_current_user
 from app.config import settings
 from app.database import get_db
 from app.routers.assistant import FicheRequest, _gemini_generate, _ocr_space
+from app.routers.journaux import _ensure_validated
 
 
 router = APIRouter(prefix="/api/cheques", tags=["Chèques"], dependencies=[Depends(require_current_user)])
@@ -47,6 +48,9 @@ class ChequeIn(BaseModel):
     en_instance: bool = True
     # Agency account (TBanque) the piece is paid into, required "à verser".
     compte_versement: str | None = Field(default=None, max_length=15)
+    # "À verser" only: the quittances it pays are comptabilisées in the feuille de caisse of the journal day (the 15th until
+    # the 15th, then the last day of the month).
+    comptabiliser: bool = False
     allocations: list[AllocationIn] = Field(default_factory=list, max_length=500)
 
 
@@ -195,10 +199,44 @@ def _pay_in(db: Session, payload: ChequeIn, nump: str, user: str, allocations: l
     return numero
 
 
+def _journal_day(db: Session) -> date:
+    """The journal / feuille de caisse day of today (agency time): the 15th until the 15th, then the last day of the month."""
+    return db.execute(text(
+        "SELECT CASE WHEN EXTRACT(DAY FROM d) <= 15 THEN date_trunc('month', d)::date + 14 "
+        "ELSE (date_trunc('month', d) + INTERVAL '1 month - 1 day')::date END "
+        "FROM (SELECT (now() AT TIME ZONE 'Africa/Tunis')::date AS d) t"
+    )).scalar()
+
+
+def _comptabiliser(db: Session, numero: int, user: str) -> date:
+    """Comptabilises the quittances paid by the settlement `numero` in the feuille de caisse of the journal day: its
+    RDetRegCli lines get Comptabiliser 'O' and that date (kept in TEncaissementValide, like a validation in the journal),
+    and so does each quittance it settles in full (an acompte leaves the quittance to declare, as in the journal).
+    TEncaissementValide must exist (_ensure_validated, which commits: called before the settlement is written)."""
+    day = _journal_day(db)
+    params = {"r": numero, "d": day, "u": user[:50]}
+    db.execute(text(
+        """UPDATE dbo."RDetRegCli" SET "Comptabiliser" = 'O', "Date_Comptabiliser" = :d WHERE "Num_reg_cli" = :r"""
+    ), params)
+    db.execute(text(
+        """UPDATE dbo."TQuittance" q SET "Comptabiliser" = 'O', "Date_Comptabiliser" = :d
+        WHERE TRIM(q.num_quittance) IN (SELECT TRIM(d."Num_quitance") FROM dbo."RDetRegCli" d WHERE d."Num_reg_cli" = :r)
+          AND COALESCE(q.solde_quittance, 0) <= 0.0005 AND COALESCE(q."Comptabiliser", 'N') <> 'O'"""
+    ), params)
+    db.execute(text(
+        """INSERT INTO dbo."TEncaissementValide" ("Num_reg_cli", "Num_quitance", "Date_Validation", "Montant", "Utilisateur", "Date_Saisie")
+        SELECT d."Num_reg_cli", TRIM(d."Num_quitance"), :d, d."Montant", :u, now() AT TIME ZONE 'Africa/Tunis'
+        FROM dbo."RDetRegCli" d WHERE d."Num_reg_cli" = :r ON CONFLICT DO NOTHING"""
+    ), params)
+    return day
+
+
 def _check_reglement(db: Session, payload: ChequeIn) -> None:
     """A piece "à verser": one status only, an agency account, and not a piece already settled for this client."""
     if payload.en_instance:
         raise HTTPException(status_code=422, detail="Choisissez un seul statut : « À verser » ou « En instance ».")
+    if payload.comptabiliser and not any(item.montant > 0 for item in payload.allocations):
+        raise HTTPException(status_code=422, detail="Pour comptabiliser dans la feuille de caisse, répartissez le montant sur au moins une quittance.")
     compte = (payload.compte_versement or "").strip()
     if not compte:
         raise HTTPException(status_code=422, detail="Choisissez le compte de versement de l'agence.")
@@ -417,17 +455,21 @@ def create_piece(payload: ChequeIn, user: dict[str, Any] = Depends(require_curre
     if payload.a_verser:
         _check_reglement(db, payload)
     allocations = _check_allocations(db, payload)
-    numero = None
+    numero, day = None, None
+    if payload.a_verser and payload.comptabiliser:
+        _ensure_validated(db)
     try:
         if payload.a_verser:
             numero = _store_reglement(db, payload, str(user.get("sub", "")), allocations)
+            if payload.comptabiliser:
+                day = _comptabiliser(db, numero, str(user.get("sub", "")))
         else:
             _store(db, payload, str(user.get("sub", "")), allocations, creating=True)
         db.commit()
     except SQLAlchemyError as exc:
         db.rollback()
         raise HTTPException(status_code=503, detail=f"Enregistrement impossible : {str(getattr(exc, 'orig', exc))[:250]}") from exc
-    return {"nump": payload.nump.strip(), "num_reg_cli": numero}
+    return {"nump": payload.nump.strip(), "num_reg_cli": numero, "date_comptabilise": day.isoformat() if day else None}
 
 
 @router.put("/{nump}")
@@ -445,17 +487,21 @@ def update_piece(nump: str, payload: ChequeIn, user: dict[str, Any] = Depends(re
     if payload.a_verser:
         _check_reglement(db, payload)
     allocations = _check_allocations(db, payload, exclude_nump=nump)
-    numero = None
+    numero, day = None, None
+    if payload.a_verser and payload.comptabiliser:
+        _ensure_validated(db)
     try:
         if payload.a_verser:
             numero = _pay_in(db, payload, nump, str(user.get("sub", "")), allocations)
+            if payload.comptabiliser:
+                day = _comptabiliser(db, numero, str(user.get("sub", "")))
         else:
             _store(db, payload, str(user.get("sub", "")), allocations, creating=False)
         db.commit()
     except SQLAlchemyError as exc:
         db.rollback()
         raise HTTPException(status_code=503, detail=f"Modification impossible : {str(getattr(exc, 'orig', exc))[:250]}") from exc
-    return {"nump": nump.strip(), "num_reg_cli": numero}
+    return {"nump": nump.strip(), "num_reg_cli": numero, "date_comptabilise": day.isoformat() if day else None}
 
 
 @router.delete("/{nump}", status_code=204)
