@@ -774,15 +774,37 @@ LEFT JOIN LATERAL (SELECT * FROM dbo."TPolice" p WHERE TRIM(p.num_int) = m.numer
 LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(p.code_client)
 ORDER BY m.date_mvt, m.numero, m.mvt
 """,
+    # The legacy software logs a quittance under the number typed at its entry: often the série of the printed form
+    # ("Ajout Quittance N° 341173"), the quittance itself being numbered 20261104400741 with "SERIE 341173" in its
+    # observation. The quittance is found by its number, else by that série in an observation (the one entered nearest
+    # the movement when two have it); not found: only the logged number, with trouvee false.
     "quittance": f"""
-WITH m AS ({PRODUCTION_MOVES})
-SELECT m.date_mvt, m.mvt, m.numero AS num_quittance, TRIM(q.num_int) AS num_int, TRIM(q.code_client) AS code_client,
+WITH m AS ({PRODUCTION_MOVES}),
+-- the numbers written in the observations (SERIE 341173, SERIE N 323223, ...)
+tok AS MATERIALIZED (
+    SELECT DISTINCT TRIM(q.num_quittance) AS nq, t[1] AS tk
+    FROM dbo."TQuittance" q, regexp_matches(q.observation, '([0-9][0-9.]*[0-9])', 'g') AS t
+    WHERE q.observation ~ '[0-9]{{4}}'
+),
+link AS (
+    SELECT numero, numero AS nq, 0 AS rang FROM m
+    UNION
+    SELECT m.numero, tok.nq, 1 FROM m JOIN tok ON tok.tk = m.numero WHERE m.numero ~ '^[0-9][0-9.]{{3,}}$'
+),
+cand AS MATERIALIZED (
+    SELECT q.*, TRIM(q.num_quittance) AS nq FROM dbo."TQuittance" q WHERE TRIM(q.num_quittance) IN (SELECT nq FROM link)
+)
+SELECT DISTINCT ON (m.date_mvt, m.numero, m.mvt)
+       m.date_mvt, m.mvt, COALESCE(q.nq, m.numero) AS num_quittance, CASE WHEN q.nq <> m.numero THEN m.numero END AS serie,
+       q.nq IS NOT NULL AS trouvee, TRIM(q.num_int) AS num_int, TRIM(q.code_client) AS code_client,
        TRIM(c.nom_client) AS nom_client, q.echeance, TRIM(q.tc) AS tc, TRIM(q."Periode") AS periode,
        TRIM(q.type_quittance) AS type_quittance, q.prime_total
 FROM m
-LEFT JOIN dbo."TQuittance" q ON TRIM(q.num_quittance) = m.numero
+LEFT JOIN link l ON l.numero = m.numero
+LEFT JOIN cand q ON q.nq = l.nq
 LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(q.code_client)
-ORDER BY m.date_mvt, m.numero, m.mvt
+ORDER BY m.date_mvt, m.numero, m.mvt, q.nq IS NULL, l.rang,
+         ABS(COALESCE(q.date_saisie, q."Date_M", q.date_emission)::date - m.date_mvt) NULLS LAST
 """,
 }
 PRODUCTION_PATTERNS = {"police": r"^\s*\S+\s+Police\s+N°", "quittance": r"^\s*\S+\s+Quittance\s+N°"}
