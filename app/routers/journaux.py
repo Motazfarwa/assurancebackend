@@ -145,7 +145,8 @@ SELECT TRIM(q.num_quittance) AS num_quittance, TRIM(q.tc) AS tc, q.echeance, p.n
        COALESCE(r.declared_on, q."Date_Comptabiliser") AS date_comptabilise,
        (SELECT MAX(TRIM(v."Utilisateur")) FROM dbo."TEncaissementValide" v WHERE TRIM(v."Num_quitance") = TRIM(q.num_quittance)
           AND v."Date_Validation" >= :done_from AND v."Date_Validation" < :next_day) AS valide_par,
-       COALESCE(r.declared_before, 0) AS declared_before, COALESCE(r.at_day, 0) AS at_day, COALESCE(r.pending, 0) AS pending
+       COALESCE(r.declared_before, 0) AS declared_before, COALESCE(r.at_day, 0) AS at_day, COALESCE(r.pending, 0) AS pending,
+       TRIM(q.num_quittance) IN (SELECT num_quittance FROM paid) AS to_declare
 FROM q
 JOIN pol p ON p.num_int = TRIM(q.num_int)
 JOIN dbo."TCompagnie" k ON k.code_compagnie = p.code_compagnie
@@ -187,6 +188,13 @@ def _receipt(row: Any) -> dict[str, Any]:
     return item
 
 
+def _pending_part(item: dict[str, Any]) -> dict[str, Any]:
+    """The part still to declare of a quittance also declared in the journal (paid again since): its own line, unticked."""
+    paid = item["paye"]
+    return {**item, "comptabilise": False, "date_comptabilise": None, "a_s": "S" if paid else "A", "montant": round(item["pending"], 3),
+            "comm": item["commission"] if paid else 0, "partie": "a_declarer"}
+
+
 def _receipts(db: Session, compagnie: int | None, day: date, done: bool, numbers: list[str] | None = None,
               regles: bool = False, reg_debut: date | None = None, reg_fin: date | None = None,
               done_from: date | None = None, pending_from: date | None = None) -> list[dict[str, Any]]:
@@ -198,7 +206,17 @@ def _receipts(db: Session, compagnie: int | None, day: date, done: bool, numbers
          "done_from": done_from or day, "pending_from": pending_from,
          "excluded": EXCLUDED_COMPANIES, "regles": regles, "reg_debut": reg_debut, "reg_fin": reg_fin},
     ).mappings().all()
-    return [_receipt(row) for row in rows]
+    # A quittance declared in the journal and paid again since (another pièce, not comptabilisée) is listed twice: the
+    # part declared (ticked) and the part still to declare (unticked).
+    items = []
+    for row in rows:
+        item = _receipt(row)
+        items.append(item)
+        if item["comptabilise"] and item.pop("to_declare") and item["pending"] > EPS:
+            item["partie"] = "declaree"
+            items.append(_pending_part(item))
+        item.pop("to_declare", None)
+    return items
 
 
 @router.get("/encaissement")
@@ -310,19 +328,20 @@ def _declare_receipt(db: Session, line: dict[str, Any], day: date, name: str) ->
     return len(settlements)
 
 
-def _undeclare_receipt(db: Session, number: str, day: date) -> int:
+def _undeclare_receipt(db: Session, number: str, day: date, until: date | None = None) -> int:
     """Takes a quittance out of the journal of `day` (it was declared on that day, then unticked): its settlement lines
-    declared on that day are to declare again, and so is the quittance. Returns the number of settlement lines."""
-    params = {"n": number, "d": day}
+    declared on that day (with `until`: from `day` to `until`) are to declare again, and so is the quittance. Returns the
+    number of settlement lines."""
+    params = {"n": number, "d": day, "u": until or day}
     count = db.execute(text(
         "UPDATE dbo.\"RDetRegCli\" SET \"Comptabiliser\" = 'N', \"Date_Comptabiliser\" = NULL "
-        "WHERE TRIM(\"Num_quitance\") = :n AND \"Comptabiliser\" = 'O' AND CAST(\"Date_Comptabiliser\" AS date) = :d"
+        "WHERE TRIM(\"Num_quitance\") = :n AND \"Comptabiliser\" = 'O' AND CAST(\"Date_Comptabiliser\" AS date) BETWEEN :d AND :u"
     ), params).rowcount
     db.execute(text(
         "UPDATE dbo.\"TQuittance\" SET \"Comptabiliser\" = 'N', \"Date_Comptabiliser\" = NULL "
-        "WHERE TRIM(num_quittance) = :n AND \"Comptabiliser\" = 'O' AND CAST(\"Date_Comptabiliser\" AS date) = :d"
+        "WHERE TRIM(num_quittance) = :n AND \"Comptabiliser\" = 'O' AND CAST(\"Date_Comptabiliser\" AS date) BETWEEN :d AND :u"
     ), params)
-    db.execute(text('DELETE FROM dbo."TEncaissementValide" WHERE TRIM("Num_quitance") = :n AND "Date_Validation" = :d'), params)
+    db.execute(text('DELETE FROM dbo."TEncaissementValide" WHERE TRIM("Num_quitance") = :n AND "Date_Validation" BETWEEN :d AND :u'), params)
     return count
 
 
@@ -391,8 +410,9 @@ def tick_receipts(payload: ChoixJournal, user: dict[str, Any] = Depends(require_
             if wanted.get(number) and not line["comptabilise"] and (line["paye"] or line["a_s"] == "A"):
                 _declare_receipt(db, line, jour, name)
                 declared.append(number)
-            elif wanted.get(number) is False and line["comptabilise"] and line.get("date_comptabilise"):
-                _undeclare_receipt(db, number, date.fromisoformat(str(line["date_comptabilise"])[:10]))
+            elif wanted.get(number) is False and line["comptabilise"]:
+                # every settlement line declared in the half month of the journal
+                _undeclare_receipt(db, number, _period_start(jour), jour)
                 withdrawn.append(number)
         for number, coche in wanted.items():
             db.execute(text(
