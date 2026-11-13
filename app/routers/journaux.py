@@ -984,9 +984,10 @@ reg AS (
 quit AS (
     SELECT q.code_client,
            SUM(q.prime_total) FILTER (WHERE NOT q.ristourne) AS prime,
-           ABS(SUM(q.prime_total) FILTER (WHERE q.ristourne)) AS ristourne,
+           -- a ristourne is money given back: negative, and so is its commission (stored positive in TQuittance)
+           -ABS(SUM(q.prime_total) FILTER (WHERE q.ristourne)) AS ristourne,
            SUM(reg.montant) FILTER (WHERE NOT q.ristourne) AS reglement,
-           SUM(q.commission) AS commission
+           SUM(CASE WHEN q.ristourne THEN -ABS(q.commission) ELSE q.commission END) AS commission
     FROM q LEFT JOIN reg ON reg.num_quittance = q.num_quittance
     GROUP BY 1
 ),
@@ -1024,7 +1025,9 @@ WITH pol AS MATERIALIZED (
 ),
 q AS MATERIALIZED (
     SELECT TRIM(q.code_client) AS code_client, q.echeance::date AS echeance, TRIM(q.num_int) AS num_int,
-           TRIM(q.num_quittance) AS num_quittance, COALESCE(q.prime_total, 0) AS prime
+           TRIM(q.num_quittance) AS num_quittance,
+           -- a ristourne (type R, stored positive) is negative
+           CASE WHEN TRIM(COALESCE(q.type_quittance, '')) = 'R' THEN -ABS(COALESCE(q.prime_total, 0)) ELSE COALESCE(q.prime_total, 0) END AS prime
     FROM dbo."TQuittance" q
     WHERE COALESCE(q.annule, 'N') <> 'O'
       AND q."Date_Retour" IS NULL
