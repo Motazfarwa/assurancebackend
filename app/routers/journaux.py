@@ -91,11 +91,14 @@ WITH paid AS MATERIALIZED (
     -- To declare: Comptabiliser 'N', no Date_Comptabiliser, and at least 100 millimes paid on the quittance.
     SELECT TRIM(d."Num_quitance") AS num_quittance
     FROM dbo."RDetRegCli" d JOIN dbo."TRegCli" t ON t.num_reg_cli = d."Num_reg_cli"
-    WHERE TRIM(d."Comptabiliser") = 'N' AND d."Date_Comptabiliser" IS NULL AND t.date_reg_cli < :next_day
+    WHERE TRIM(d."Comptabiliser") = 'N' AND d."Date_Comptabiliser" IS NULL
       AND t.date_reg_cli >= date_trunc('year', CAST(:day AS date)) - INTERVAL '1 year'
-      -- the journal of a period: only what was paid in it (from its first day)
-      AND (CAST(:pending_from AS date) IS NULL OR t.date_reg_cli >= CAST(:pending_from AS date))
-    GROUP BY 1 HAVING SUM(COALESCE(d."Montant", 0)) >= 0.0995
+    GROUP BY 1
+    HAVING SUM(CASE WHEN t.date_reg_cli < :next_day THEN COALESCE(d."Montant", 0) ELSE 0 END) >= 0.0995
+      -- the journal of a period: the quittances whose latest payment still to declare is in it (all of that quittance's
+      -- payments still to declare are then in this journal, as in "Lister")
+      AND (CAST(:pending_from AS date) IS NULL
+           OR (MAX(t.date_reg_cli) >= CAST(:pending_from AS date) AND MAX(t.date_reg_cli) < :next_day))
 ),
 q AS MATERIALIZED (
     SELECT q.* FROM dbo."TQuittance" q
@@ -1500,8 +1503,11 @@ CREATE TABLE IF NOT EXISTS dbo."TJournalValide" (
 RECEIPT_PERIODS_SQL = """
 WITH per AS (SELECT * FROM unnest(CAST(:starts AS date[]), CAST(:ends AS date[])) AS p(debut, jour)),
 lines AS MATERIALIZED (
+    -- still to declare: every such payment of a quittance is in the journal of its latest one (as listed in the journal
+    -- and declared by "Valider"), not split over the half months it was paid in
     SELECT TRIM(d."Num_quitance") AS num_quittance, COALESCE(d."Montant", 0) AS montant, d."Comptabiliser" = 'O' AS declared,
-           CASE WHEN d."Comptabiliser" = 'O' THEN d."Date_Comptabiliser"::date ELSE t.date_reg_cli::date END AS jour_ref
+           CASE WHEN d."Comptabiliser" = 'O' THEN d."Date_Comptabiliser"::date
+                ELSE (MAX(t.date_reg_cli) FILTER (WHERE d."Comptabiliser" IS DISTINCT FROM 'O') OVER (PARTITION BY TRIM(d."Num_quitance")))::date END AS jour_ref
     FROM dbo."RDetRegCli" d JOIN dbo."TRegCli" t ON t.num_reg_cli = d."Num_reg_cli"
     WHERE COALESCE(d."Montant", 0) > 0.0005
       AND ((d."Comptabiliser" = 'O' AND d."Date_Comptabiliser" >= :first AND d."Date_Comptabiliser" < CAST(:last AS date) + 1)
