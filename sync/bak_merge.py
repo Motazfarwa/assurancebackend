@@ -43,6 +43,7 @@ def recent(app, prefix=""):
 
 
 USERS = "RUtilisateur_Depot"
+SKIP = {USERS}
 # the comparisons hash whole tables: in memory, not in temporary files (the online disk is small, its work_mem tiny)
 WORK_MEM = " -c work_mem=128MB"
 
@@ -77,7 +78,8 @@ def primary_key(c, table):
 
 def pairs(c):
     tables = set(c.execute(text("SELECT table_name FROM information_schema.tables WHERE table_schema='dbo' AND table_type='BASE TABLE'")).scalars())
-    return sorted((t, t.lower()) for t in tables if t != t.lower() and t.lower() in tables)
+    # The users are managed in the new app (passwords, lieu, users deleted there): never taken from the .BAK.
+    return sorted((t, t.lower()) for t in tables if t != t.lower() and t.lower() in tables and t not in SKIP)
 
 
 def plan(c):
