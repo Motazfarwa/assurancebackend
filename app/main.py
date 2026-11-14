@@ -41,6 +41,8 @@ from app.routers.reconciliation import router as reconciliation_router
 from app.routers.journal_employe import router as journal_employe_router
 from app.audit import audit_middleware
 from app.repairs import run_repairs
+from app import whatsapp_robot
+from app.routers.whatsapp_robot import router as whatsapp_robot_router
 
 # The application's own messages (readings, repairs, history) appear in the server logs; other libraries stay at warnings.
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
@@ -50,7 +52,9 @@ logging.getLogger("app").setLevel(logging.INFO)
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     await run_in_threadpool(run_repairs)  # corrects data left wrong by earlier versions
+    await run_in_threadpool(whatsapp_robot.start_if_linked)  # the linked WhatsApp number reconnects
     yield
+    await run_in_threadpool(whatsapp_robot.stop, 3)
 
 
 app = FastAPI(title="Assurance API", version="0.1.0", lifespan=lifespan)
@@ -72,6 +76,7 @@ app.include_router(clients_router)
 app.include_router(client_records_router)
 app.include_router(auth_router)
 app.include_router(admin_users_router)
+app.include_router(whatsapp_robot_router)
 app.include_router(prestataires_router)
 app.include_router(companies_router)
 app.include_router(documents_router)

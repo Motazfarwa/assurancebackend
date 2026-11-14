@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 
 from app.auth import require_current_user
 from app.config import settings
+from app import whatsapp_robot
 from app.database import get_db
 from app.pdf_simple import PAGE_H, PAGE_W, Pdf, fit, text_width as pdf_width
 from app.routers.impayes import unpaid_statement
@@ -285,7 +286,16 @@ def send_memoire(code_client: str, payload: Envoi, db: Session = Depends(get_db)
     number = whatsapp_number(to)
     if len(number) < 10:
         raise HTTPException(status_code=422, detail="Numéro WhatsApp invalide.")
-    if settings.whatsapp_token and settings.whatsapp_phone_number_id:
+    # The WhatsApp robot (the agency's number linked in Administration → WhatsApp) sends it directly, free of charge.
+    robot_problem = None
+    if whatsapp_robot.configured():
+        try:
+            whatsapp_robot.send_document(number, pdf, name, payload.message)
+            return {"canal": "whatsapp", "destinataire": number, "envoye": True, "fichier": name}
+        except Exception as exc:  # noqa: BLE001 - the share fallback below is offered, with the reason
+            logger.warning("mémoire %s: WhatsApp robot to %s failed: %s", code, number, exc)
+            robot_problem = f"Envoi direct impossible : {exc}"
+    if not robot_problem and settings.whatsapp_token and settings.whatsapp_phone_number_id:
         try:
             _send_whatsapp(number, payload.message, pdf, name)
         except Exception as exc:  # noqa: BLE001
@@ -293,5 +303,5 @@ def send_memoire(code_client: str, payload: Envoi, db: Session = Depends(get_db)
             raise HTTPException(status_code=502, detail=f"Le message WhatsApp n’a pas pu être envoyé : {exc}") from exc
         return {"canal": "whatsapp", "destinataire": number, "envoye": True, "fichier": name}
     # No WhatsApp API on the server: WhatsApp opens with the message written; the PDF (downloaded) is attached there.
-    return {"canal": "whatsapp", "destinataire": number, "envoye": False, "fichier": name,
+    return {"canal": "whatsapp", "destinataire": number, "envoye": False, "fichier": name, "avertissement": robot_problem,
             "lien": f"https://wa.me/{number}?text={quote(payload.message)}"}

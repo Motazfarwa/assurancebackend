@@ -55,6 +55,9 @@ class Settings(BaseSettings):
     # (the PDF) and whose body has one parameter (the message). Meta only lets a business write first with a template;
     # without it the PDF goes as a plain document, which Meta delivers only within 24 h of the client's last message.
     whatsapp_memoire_template: str | None = None
+    # WhatsApp robot (free, unofficial): the agency's WhatsApp linked like WhatsApp Web, from Administration -> WhatsApp.
+    # Its session is kept in DATABASE_URL (tables whatsmeow_* of the public schema) unless WHATSAPP_ROBOT_DATABASE_URL is set.
+    whatsapp_robot_database_url: str | None = None
     # "Journal du jour": each submitted day is also emailed to the administrator (JOURNAL_REPORT_EMAIL, or the address set in
     # the module). Sending: SMTP (SMTP_HOST, SMTP_PORT 587 STARTTLS or 465 SSL, SMTP_USER, SMTP_PASSWORD, SMTP_FROM; for Gmail
     # an "app password"), or the Brevo API (BREVO_API_KEY, over HTTPS, for hosts that block the SMTP ports).
