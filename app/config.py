@@ -51,6 +51,10 @@ class Settings(BaseSettings):
     whatsapp_phone_number_id: str | None = None
     whatsapp_template: str | None = None
     whatsapp_template_language: str = "fr"
+    # Mémoire de règlement sent to a client: WHATSAPP_MEMOIRE_TEMPLATE is an approved template whose header is a DOCUMENT
+    # (the PDF) and whose body has one parameter (the message). Meta only lets a business write first with a template;
+    # without it the PDF goes as a plain document, which Meta delivers only within 24 h of the client's last message.
+    whatsapp_memoire_template: str | None = None
     # "Journal du jour": each submitted day is also emailed to the administrator (JOURNAL_REPORT_EMAIL, or the address set in
     # the module). Sending: SMTP (SMTP_HOST, SMTP_PORT 587 STARTTLS or 465 SSL, SMTP_USER, SMTP_PASSWORD, SMTP_FROM; for Gmail
     # an "app password"), or the Brevo API (BREVO_API_KEY, over HTTPS, for hosts that block the SMTP ports).

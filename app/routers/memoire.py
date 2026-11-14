@@ -240,9 +240,20 @@ def _send_whatsapp(number: str, message: str, pdf: bytes, name: str) -> None:
                         files={"file": (name, pdf, "application/pdf")})
     if upload.status_code >= 300:
         raise RuntimeError(upload.text[:300])
-    answer = httpx.post(f"{base}/messages", headers=auth, timeout=30, json={
-        "messaging_product": "whatsapp", "to": number, "type": "document",
-        "document": {"id": upload.json()["id"], "filename": name, "caption": message[:1000]}})
+    media = upload.json()["id"]
+    if settings.whatsapp_memoire_template:
+        # A template parameter may not hold line breaks: the message is written on one line.
+        flat = re.sub(r"\s*\n+\s*", " ", message).strip()[:1000] or " "
+        body = {"messaging_product": "whatsapp", "to": number, "type": "template", "template": {
+            "name": settings.whatsapp_memoire_template, "language": {"code": settings.whatsapp_template_language},
+            "components": [
+                {"type": "header", "parameters": [{"type": "document", "document": {"id": media, "filename": name}}]},
+                {"type": "body", "parameters": [{"type": "text", "text": flat}]},
+            ]}}
+    else:
+        body = {"messaging_product": "whatsapp", "to": number, "type": "document",
+                "document": {"id": media, "filename": name, "caption": message[:1000]}}
+    answer = httpx.post(f"{base}/messages", headers=auth, timeout=30, json=body)
     if answer.status_code >= 300:
         try:
             reason = answer.json().get("error", {}).get("message") or answer.text
