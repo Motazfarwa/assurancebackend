@@ -264,9 +264,9 @@ def _pending_start(day: date) -> date:
 
 
 def _receipt_pending_start(day: date) -> date | None:
-    """Journal d'encaissement: a quittance still to declare (unticked) stays in every journal (15th / end of month) from
-    its payment on, until it is ticked and declared (then only in the journal of that date). None: no lower bound."""
-    return None if _is_period_end(day) else day + timedelta(days=1)
+    """Journal d'encaissement: a quittance still to declare (unticked) is shown on every date from its payment on (any day,
+    every month), until it is ticked and declared (then only in the journal of that date). None: no lower bound."""
+    return None
 
 
 VALIDATED_DDL = """
@@ -1577,7 +1577,7 @@ UNION ALL
 SELECT NULL, NULL, 0, 0, 0, 0
 ORDER BY 1 DESC NULLS LAST
 """
-RECEIPT_PERIODS_JOIN = "(k.declared AND k.jour_ref = per.jour) OR (NOT k.declared AND per.debut < per.jour AND k.jour_ref <= per.jour)"
+RECEIPT_PERIODS_JOIN = "(k.declared AND k.jour_ref = per.jour) OR (NOT k.declared AND k.jour_ref <= per.jour)"
 RECEIPT_PERIODS_SQL = RECEIPT_PERIODS_SQL.replace("{per}", PERIODS_PER).replace("{join}", RECEIPT_PERIODS_JOIN)
 
 EXPENSE_PERIODS_SQL = """
@@ -1726,8 +1726,9 @@ def validate_journal(payload: ValiderJournal, user: dict[str, Any] = Depends(req
         if kind == "E":
             unticked = _unticked(db, jour)
             lines = [line for line in _receipts(db, compagnie, jour, True, regles=True, pending_from=_receipt_pending_start(jour))]
+            # declared on the 15th / end of month only (a journal the legacy software dated another day is only confirmed)
             to_declare = [line for line in lines if not line["comptabilise"] and (line["paye"] or line["a_s"] == "A")
-                          and line["num_quittance"] not in unticked]
+                          and line["num_quittance"] not in unticked] if _is_period_end(jour) else []
             for line in to_declare:
                 _declare_receipt(db, line, jour, name)
             withdrawn = [line["num_quittance"] for line in lines if line["comptabilise"] and line["num_quittance"] in unticked]

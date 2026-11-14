@@ -140,6 +140,7 @@ class QuittanceCreate(BaseModel):
     echeance: datetime | None = None
     tc: str | None = Field(default=None, pattern="^[TC]$")
     prime_net: float | None = None
+    prime_total: float | None = None
     commission: float | None = None
     montant_quittance: float | None = None
     solde_quittance: float | None = None
@@ -166,15 +167,16 @@ def create_quittance(payload: QuittanceCreate, db: Session = Depends(get_db)) ->
         db.execute(
             text(
                 'INSERT INTO dbo."TQuittance" (num_quittance, num_int, code_client, code_branche, date_saisie, date_emission, echeance, '
-                'tc, "Periode", prime_net, commission, montant_quittance, solde_quittance, "Date_Reglement", "Date_M", observation, type_quittance) '
+                'tc, "Periode", prime_net, prime_total, commission, montant_quittance, solde_quittance, "Date_Reglement", "Date_M", observation, type_quittance) '
                 "VALUES (:num_quittance, :num_int, :code_client, :code_branche, :date_saisie, :date_emission, :echeance, "
-                ":tc, :periode, :prime_net, :commission, :montant_quittance, :solde_quittance, :date_reglement, :date_m, '', 'P')"
+                ":tc, :periode, :prime_net, :prime_total, :commission, :montant_quittance, :solde_quittance, :date_reglement, :date_m, '', 'P')"
             ),
             {
                 "num_quittance": number, "num_int": payload.num_int.strip(), "code_client": payload.code_client.strip(),
                 "code_branche": policy["code_branche"], "date_saisie": payload.date_saisie or datetime.now(),
                 "date_emission": payload.date_emission, "echeance": payload.echeance, "tc": payload.tc,
-                "periode": f"{period_source:%m/%Y}", "prime_net": payload.prime_net, "commission": payload.commission,
+                "periode": f"{period_source:%m/%Y}", "prime_net": payload.prime_net,
+                "prime_total": payload.prime_total if payload.prime_total is not None else payload.montant_quittance, "commission": payload.commission,
                 "montant_quittance": payload.montant_quittance, "solde_quittance": payload.solde_quittance,
                 "date_reglement": payload.date_reglement, "date_m": payload.date_m or datetime.now(),
             },

@@ -20,7 +20,7 @@ from urllib.parse import quote
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -188,6 +188,12 @@ class Envoi(BaseModel):
     date_debut: date | None = None
     date_fin: date | None = None
     code_compagnie: int | None = None
+
+    # The criteria of the statement come as they are on screen: an empty one ("") is no criterion.
+    @field_validator("date_debut", "date_fin", "code_compagnie", mode="before")
+    @classmethod
+    def _empty_is_none(cls, value: Any) -> Any:
+        return None if isinstance(value, str) and not value.strip() else value
 
 
 def _send_email(to: str, subject: str, body: str, pdf: bytes, name: str) -> None:
