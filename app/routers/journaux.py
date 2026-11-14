@@ -240,7 +240,7 @@ def receipts_journal(
         raise HTTPException(status_code=422, detail="La date de fin précède la date de début.")
     try:
         items = _receipts(db, compagnie, date_journal, comptabilises, regles=regles, reg_debut=debut, reg_fin=fin,
-                          pending_from=_pending_start(date_journal) if journal else None)
+                          pending_from=_receipt_pending_start(date_journal) if journal else None)
     except SQLAlchemyError as exc:
         raise _fail(exc) from exc
     return {"items": items, "num_jeq": date_journal.strftime("%Y%m%d"), "debut_periode": _period_start(date_journal).isoformat()}
@@ -261,6 +261,12 @@ def _pending_start(day: date) -> date:
     (14/11, 30/10...): such a date is a journal of its own, with only what was declared on it (nothing pending: an empty
     range)."""
     return _period_start(day) if _is_period_end(day) else day + timedelta(days=1)
+
+
+def _receipt_pending_start(day: date) -> date | None:
+    """Journal d'encaissement: a quittance still to declare (unticked) stays in every journal (15th / end of month) from
+    its payment on, until it is ticked and declared (then only in the journal of that date). None: no lower bound."""
+    return None if _is_period_end(day) else day + timedelta(days=1)
 
 
 VALIDATED_DDL = """
@@ -1527,16 +1533,16 @@ PERIODS_JOIN = "(k.declared AND k.jour_ref = per.jour) OR (NOT k.declared AND pe
 RECEIPT_PERIODS_SQL = """
 WITH per0 AS (SELECT * FROM unnest(CAST(:starts AS date[]), CAST(:ends AS date[])) AS p(debut, jour)),
 lines AS MATERIALIZED (
-    -- still to declare: every such payment of a quittance is in the journal of its latest one (as listed in the journal
-    -- and declared by "Valider"), not split over the half months it was paid in
+    -- still to declare: a quittance is in every journal from its first payment still to declare on (with all of
+    -- them), until it is ticked / declared; declared: only in the journal of its Date_Comptabiliser
     SELECT TRIM(d."Num_quitance") AS num_quittance, COALESCE(d."Montant", 0) AS montant, d."Comptabiliser" = 'O' AS declared,
            CASE WHEN d."Comptabiliser" = 'O' THEN d."Date_Comptabiliser"::date
-                ELSE (MAX(t.date_reg_cli) FILTER (WHERE d."Comptabiliser" IS DISTINCT FROM 'O') OVER (PARTITION BY TRIM(d."Num_quitance")))::date END AS jour_ref
+                ELSE (MIN(t.date_reg_cli) FILTER (WHERE d."Comptabiliser" IS DISTINCT FROM 'O') OVER (PARTITION BY TRIM(d."Num_quitance")))::date END AS jour_ref
     FROM dbo."RDetRegCli" d JOIN dbo."TRegCli" t ON t.num_reg_cli = d."Num_reg_cli"
     WHERE COALESCE(d."Montant", 0) > 0.0005
       AND ((d."Comptabiliser" = 'O' AND d."Date_Comptabiliser" >= :first AND d."Date_Comptabiliser" < CAST(:last AS date) + 1)
            OR (TRIM(d."Comptabiliser") = 'N' AND d."Date_Comptabiliser" IS NULL AND t.date_reg_cli < CAST(:last AS date) + 1
-               AND t.date_reg_cli >= CAST(:first AS date) - INTERVAL '2 years'))
+               AND t.date_reg_cli >= date_trunc('year', CAST(:first AS date)) - INTERVAL '1 year'))
 ),
 q AS (
     SELECT DISTINCT ON (TRIM(q.num_quittance)) TRIM(q.num_quittance) AS num_quittance, TRIM(q.num_int) AS num_int
@@ -1567,13 +1573,12 @@ SELECT per.jour, per.debut,
 FROM per LEFT JOIN kept k ON {join}
 GROUP BY per.jour, per.debut
 UNION ALL
--- still to declare, paid before the oldest journal listed (jour NULL)
-SELECT NULL, NULL, 0, 0, COUNT(DISTINCT k.num_quittance), COALESCE(ROUND(SUM(k.montant)::numeric, 3), 0)
-FROM kept k WHERE NOT k.declared AND k.jour_ref < :first
+-- (the receipts still to declare are in every journal: none is left to an older one)
+SELECT NULL, NULL, 0, 0, 0, 0
 ORDER BY 1 DESC NULLS LAST
 """
-
-RECEIPT_PERIODS_SQL = RECEIPT_PERIODS_SQL.replace("{per}", PERIODS_PER).replace("{join}", PERIODS_JOIN)
+RECEIPT_PERIODS_JOIN = "(k.declared AND k.jour_ref = per.jour) OR (NOT k.declared AND per.debut < per.jour AND k.jour_ref <= per.jour)"
+RECEIPT_PERIODS_SQL = RECEIPT_PERIODS_SQL.replace("{per}", PERIODS_PER).replace("{join}", RECEIPT_PERIODS_JOIN)
 
 EXPENSE_PERIODS_SQL = """
 WITH per0 AS (SELECT * FROM unnest(CAST(:starts AS date[]), CAST(:ends AS date[])) AS p(debut, jour)),
@@ -1720,7 +1725,7 @@ def validate_journal(payload: ValiderJournal, user: dict[str, Any] = Depends(req
         db.execute(text("SELECT pg_advisory_xact_lock(hashtext('journal:' || :t || ':' || :j))"), {"t": kind, "j": jour.isoformat()})
         if kind == "E":
             unticked = _unticked(db, jour)
-            lines = [line for line in _receipts(db, compagnie, jour, True, regles=True, pending_from=start)]
+            lines = [line for line in _receipts(db, compagnie, jour, True, regles=True, pending_from=_receipt_pending_start(jour))]
             to_declare = [line for line in lines if not line["comptabilise"] and (line["paye"] or line["a_s"] == "A")
                           and line["num_quittance"] not in unticked]
             for line in to_declare:

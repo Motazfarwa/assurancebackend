@@ -3,7 +3,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import MetaData, Table, func, select, update
+from sqlalchemy import MetaData, Table, func, select, text, update
 from sqlalchemy.exc import NoSuchTableError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -20,7 +20,29 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=256)
 
 
+_archive_ready = False
+
+
+def _ensure_archive_column(db: Session) -> None:
+    """dbo.RUtilisateur_Depot."archive" (app column, kept by the .BAK syncs): an archived account stays in the table but can
+    no longer log in, and is listed apart in the administration."""
+    global _archive_ready
+    if _archive_ready:
+        return
+    try:
+        db.execute(text(f'ALTER TABLE "{settings.db_schema}"."{settings.db_user_table}" ADD COLUMN IF NOT EXISTS "archive" boolean NOT NULL DEFAULT false'))
+        db.commit()
+        _archive_ready = True
+    except SQLAlchemyError:
+        db.rollback()
+
+
+def is_archived(row: Any) -> bool:
+    return bool(dict(row).get("archive"))
+
+
 def users_table(db: Session) -> Table:
+    _ensure_archive_column(db)
     try:
         table = Table(settings.db_user_table, MetaData(), schema=settings.db_schema, autoload_with=db.get_bind())
     except OperationalError as exc:
@@ -65,6 +87,8 @@ def list_login_users(lieu: str = Query(default="", max_length=255), db: Session 
     """Usernames for the login page, filtered by the selected lieu (agency) when given."""
     table = users_table(db)
     query = select(table.c.Nom_Utilisateur).where(table.c.Nom_Utilisateur.is_not(None))
+    if "archive" in table.c:
+        query = query.where(table.c.archive.is_not(True))
     if lieu.strip():
         query = query.where(func.lower(func.trim(table.c.lieu)) == lieu.strip().lower())
     try:
@@ -86,6 +110,8 @@ def login(credentials: LoginRequest, db: Session = Depends(get_db)) -> dict[str,
     matches, needs_upgrade = verify_password(credentials.password, str(row["ModP"]))
     if not matches:
         raise HTTPException(status_code=401, detail="Nom d'utilisateur ou mot de passe incorrect.")
+    if is_archived(row):
+        raise HTTPException(status_code=403, detail="Ce compte est archivé : demandez à l’administrateur de le réactiver.")
     if needs_upgrade:
         try:
             db.execute(update(table).where(table.c.Nom_Utilisateur == credentials.username).values(ModP=hash_password(credentials.password)))
@@ -103,7 +129,7 @@ def refresh(payload: RefreshRequest, db: Session = Depends(get_db)) -> dict[str,
         return _session_payload(settings.admin_username, None)
     table = users_table(db)
     row = db.execute(select(table).where(table.c.Nom_Utilisateur == claims["sub"]).limit(1)).mappings().first()
-    if row is None:
+    if row is None or is_archived(row):
         raise HTTPException(status_code=401, detail="Session invalide ou expirée.")
     return _session_payload(str(row["Nom_Utilisateur"]), row["lieu"])
 

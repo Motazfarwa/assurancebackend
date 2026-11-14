@@ -19,6 +19,7 @@ from app.routers.prestataires import router as prestataires_router
 from app.routers.companies import router as companies_router
 from app.routers.documents import router as documents_router
 from app.routers.impayes import router as impayes_router
+from app.routers.memoire import router as memoire_router
 from app.routers.record_updates import router as record_updates_router
 from app.routers import polices
 from app.routers.assistant import router as assistant_router
@@ -74,6 +75,7 @@ app.include_router(admin_users_router)
 app.include_router(prestataires_router)
 app.include_router(companies_router)
 app.include_router(documents_router)
+app.include_router(memoire_router)
 app.include_router(impayes_router)
 app.include_router(polices.router)
 app.include_router(assistant_router)

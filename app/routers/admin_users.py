@@ -24,6 +24,8 @@ class UserCreate(BaseModel):
 class UserUpdate(BaseModel):
     password: str | None = Field(default=None, min_length=1, max_length=256)
     lieu: str | None = Field(default=None, max_length=255)
+    # True: the account is archived (kept, but it can no longer log in); False: reactivated.
+    archive: bool | None = None
 
 
 def _is_admin_name(name: str) -> bool:
@@ -34,10 +36,12 @@ def _is_admin_name(name: str) -> bool:
 def list_users(db: Session = Depends(get_db)) -> dict[str, list[dict[str, Any]]]:
     table = users_table(db)
     try:
-        rows = db.execute(select(table.c.Nom_Utilisateur, table.c.lieu, table.c.Code_Depot).where(table.c.Nom_Utilisateur.is_not(None)).order_by(table.c.Nom_Utilisateur)).all()
+        archived = table.c.archive if "archive" in table.c else None
+        columns = [table.c.Nom_Utilisateur, table.c.lieu, table.c.Code_Depot] + ([archived] if archived is not None else [])
+        rows = db.execute(select(*columns).where(table.c.Nom_Utilisateur.is_not(None)).order_by(table.c.Nom_Utilisateur)).all()
     except SQLAlchemyError as exc:
         raise HTTPException(status_code=503, detail="Impossible de charger les utilisateurs.") from exc
-    return {"items": [{"username": str(nom), "lieu": lieu, "code_depot": code_depot} for nom, lieu, code_depot in rows]}
+    return {"items": [{"username": str(row[0]), "lieu": row[1], "code_depot": row[2], "archive": bool(row[3]) if len(row) > 3 else False} for row in rows]}
 
 
 @router.post("", status_code=201)
@@ -65,6 +69,12 @@ def update_user(username: str, payload: UserUpdate, db: Session = Depends(get_db
         values["ModP"] = hash_password(payload.password)
     if "lieu" in payload.model_fields_set:
         values["lieu"] = payload.lieu
+    if payload.archive is not None:
+        if _is_admin_name(username):
+            raise HTTPException(status_code=400, detail="Le compte administrateur ne peut pas être archivé.")
+        if "archive" not in table.c:
+            raise HTTPException(status_code=503, detail="L’archivage n’est pas disponible sur cette base.")
+        values["archive"] = payload.archive
     if not values:
         raise HTTPException(status_code=422, detail="Aucune modification fournie.")
     try:

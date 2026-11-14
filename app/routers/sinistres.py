@@ -344,10 +344,24 @@ def list_sinistres(
             text(f'SELECT {LIST_COLUMNS} FROM dbo."Sinistre" WHERE {where} ORDER BY LENGTH(TRIM("Num_Sinistre_Agence")), TRIM("Num_Sinistre_Agence") LIMIT :limit OFFSET :offset'),
             params,
         ).mappings().all()
+        items = [_plain(row) for row in rows]
+        # The step each file has reached: its highest step (Sinistre_Suivi.Code_Etape) and its libellé (TEtape_Siniste),
+        # for the list "Répartis par étape".
+        numbers = [str(item.get("Num_Sinistre_Agence") or "").strip() for item in items]
+        steps = {
+            row[0]: (row[1], row[2]) for row in db.execute(text(
+                'SELECT DISTINCT ON (TRIM(s."Num_Sinistre_Agence")) TRIM(s."Num_Sinistre_Agence"), s."Code_Etape", TRIM(e."Libelle_Etape") '
+                'FROM dbo."Sinistre_Suivi" s LEFT JOIN dbo."TEtape_Siniste" e ON e."Code_Etape" = s."Code_Etape" '
+                'WHERE TRIM(s."Num_Sinistre_Agence") = ANY(CAST(:numbers AS text[])) AND s."Code_Etape" IS NOT NULL '
+                'ORDER BY TRIM(s."Num_Sinistre_Agence"), s."Code_Etape" DESC'
+            ), {"numbers": numbers}).all()
+        } if numbers else {}
+        for item, number in zip(items, numbers):
+            item["code_etape"], item["libelle_etape"] = steps.get(number, (None, None))
     except SQLAlchemyError as exc:
         raise HTTPException(status_code=503, detail="Lecture des sinistres impossible.") from exc
     return {
-        "items": [_plain(row) for row in rows], "total": total, "limit": limit, "offset": offset,
+        "items": items, "total": total, "limit": limit, "offset": offset,
         "counts": {"non_regle": counts["non_regle"], "non_cloture": counts["non_cloture"]},
     }
 
