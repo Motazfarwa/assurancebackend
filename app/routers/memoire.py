@@ -200,6 +200,8 @@ def _send_email(to: str, subject: str, body: str, pdf: bytes, name: str) -> None
     """The message with the PDF attached (raises on failure): the Brevo API when its key is set, else SMTP."""
     sender = settings.smtp_from or settings.smtp_user or to
     if settings.brevo_api_key:
+        if not (settings.smtp_from or settings.smtp_user):
+            raise RuntimeError("Indiquez sur le serveur l’adresse d’envoi (SMTP_FROM), validée comme expéditeur dans Brevo.")
         answer = httpx.post("https://api.brevo.com/v3/smtp/email", timeout=30, headers={"api-key": settings.brevo_api_key, "accept": "application/json"},
                             json={"sender": {"name": AGENCY[0], "email": sender}, "to": [{"email": to}], "subject": subject, "textContent": body,
                                   "attachment": [{"content": base64.b64encode(pdf).decode(), "name": name}]})
