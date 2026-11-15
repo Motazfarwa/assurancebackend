@@ -3,6 +3,7 @@
 The administrator is notified of every user's actions; any other user only of their own. What a user has
 already seen is kept in dbo."TNotifLu" (the last "N" seen), so the unread count follows them on any computer.
 """
+from datetime import date
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -107,7 +108,7 @@ PHONE_OFFICE = _any_contact(_IS_PHONE, "k.tel_b, k.tel_b2, k.tel_b3, k.tel_b4", 
 INCOMPLETE_SQL = f"""
     WITH pol AS (SELECT DISTINCT TRIM(p.code_client) AS code FROM dbo."TPolice" p
     ), c AS (
-        SELECT TRIM(k.code_client) AS code_client, TRIM(k.nom_client) AS nom_client,
+        SELECT TRIM(k.code_client) AS code_client, TRIM(k.nom_client) AS nom_client, k.date_creation::date AS date_creation,
                ARRAY_REMOVE(ARRAY[
                    CASE WHEN {_no_place('k.adresse')} AND {_no_place('k.adresse_b')} THEN 'adresse' END,
                    CASE WHEN {_no_place('k.ville')} AND {_no_place('k.ville_b')} THEN 'ville' END,
@@ -133,12 +134,20 @@ def incomplete_clients(
     # one missing coordonnée only: adresse, ville, code postal, téléphone
     manque: str = Query(default="", pattern="^(|adresse|ville|code postal|téléphone)$"),
     offset: int = Query(default=0, ge=0),
+    # "Entre deux dates": the clients created (date de création) between them, both days included; the counters too
+    date_debut: date | None = None,
+    date_fin: date | None = None,
     user: dict[str, Any] = Depends(require_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     if not is_admin(user):
         raise HTTPException(status_code=403, detail="Accès réservé à l'administrateur.")
+    if date_debut and date_fin and date_debut > date_fin:
+        raise HTTPException(status_code=422, detail="La date de début doit précéder la date de fin.")
     rows = db.execute(text(INCOMPLETE_SQL)).mappings().all()
+    if date_debut or date_fin:
+        rows = [row for row in rows if row["date_creation"] is not None
+                and (date_debut is None or row["date_creation"] >= date_debut) and (date_fin is None or row["date_creation"] <= date_fin)]
     # Every word typed must be in the code or the name, in any order; the exact code comes first.
     search = q.strip().lower()
     found = [row for row in rows if all(word in f'{row["code_client"]} {row["nom_client"] or ""}'.lower() for word in search.split())]
@@ -154,6 +163,7 @@ def incomplete_clients(
             manques.append("aucune police")
         items.append({
             "code_client": row["code_client"], "nom_client": row["nom_client"], "manques": manques,
+            "date_creation": row["date_creation"].isoformat() if row["date_creation"] else None,
             "details": {
                 "coordonnees": list(row["coordonnees"]), "sans_police": bool(row["sans_police"]),
             },
