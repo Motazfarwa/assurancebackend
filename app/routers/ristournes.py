@@ -7,7 +7,7 @@ ristourne nette = prime_net, décommission = commission, détaxe = Taxe, ristour
 import json
 import logging
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from itertools import combinations
 from typing import Any
 
@@ -56,6 +56,38 @@ FROM dbo."TQuittance" q
 LEFT JOIN LATERAL ({policy}) pol ON TRUE
 LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(q.code_client)
 WHERE TRIM(q.type_quittance) = 'R' AND {where}
+"""
+
+
+LIST_SQL = """
+WITH q AS MATERIALIZED (
+    SELECT q.* FROM dbo."TQuittance" q
+    WHERE TRIM(q.type_quittance) = 'R'
+      AND (CAST(:debut AS date) IS NULL OR q.date_saisie >= CAST(:debut AS date))
+      AND (CAST(:lendemain AS date) IS NULL OR q.date_saisie < CAST(:lendemain AS date))
+    ORDER BY q.date_saisie DESC NULLS LAST, q.num_quittance DESC
+    LIMIT :limit
+),
+pol AS (
+    SELECT DISTINCT ON (TRIM(p.num_int)) TRIM(p.num_int) AS num_int, TRIM(p.num_police) AS num_police, p.code_compagnie,
+           TRIM(p.code_branche) AS code_branche
+    FROM dbo."TPolice" p WHERE TRIM(p.num_int) IN (SELECT TRIM(num_int) FROM q)
+    ORDER BY TRIM(p.num_int), p.date_creation DESC NULLS LAST
+)
+SELECT TRIM(q.num_quittance) AS num_ristourne, TRIM(q.num_int) AS num_int, pol.num_police,
+       TRIM(q.code_client) AS code_client, TRIM(c.nom_client) AS nom_client,
+       pol.code_compagnie, TRIM(co.nom_compagnie) AS nom_compagnie, pol.code_branche, TRIM(b.nom_branche) AS nom_branche,
+       q.date_emission AS date_du, q.echeance AS date_au, q.date_saisie, q."Date_Reglement" AS date_reglement,
+       q."Date_Comptabiliser" AS date_comptabilise, COALESCE(q."Comptabiliser", 'N') = 'O' AS comptabilise,
+       q.prime_net AS nette, q.commission AS decommission, q."Taxe" AS detaxe,
+       q.montant_quittance AS totale, q.solde_quittance AS solde, TRIM(q.observation) AS observation,
+       TRIM(q.infoquittance) AS informations
+FROM q
+LEFT JOIN pol ON pol.num_int = TRIM(q.num_int)
+LEFT JOIN dbo."TCompagnie" co ON co.code_compagnie = pol.code_compagnie
+LEFT JOIN dbo."TBranche" b ON b.code_compagnie = pol.code_compagnie AND TRIM(b.code_branche) = pol.code_branche
+LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(q.code_client)
+ORDER BY q.date_saisie DESC NULLS LAST, q.num_quittance DESC
 """
 
 
@@ -155,18 +187,35 @@ def _amounts(payload: RistournePayload) -> dict[str, Any]:
 
 
 @router.get("")
-def list_ristournes(q: str = "", limit: int = Query(200, ge=1, le=1000), db: Session = Depends(get_db)) -> dict[str, Any]:
-    """The ristournes, newest first, searched by number, policy, client code or name."""
+def list_ristournes(
+    q: str = "",
+    date_debut: date | None = None,
+    date_fin: date | None = None,
+    limit: int = Query(200, ge=1, le=2000),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """The ristournes, newest first, searched by number, policy, client code or name; "Lister" with two dates: those
+    whose date de saisie falls between them (both days included)."""
+    if date_debut and date_fin and date_debut > date_fin:
+        raise HTTPException(status_code=422, detail="La date de début doit précéder la date de fin.")
     term = q.strip()
     where = "TRUE"
     if term:
         where = ("(TRIM(q.num_quittance) ILIKE :like OR pol.num_police ILIKE :like OR TRIM(q.code_client) = :term "
                  "OR c.nom_client ILIKE :like)")
+    params = {"term": term, "like": f"%{term}%", "limit": limit, "debut": date_debut,
+              "lendemain": date_fin + timedelta(days=1) if date_fin else None}
     try:
-        rows = db.execute(
-            text(_ristourne_sql(where) + " ORDER BY q.date_saisie DESC NULLS LAST, q.num_quittance DESC LIMIT :limit"),
-            {"term": term, "like": f"%{term}%", "limit": limit},
-        ).mappings().all()
+        if term:
+            rows = db.execute(
+                text(_ristourne_sql(where) + " ORDER BY q.date_saisie DESC NULLS LAST, q.num_quittance DESC LIMIT :limit"), params,
+            ).mappings().all()
+        else:
+            # "Lister": the ristournes chosen first, then their policies read in one pass (hash joins: a per-row lookup
+            # on TRIM(num_int) reads the whole policy table for each ristourne).
+            db.execute(text("SET LOCAL enable_nestloop = off"))
+            rows = db.execute(text(LIST_SQL), params).mappings().all()
+            db.rollback()
     except SQLAlchemyError as exc:
         raise _fail(exc) from exc
     return {"items": [_plain(row) for row in rows]}

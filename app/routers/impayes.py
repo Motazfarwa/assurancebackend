@@ -310,11 +310,14 @@ def unpaid_statement(
 
 RECOVERY_SQL = """
 WITH q AS MATERIALIZED (
+    -- the premium quittances (type P, not cancelled) whose échéance falls in the period, of the statement's client / TC
     SELECT TRIM(q.num_quittance) AS num_quittance, TRIM(q.num_int) AS num_int, TRIM(q.code_client) AS code_client,
-           COALESCE(q.montant_quittance, 0) AS montant, q.echeance
+           COALESCE(q.montant_quittance, 0) AS montant, GREATEST(COALESCE(q.solde_quittance, 0), 0) AS solde
     FROM "{schema}"."TQuittance" q
     WHERE TRIM(q.type_quittance) = 'P' AND COALESCE(q.annule, 'N') <> 'O'
+      AND q.echeance >= :debut AND q.echeance < :lendemain
       AND (:code = '' OR TRIM(q.code_client) = :code)
+      AND (:tc = '' OR UPPER(TRIM(q.tc)) = :tc)
 ),
 pol AS (
     SELECT DISTINCT ON (TRIM(num_int)) TRIM(num_int) AS num_int, code_compagnie
@@ -322,23 +325,25 @@ pol AS (
     ORDER BY TRIM(num_int), effet DESC NULLS LAST
 ),
 scope AS MATERIALIZED (
-    -- the quittances of the statement's client / company / type of client
+    -- of the statement's company / type of client
     SELECT q.* FROM q
     LEFT JOIN pol p ON p.num_int = q.num_int
     WHERE (CAST(:compagnie AS integer) IS NULL OR p.code_compagnie = CAST(:compagnie AS integer))
       AND (:type_client = '' OR q.code_client IN (SELECT TRIM(code_client) FROM "{schema}"."TClient" WHERE TRIM("Type_Client") = :type_client))
 ),
-paid AS (
-    -- what the clients paid in the year (client settlements dated from 1 January to today; ristournes "R" left out)
-    SELECT COALESCE(SUM(d."Montant"), 0) AS encaissements
-    FROM "{schema}"."RDetRegCli" d JOIN "{schema}"."TRegCli" t ON t.num_reg_cli = d."Num_reg_cli"
-    WHERE t.date_reg_cli >= :debut AND t.date_reg_cli < :lendemain AND COALESCE(TRIM(t.type_reg_cli), '') <> 'R'
-      AND TRIM(d."Num_quitance") IN (SELECT num_quittance FROM scope)
+instance AS (
+    -- "Avec pièce": the cheques / traites en instance (not cashed yet) cover part of the solde, as on the statement
+    SELECT TRIM(r."Num_Quittance") AS num_quittance, SUM(r."Montant_Reglement") AS montant
+    FROM "{schema}"."RPiece" r
+    JOIN "{schema}"."TPiece" t ON TRIM(t.nump) = TRIM(r."NumP") AND TRIM(t.code_client) = TRIM(r."Code_Client")
+    WHERE :piece = 'avec' AND COALESCE(t.regle, 'N') <> 'O' AND TRIM(r."Num_Quittance") IN (SELECT num_quittance FROM scope)
+    GROUP BY 1
 )
-SELECT (SELECT encaissements FROM paid) AS encaissements,
-       COALESCE(SUM(montant) FILTER (WHERE echeance >= :debut AND echeance < :lendemain), 0) AS primes_exigibles,
-       COUNT(*) FILTER (WHERE echeance >= :debut AND echeance < :lendemain) AS quittances_exigibles
-FROM scope
+SELECT COALESCE(SUM(s.montant), 0) AS primes_exigibles,
+       COALESCE(SUM(GREATEST(s.solde - COALESCE(i.montant, 0), 0)), 0) AS reste,
+       COUNT(*) AS quittances_exigibles,
+       COUNT(*) FILTER (WHERE s.solde - COALESCE(i.montant, 0) > 0.0005) AS quittances_impayees
+FROM scope s LEFT JOIN instance i ON i.num_quittance = s.num_quittance
 """
 
 
@@ -347,42 +352,54 @@ def recovery_rate(
     code_client: str = Query(default="", max_length=8),
     type_client: str = Query(default="", pattern="^(|P|S)$"),
     code_compagnie: int | None = None,
+    tc: str = Query(default="", pattern="^(|C|T)$"),
+    piece: str = Query(default="sans", pattern="^(avec|sans)$"),
+    date_debut: date | None = None,
+    date_fin: date | None = None,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Taux de recouvrement = encaissements de l'année en cours / primes de l'année en cours exigibles.
-    Encaissements: what the clients paid from 1 January to today (RDetRegCli lines of the TRegCli settlements of the year).
-    Primes exigibles: the premium quittances (type P, not cancelled) whose échéance falls from 1 January to today.
-    For the statement's client, company or type of client when given, else for the whole agency."""
+    """Taux de recouvrement = (primes exigibles - reste impayé) / primes exigibles, read from the quittances themselves:
+    the premium quittances (type P, not cancelled) whose échéance falls in the period, and what is still unpaid on them
+    (solde_quittance; "avec pièce": less the pièces en instance, as on the statement). A settlement the client made is
+    counted whether or not it was entered as a client settlement (RDetRegCli): many quittances are settled (solde 0)
+    without one. For the current year (1 January to today), the whole previous year, and the statement's own échéance
+    interval when it has one; for the statement's client, company, type of client and TC when given."""
+    if date_debut and date_fin and date_debut > date_fin:
+        raise HTTPException(status_code=422, detail="La date de début doit précéder la date de fin.")
     try:
         today = db.execute(text("SELECT (now() AT TIME ZONE 'Africa/Tunis')::date")).scalar()
         start = today.replace(month=1, day=1)
-        # TRIM joins on legacy tables: hash joins only (nested loops take minutes over all the quittances).
-        db.execute(text("SET LOCAL enable_nestloop = off"))
-        def year(first: date, last: date) -> Any:
+        db.execute(text("SET LOCAL enable_nestloop = off"))  # TRIM joins on legacy tables: hash joins only
+        def period(first: date, last: date) -> Any:
             return db.execute(text(RECOVERY_SQL.format(schema=settings.db_schema)), {
-                "code": code_client.strip(), "type_client": type_client, "compagnie": code_compagnie,
+                "code": code_client.strip(), "type_client": type_client, "compagnie": code_compagnie, "tc": tc, "piece": piece,
                 "debut": datetime.combine(first, time.min), "lendemain": datetime.combine(last + timedelta(days=1), time.min),
             }).mappings().one()
-        row = year(start, today)
-        # the whole previous year (1 January to 31 December), for comparison: its rate only
-        before = year(start.replace(year=start.year - 1), start - timedelta(days=1))
+        row = period(start, today)
+        before = period(start.replace(year=start.year - 1), start - timedelta(days=1))
+        chosen = None
+        if date_debut or date_fin:
+            first = date_debut or date(1900, 1, 1)
+            last = date_fin or today
+            chosen = {"du": date_debut.isoformat() if date_debut else None, "au": last.isoformat(), **_summary(period(first, last))}
     except SQLAlchemyError as exc:
         raise HTTPException(status_code=503, detail="Impossible de calculer le taux de recouvrement.") from exc
     finally:
         db.rollback()  # ends the read transaction, and with it the SET LOCAL
-    encaissements, primes = float(row["encaissements"] or 0), float(row["primes_exigibles"] or 0)
     return {
-        "annee": today.year, "du": start.isoformat(), "au": today.isoformat(),
-        "encaissements": round(encaissements, 3), "primes_exigibles": round(primes, 3),
-        "quittances_exigibles": int(row["quittances_exigibles"] or 0),
-        "taux": round(encaissements / primes * 100, 2) if primes > 0.0005 else None,
-        "precedente": {"annee": today.year - 1, "taux": _rate(before)},
+        "annee": today.year, "du": start.isoformat(), "au": today.isoformat(), **_summary(row),
+        "precedente": {"annee": today.year - 1, "taux": _summary(before)["taux"]},
+        "periode": chosen,
     }
 
 
-def _rate(row: Any) -> float | None:
-    paid, due = float(row["encaissements"] or 0), float(row["primes_exigibles"] or 0)
-    return round(paid / due * 100, 2) if due > 0.0005 else None
+def _summary(row: Any) -> dict[str, Any]:
+    due, rest = float(row["primes_exigibles"] or 0), float(row["reste"] or 0)
+    return {
+        "primes_exigibles": round(due, 3), "reste": round(rest, 3), "encaissements": round(due - rest, 3),
+        "quittances_exigibles": int(row["quittances_exigibles"] or 0), "quittances_impayees": int(row["quittances_impayees"] or 0),
+        "taux": round((due - rest) / due * 100, 2) if due > 0.0005 else None,
+    }
 
 
 @router.get("/etat/liens/{code_client}")

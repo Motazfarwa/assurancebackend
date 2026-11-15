@@ -169,4 +169,33 @@ def search_receipts(
         ),
         params,
     ).mappings().all()
-    return {"items": [serialize(row) for row in rows], "total": len(rows)}
+    items = [serialize(row) for row in rows]
+    sheets = _cash_sheets(db, [str(row["num_quittance"] or "").strip() for row in rows])
+    for item in items:
+        item["feuille_caisse"] = sheets.get(str(item.get("num_quittance") or "").strip(), "")
+    return {"items": items, "total": len(items)}
+
+
+# The feuille de caisse a quittance went into: the day its client settlement lines (RDetRegCli) were declared in the
+# journal d'encaissement (Date_Comptabiliser), as the feuille de caisse of a day counts them; "À déclarer" for a payment
+# not declared yet. Nothing for a quittance the client has not paid anything on.
+CASH_SHEETS_SQL = """
+SELECT TRIM(d."Num_quitance") AS num_quittance,
+       STRING_AGG(DISTINCT TO_CHAR(d."Date_Comptabiliser", 'DD/MM/YYYY'), ', ')
+           FILTER (WHERE d."Comptabiliser" = 'O' AND d."Date_Comptabiliser" IS NOT NULL) AS jours,
+       BOOL_OR(COALESCE(d."Comptabiliser", 'N') <> 'O' OR d."Date_Comptabiliser" IS NULL) AS a_declarer
+FROM dbo."RDetRegCli" d
+WHERE TRIM(d."Num_quitance") = ANY(:numbers)
+GROUP BY 1
+"""
+
+
+def _cash_sheets(db: Session, numbers: list[str]) -> dict[str, str]:
+    numbers = [number for number in numbers if number]
+    if not numbers:
+        return {}
+    result = {}
+    for row in db.execute(text(CASH_SHEETS_SQL), {"numbers": numbers}).mappings():
+        parts = [part for part in (row["jours"], "À déclarer" if row["a_declarer"] else None) if part]
+        result[row["num_quittance"]] = " · ".join(parts)
+    return result

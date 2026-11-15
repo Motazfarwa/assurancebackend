@@ -971,7 +971,8 @@ def daily_financial(
 # Etat des comptes client
 # ---------------------------------------------------------------------------------------------
 # Per client, for the quittances due between two dates (or all of them, the returned ones left out): the primes, the ristournes (quittances of type R),
-# what the client paid on them (RDetRegCli), the commissions, and the claims paid to the client in the period (TDepense 'T'
+# what the client paid on them (montant - solde of the quittance: many are settled without a RDetRegCli line), what is
+# still to pay (solde), the commissions, and the claims paid to the client in the period (TDepense 'T'
 # of nature S). Optional filters: one company, one client, one police; état: tous, comptabilisé, en instance, ristournes.
 ACCOUNTS_SQL = """
 WITH pol AS MATERIALIZED (  -- the policies of the company / the police asked for (none asked: not used)
@@ -982,7 +983,9 @@ WITH pol AS MATERIALIZED (  -- the policies of the company / the police asked fo
 ),
 q AS MATERIALIZED (
     SELECT q.num_quittance, TRIM(q.code_client) AS code_client, TRIM(COALESCE(q.type_quittance, '')) = 'R' AS ristourne,
-           COALESCE(q.prime_total, 0) AS prime_total, COALESCE(q.commission, 0) AS commission
+           -- the prime is what the client pays: montant_quittance (prime_total less the timbre, 0.5 to 3 TND, on many)
+           COALESCE(q.montant_quittance, q.prime_total, 0) AS prime_total, COALESCE(q.commission, 0) AS commission,
+           COALESCE(q.montant_quittance, 0) AS montant, GREATEST(COALESCE(q.solde_quittance, 0), 0) AS solde
     FROM dbo."TQuittance" q
     WHERE COALESCE(q.annule, 'N') <> 'O'
       AND q."Date_Retour" IS NULL  -- a quittance returned to the company is no longer the client's
@@ -995,18 +998,15 @@ q AS MATERIALIZED (
             WHEN 'ristourne' THEN TRIM(COALESCE(q.type_quittance, '')) = 'R'
             ELSE TRUE END
 ),
-reg AS (
-    SELECT d."Num_quitance" AS num_quittance, SUM(d."Montant") AS montant
-    FROM dbo."RDetRegCli" d WHERE d."Num_quitance" IN (SELECT num_quittance FROM q) GROUP BY 1
-),
 quit AS (
     SELECT q.code_client,
            SUM(q.prime_total) FILTER (WHERE NOT q.ristourne) AS prime,
            -- a ristourne is money given back: negative, and so is its commission (stored positive in TQuittance)
            -ABS(SUM(q.prime_total) FILTER (WHERE q.ristourne)) AS ristourne,
-           SUM(reg.montant) FILTER (WHERE NOT q.ristourne) AS reglement,
+           SUM(GREATEST(q.montant - q.solde, 0)) FILTER (WHERE NOT q.ristourne) AS reglement,
+           SUM(q.solde) FILTER (WHERE NOT q.ristourne) AS reste,
            SUM(CASE WHEN q.ristourne THEN -ABS(q.commission) ELSE q.commission END) AS commission
-    FROM q LEFT JOIN reg ON reg.num_quittance = q.num_quittance
+    FROM q
     GROUP BY 1
 ),
 sin AS (
@@ -1026,11 +1026,11 @@ SELECT COALESCE(quit.code_client, sin.code_client) AS code_client,
        (SELECT TRIM(c.nom_client) FROM dbo."TClient" c WHERE TRIM(c.code_client) = COALESCE(quit.code_client, sin.code_client) LIMIT 1) AS nom_client,
        ROUND(COALESCE(quit.prime, 0)::numeric, 3) AS prime, ROUND(COALESCE(quit.ristourne, 0)::numeric, 3) AS ristourne,
        ROUND(COALESCE(sin.sinistre, 0)::numeric, 3) AS sinistre, ROUND(COALESCE(quit.reglement, 0)::numeric, 3) AS reglement,
-       ROUND(COALESCE(quit.commission, 0)::numeric, 3) AS commission
+       ROUND(COALESCE(quit.reste, 0)::numeric, 3) AS reste, ROUND(COALESCE(quit.commission, 0)::numeric, 3) AS commission
 FROM quit FULL JOIN sin ON sin.code_client = quit.code_client
 ORDER BY COALESCE(quit.prime, 0) DESC, 1
 """
-ACCOUNT_TOTALS = ("prime", "ristourne", "sinistre", "reglement", "commission")
+ACCOUNT_TOTALS = ("prime", "ristourne", "sinistre", "reglement", "reste", "commission")
 
 # The detail (what an employee sees): every quittance of the same selection, with its company, échéance, police and
 # prime; the ristournes only when they are asked for.
@@ -1045,7 +1045,10 @@ q AS MATERIALIZED (
     SELECT TRIM(q.code_client) AS code_client, q.echeance::date AS echeance, TRIM(q.num_int) AS num_int,
            TRIM(q.num_quittance) AS num_quittance,
            -- a ristourne (type R, stored positive) is negative
-           CASE WHEN TRIM(COALESCE(q.type_quittance, '')) = 'R' THEN -ABS(COALESCE(q.prime_total, 0)) ELSE COALESCE(q.prime_total, 0) END AS prime
+           CASE WHEN TRIM(COALESCE(q.type_quittance, '')) = 'R' THEN -ABS(COALESCE(q.montant_quittance, q.prime_total, 0)) ELSE COALESCE(q.montant_quittance, q.prime_total, 0) END AS prime,
+           -- what the client settled on it and what is still to pay (none for a ristourne)
+           CASE WHEN TRIM(COALESCE(q.type_quittance, '')) = 'R' THEN 0 ELSE GREATEST(COALESCE(q.montant_quittance, 0) - GREATEST(COALESCE(q.solde_quittance, 0), 0), 0) END AS regle,
+           CASE WHEN TRIM(COALESCE(q.type_quittance, '')) = 'R' THEN 0 ELSE GREATEST(COALESCE(q.solde_quittance, 0), 0) END AS reste
     FROM dbo."TQuittance" q
     WHERE COALESCE(q.annule, 'N') <> 'O'
       AND q."Date_Retour" IS NULL
@@ -1066,7 +1069,8 @@ p AS (
 SELECT q.code_client,
        (SELECT TRIM(c.nom_client) FROM dbo."TClient" c WHERE TRIM(c.code_client) = q.code_client LIMIT 1) AS nom_client,
        p.code_compagnie, (SELECT TRIM(k.nom_compagnie) FROM dbo."TCompagnie" k WHERE k.code_compagnie = p.code_compagnie) AS nom_compagnie,
-       q.echeance, COALESCE(p.num_police, q.num_int) AS num_police, q.num_quittance, ROUND(q.prime::numeric, 3) AS prime
+       q.echeance, COALESCE(p.num_police, q.num_int) AS num_police, q.num_quittance, ROUND(q.prime::numeric, 3) AS prime,
+       ROUND(q.regle::numeric, 3) AS regle, ROUND(q.reste::numeric, 3) AS reste
 FROM q LEFT JOIN p ON p.num_int = q.num_int
 ORDER BY CASE WHEN q.code_client ~ '^[0-9]+$' THEN CAST(q.code_client AS bigint) END NULLS LAST, q.code_client,
          nom_compagnie NULLS LAST, q.echeance, q.num_quittance
@@ -1104,7 +1108,9 @@ def client_accounts(
         raise _fail(exc) from exc
     items = [_plain(row) for row in rows]
     if presentation == "detail":
-        return {"presentation": "detail", "lines": items, "total": round(sum(float(row["prime"] or 0) for row in items), 3)}
+        return {"presentation": "detail", "lines": items, "total": round(sum(float(row["prime"] or 0) for row in items), 3),
+                "total_regle": round(sum(float(row["regle"] or 0) for row in items), 3),
+                "total_reste": round(sum(float(row["reste"] or 0) for row in items), 3)}
     return {"presentation": "synthese", "items": items, "totals": {key: round(sum(float(row[key] or 0) for row in items), 3) for key in ACCOUNT_TOTALS}}
 
 
