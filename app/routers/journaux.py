@@ -187,6 +187,8 @@ def _receipt(row: Any) -> dict[str, Any]:
         # The commission is declared with the balance, not with the acomptes.
         "comm": item["commission"] if kind == "S" else 0,
         "paye": paid,
+        # as the legacy JEQ: an acompte still to declare (the quittance not fully paid) is not in the journal
+        "hors_journal": not done and not paid,
     })
     return item
 
@@ -195,7 +197,7 @@ def _pending_part(item: dict[str, Any]) -> dict[str, Any]:
     """The part still to declare of a quittance also declared in the journal (paid again since): its own line, unticked."""
     paid = item["paye"]
     return {**item, "comptabilise": False, "date_comptabilise": None, "a_s": "S" if paid else "A", "montant": round(item["pending"], 3),
-            "comm": item["commission"] if paid else 0, "partie": "a_declarer"}
+            "comm": item["commission"] if paid else 0, "partie": "a_declarer", "hors_journal": not paid}
 
 
 def _receipts(db: Session, compagnie: int | None, day: date, done: bool, numbers: list[str] | None = None,
@@ -756,7 +758,7 @@ def cash_sheet(
 def _add_pending(db: Session, compagnie: int, day: date, journals: list[dict[str, Any]], expenses: list[dict[str, Any]]) -> None:
     """Adds to the feuille of `day` the lines its journals still have to declare (see cash_sheet)."""
     pending = [line for line in _receipts(db, compagnie, day, False, regles=True)
-               if not line["comptabilise"] and (line["paye"] or line["a_s"] == "A")]
+               if not line["comptabilise"] and not line["hors_journal"]]
     if pending:
         row = next((item for item in journals if str(item["jour"])[:10] == day.isoformat()), None)
         if row is None:
@@ -1492,7 +1494,7 @@ def validate_cash_sheet(payload: ValiderFeuille, user: dict[str, Any] = Depends(
         numbers = sorted({n.strip() for n in payload.quittances if n.strip()}) if payload.quittances is not None else None
         receipts = [] if numbers == [] else [
             line for line in _receipts(db, payload.compagnie, jour, False, numbers, regles=True)
-            if not line["comptabilise"] and (line["paye"] or line["a_s"] == "A")
+            if not line["comptabilise"] and not line["hors_journal"]
         ]
         # As the legacy software: everything paid by then and still to declare (the feuille shows the same lines).
         for line in receipts:
@@ -1569,7 +1571,8 @@ lines AS MATERIALIZED (
                AND t.date_reg_cli >= date_trunc('year', CAST(:first AS date)) - INTERVAL '1 year'))
 ),
 q AS (
-    SELECT DISTINCT ON (TRIM(q.num_quittance)) TRIM(q.num_quittance) AS num_quittance, TRIM(q.num_int) AS num_int
+    SELECT DISTINCT ON (TRIM(q.num_quittance)) TRIM(q.num_quittance) AS num_quittance, TRIM(q.num_int) AS num_int,
+           COALESCE(q.solde_quittance, 0) <= 0.0005 AS soldee
     FROM dbo."TQuittance" q
     WHERE TRIM(q.num_quittance) IN (SELECT num_quittance FROM lines) AND TRIM(q.type_quittance) = 'P' AND COALESCE(q.annule, 'N') <> 'O'
     ORDER BY TRIM(q.num_quittance)
@@ -1586,7 +1589,9 @@ kept AS (
     JOIN dbo."TCompagnie" k ON k.code_compagnie = p.code_compagnie
     WHERE (CAST(:compagnie AS integer) IS NULL OR p.code_compagnie = CAST(:compagnie AS integer))
       AND UPPER(TRIM(k.nom_compagnie)) <> ALL(:excluded)
-      AND (l.declared OR l.num_quittance NOT IN (SELECT num_quittance FROM small))
+      -- as the legacy JEQ: what is declared on the date, and the quittances fully paid still to declare (an acompte
+      -- still to declare is not in a journal until it is declared)
+      AND (l.declared OR (q.soldee AND l.num_quittance NOT IN (SELECT num_quittance FROM small)))
 ),
 {per}
 SELECT per.jour, per.debut,
@@ -1766,7 +1771,7 @@ def validate_journal(payload: ValiderJournal, user: dict[str, Any] = Depends(req
         if kind == "E":
             lines = [line for line in _receipts(db, compagnie, jour, True, regles=True, pending_from=_receipt_pending_start(jour))]
             # declared on the 15th / end of month only (a journal the legacy software dated another day is only confirmed)
-            to_declare = [line for line in lines if not line["comptabilise"] and (line["paye"] or line["a_s"] == "A")]                 if _is_period_end(jour) else []
+            to_declare = [line for line in lines if not line["comptabilise"] and not line["hors_journal"]] if _is_period_end(jour) else []
             for line in to_declare:
                 _declare_receipt(db, line, jour, name)
         else:
