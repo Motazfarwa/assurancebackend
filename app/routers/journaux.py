@@ -1685,8 +1685,9 @@ def journal_periods(
             continue
         item["jour"] = row["jour"].isoformat()
         item["debut"] = row["debut"].isoformat()
-        item["lignes"] = item["declarees"] + item["a_declarer"]
-        item["montant"] = round(float(item["montant_declare"]) + float(item["montant_a_declarer"]), 3)
+        # the journal holds what is declared (comptabilisé) on its date only: what is still to declare is not counted
+        item["lignes"] = item["declarees"]
+        item["montant"] = round(float(item["montant_declare"]), 3)
         item["validation"] = validations.get(item["jour"])
         item["quinzaine"] = row["debut"] < row["jour"]
         items.append(item)
@@ -1708,49 +1709,44 @@ def _declared_on(db: Session, kind: str, day: date) -> bool:
     ), {"d": day, "n": day + timedelta(days=1)}).first())
 
 
+def _journal_totals(db: Session, kind: str, jour: date, compagnie: int | None, nature: str | None) -> tuple[int, float]:
+    """What is declared in the journal of `jour` (the same figures as its line of the list)."""
+    params = {"starts": [_period_start(jour)], "ends": [jour], "first": _period_start(jour), "last": jour, "compagnie": compagnie,
+              "excluded": EXCLUDED_COMPANIES}
+    db.execute(text("SET LOCAL enable_nestloop = off"))
+    sql = RECEIPT_PERIODS_SQL if kind == "E" else EXPENSE_PERIODS_SQL
+    if kind == "D":
+        params["nature"] = nature or None
+    for row in db.execute(text(sql), params).mappings().all():
+        if row["jour"] == jour:
+            return int(row["declarees"] or 0), round(float(row["montant_declare"] or 0), 3)
+    return 0, 0.0
+
+
 @router.post("/valider-journal")
 def validate_journal(payload: ValiderJournal, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
-    """Validates the journal of the half month ending on `jour`: what was paid in it and is still to declare is declared on
-    `jour` (encaissements: the quittances not unticked in the journal of that day; the ones declared in it then unticked
-    are taken out). They are then in the feuille de caisse of `jour`."""
+    """Validates the journal of `jour` as it is: what is declared (comptabilisé) on that date. Nothing still to declare /
+    to comptabiliser is added: those are declared by ticking them (encaissement) or by "Comptabiliser" (dépense).
+    Encaissement: a quittance declared in it and then unticked is taken out."""
     jour, compagnie = payload.jour, payload.compagnie
     _ensure_journal_validated(db)
     if not _is_period_end(jour) and not _declared_on(db, payload.type, jour):
         raise HTTPException(status_code=422, detail="Un journal est daté du 15 ou du dernier jour du mois.")
     name = str(user.get("sub", ""))[:50]
-    start = _pending_start(jour)
     kind = "E" if payload.type == "encaissement" else "D"
     withdrawn: list[str] = []
     try:
         db.execute(text("SELECT pg_advisory_xact_lock(hashtext('journal:' || :t || ':' || :j))"), {"t": kind, "j": jour.isoformat()})
         if kind == "E":
             unticked = _unticked(db, jour)
-            lines = [line for line in _receipts(db, compagnie, jour, True, regles=True, pending_from=_receipt_pending_start(jour))]
-            # declared on the 15th / end of month only (a journal the legacy software dated another day is only confirmed)
-            to_declare = [line for line in lines if not line["comptabilise"] and (line["paye"] or line["a_s"] == "A")
-                          and line["num_quittance"] not in unticked] if _is_period_end(jour) else []
-            for line in to_declare:
-                _declare_receipt(db, line, jour, name)
-            withdrawn = [line["num_quittance"] for line in lines if line["comptabilise"] and line["num_quittance"] in unticked]
-            for number in withdrawn:
-                for day in {str(line.get("date_comptabilise") or "")[:10] for line in lines if line["num_quittance"] == number}:
-                    if day:
-                        _undeclare_receipt(db, number, date.fromisoformat(day))
-            count, amount = len(to_declare), round(sum(line["montant"] for line in to_declare), 3)
-        else:
-            lines = [line for line in _expenses(db, compagnie, jour, False, payload.nature or None, pending_from=start) if not line["comptabilise"]]
-            ids = [line["num_dep"] for line in lines]
-            if ids:
-                db.execute(text(
-                    'UPDATE dbo."TDepense" SET "Comptabiliser" = \'O\', "Date_Comptabiliser" = :d '
-                    'WHERE TRIM("Typ_dep") = \'T\' AND num_dep = ANY(CAST(:ids AS int[])) AND COALESCE("Comptabiliser", \'N\') <> \'O\''
-                ), {"d": jour, "ids": ids})
-                for num_dep in ids:
-                    db.execute(text(
-                        'INSERT INTO dbo."TDepenseValide" (num_dep, jour, utilisateur, date_saisie) '
-                        "VALUES (:n, :j, :u, now() AT TIME ZONE 'Africa/Tunis') ON CONFLICT DO NOTHING"
-                    ), {"n": num_dep, "j": jour, "u": name})
-            count, amount = len(ids), round(sum(float(line["montant"] or 0) for line in lines), 3)
+            if unticked:
+                lines = _receipts(db, compagnie, jour, True, regles=True, pending_from=_receipt_pending_start(jour))
+                withdrawn = sorted({line["num_quittance"] for line in lines if line["comptabilise"] and line["num_quittance"] in unticked})
+                for number in withdrawn:
+                    for day in {str(line.get("date_comptabilise") or "")[:10] for line in lines if line["num_quittance"] == number}:
+                        if day:
+                            _undeclare_receipt(db, number, date.fromisoformat(day))
+        count, amount = _journal_totals(db, kind, jour, compagnie, payload.nature)
         db.execute(text(
             'INSERT INTO dbo."TJournalValide" (type_journal, jour, code_compagnie, lignes, montant, retirees, utilisateur, date_saisie) '
             "VALUES (:t, :j, :c, :n, :m, :r, :u, now() AT TIME ZONE 'Africa/Tunis')"
