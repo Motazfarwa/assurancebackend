@@ -358,10 +358,14 @@ def recovery_rate(
         start = today.replace(month=1, day=1)
         # TRIM joins on legacy tables: hash joins only (nested loops take minutes over all the quittances).
         db.execute(text("SET LOCAL enable_nestloop = off"))
-        row = db.execute(text(RECOVERY_SQL.format(schema=settings.db_schema)), {
-            "code": code_client.strip(), "type_client": type_client, "compagnie": code_compagnie,
-            "debut": datetime.combine(start, time.min), "lendemain": datetime.combine(today + timedelta(days=1), time.min),
-        }).mappings().one()
+        def year(first: date, last: date) -> Any:
+            return db.execute(text(RECOVERY_SQL.format(schema=settings.db_schema)), {
+                "code": code_client.strip(), "type_client": type_client, "compagnie": code_compagnie,
+                "debut": datetime.combine(first, time.min), "lendemain": datetime.combine(last + timedelta(days=1), time.min),
+            }).mappings().one()
+        row = year(start, today)
+        # the whole previous year (1 January to 31 December), for comparison: its rate only
+        before = year(start.replace(year=start.year - 1), start - timedelta(days=1))
     except SQLAlchemyError as exc:
         raise HTTPException(status_code=503, detail="Impossible de calculer le taux de recouvrement.") from exc
     finally:
@@ -372,7 +376,13 @@ def recovery_rate(
         "encaissements": round(encaissements, 3), "primes_exigibles": round(primes, 3),
         "quittances_exigibles": int(row["quittances_exigibles"] or 0),
         "taux": round(encaissements / primes * 100, 2) if primes > 0.0005 else None,
+        "precedente": {"annee": today.year - 1, "taux": _rate(before)},
     }
+
+
+def _rate(row: Any) -> float | None:
+    paid, due = float(row["encaissements"] or 0), float(row["primes_exigibles"] or 0)
+    return round(paid / due * 100, 2) if due > 0.0005 else None
 
 
 @router.get("/etat/liens/{code_client}")
