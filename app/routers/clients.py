@@ -1,8 +1,9 @@
 import logging
+import re
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from sqlalchemy import BigInteger, MetaData, Table, cast, func, or_, select, text
+from sqlalchemy import BigInteger, MetaData, Table, and_, cast, func, or_, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -61,6 +62,21 @@ def complete_client_name(values: dict[str, Any]) -> dict[str, Any]:
     return values
 
 
+_ACCENTS = ("àâäáãåçéèêëíìîïñóòôöõúùûüýÿ", "aaaaaaceeeeiiiinooooouuuuyy")
+
+
+def fold_name(value: str) -> str:
+    """A name folded for the similar search: lower case, no accents, letters and digits only, a doubled letter once."""
+    text = (value or "").lower().translate(str.maketrans(*_ACCENTS))
+    return re.sub(r"(.)\1+", r"\1", re.sub(r"[^a-z0-9]", "", text))
+
+
+def _folded_sql(column: Any) -> Any:
+    """fold_name in SQL."""
+    text = func.translate(func.lower(func.coalesce(column, "")), _ACCENTS[0], _ACCENTS[1])
+    return func.regexp_replace(func.regexp_replace(text, "[^a-z0-9]", "", "g"), r"(.)\1+", r"\1", "g")
+
+
 @router.get("")
 def list_clients(
     q: str = Query(default="", max_length=100),
@@ -74,7 +90,13 @@ def list_clients(
     query = select(table)
     if q.strip():
         term = f"%{q.strip()}%"
-        query = query.where(or_(table.c.code_client.ilike(term), table.c.nom_client.ilike(term)))
+        # similar names: case, accents, spaces, punctuation and doubled letters aside, every word typed is somewhere in
+        # the name ("abdenour" finds BEN ABDENNOUR and BENABDENNOUR); a code is looked up as typed
+        words = [fold_name(word) for word in q.split()]
+        folded = _folded_sql(table.c.nom_client)
+        conditions = [folded.like(f"%{word}%") for word in words if word]
+        query = query.where(or_(table.c.code_client.ilike(term), table.c.nom_client.ilike(term),
+                                *([and_(*conditions)] if conditions else [])))
     try:
         rows = db.execute(query.order_by(table.c.code_client).limit(limit).offset(offset)).mappings().all()
         return {"items": [serialize(row) for row in rows], "limit": limit, "offset": offset}
