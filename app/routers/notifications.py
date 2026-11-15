@@ -130,6 +130,8 @@ def incomplete_clients(
     q: str = Query(default="", max_length=100),  # code or name of a client; the counters stay those of the whole list
     # Module "Clients à compléter": one kind of gap only, the next pages, and every entry of each client
     categorie: str = Query(default="", pattern="^(|coordonnees|sans_police)$"),
+    # one missing coordonnée only: adresse, ville, code postal, téléphone
+    manque: str = Query(default="", pattern="^(|adresse|ville|code postal|téléphone)$"),
     offset: int = Query(default=0, ge=0),
     user: dict[str, Any] = Depends(require_current_user),
     db: Session = Depends(get_db),
@@ -142,6 +144,8 @@ def incomplete_clients(
     found = [row for row in rows if all(word in f'{row["code_client"]} {row["nom_client"] or ""}'.lower() for word in search.split())]
     if categorie:
         found = [row for row in found if row[categorie]]
+    if manque:
+        found = [row for row in found if manque in row["coordonnees"]]
     found.sort(key=lambda row: row["code_client"].lower() != search)
     items = []
     for row in found[offset:offset + limit]:
@@ -159,6 +163,7 @@ def incomplete_clients(
         "found": len(found),
         "coordonnees": sum(1 for row in rows if row["coordonnees"]),
         "sans_police": sum(1 for row in rows if row["sans_police"]),
+        "manques": {name: sum(1 for row in rows if name in row["coordonnees"]) for name in ("adresse", "ville", "code postal", "téléphone")},
         "items": items,
     }
 
