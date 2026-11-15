@@ -13,11 +13,12 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.auth import require_admin
+from app.auth import require_current_user
 from app.database import get_db
 
 
-router = APIRouter(prefix="/api/frais-generaux", tags=["Frais généraux"], dependencies=[Depends(require_admin)])
+# A normal module (400): every user given it in "Access users" may use it.
+router = APIRouter(prefix="/api/frais-generaux", tags=["Frais généraux"], dependencies=[Depends(require_current_user)])
 
 # Only the W.J frais are entered now; the M.J ones (Typ_dep 'F') stay in TDepense as history.
 NATURES = {"D": "Frais Généraux (W.J)"}
