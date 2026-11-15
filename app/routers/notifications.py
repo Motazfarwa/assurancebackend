@@ -73,18 +73,15 @@ def my_notifications(
     return {"unread": unread, "items": items}
 
 
-# Clients to complete (administrator), what each one lacks:
-#  - coordonnées: an address, city and postal code (at home or at the office), and at least one phone and one email on
-#    the address chosen for correspondence (Correspondant 'B': the office, otherwise home);
-#  - polices: no police at all, or a police in force (etat AN) without company, effect date, risk, or its
-#    term (échéance if renewable, expiration if not);
-#  - quittances of a police in force without date d'émission, échéance, prime nette, prime totale, montant or solde.
-# The sinistres are not counted.
+# Clients to complete (administrator): the clients that have
+#  - missing coordonnées: no address, no city or no postal code (neither at home nor at the office), or no phone at all
+#    (home or office). The email is not required: most clients of the agency have none;
+#  - no police at all.
+# A client lacking both is counted once in the total.
 # What counts as filled comes from Render's data: phones are often typed with spaces ("50 932 532"), and the old software
 # left "." or "neant" where there was nothing. A phone is one field with at least 6 digits, not all the same ("000000").
 _ITEMS = "jsonb_array_elements(CASE WHEN jsonb_typeof(to_jsonb(k)->'{json}') = 'array' THEN to_jsonb(k)->'{json}' ELSE '[]'::jsonb END)"
 _IS_PHONE = r"(LENGTH(REGEXP_REPLACE(COALESCE({v}, ''), '[^0-9]', '', 'g')) >= 6 AND REGEXP_REPLACE(COALESCE({v}, ''), '[^0-9]', '', 'g') !~ '^(.)\1*$')"
-_IS_EMAIL = "COALESCE({v}, '') ~ '[^@[:space:]]@[^@[:space:]]'"
 
 
 def _any_contact(check: str, cols: str, json: str) -> str:
@@ -104,59 +101,25 @@ def _no_place(col: str) -> str:
     return f"({_empty(col)} OR LOWER(TRIM({col})) IN ('0', 'neant', 'néant'))"
 
 
-PHONE_HOME = _any_contact(_IS_PHONE, "k.tel, k.tel1, k.tel2, k.tel3", "telephones_domicile")
+PHONE_HOME = _any_contact(_IS_PHONE, "k.tel, k.tel1, k.tel2, k.tel3, k.mobile, k.tel_contact", "telephones_domicile")
 PHONE_OFFICE = _any_contact(_IS_PHONE, "k.tel_b, k.tel_b2, k.tel_b3, k.tel_b4", "telephones_bureau")
-EMAIL_HOME = _any_contact(_IS_EMAIL, "k.email1, k.email2, k.email3", "emails_domicile")
-EMAIL_OFFICE = _any_contact(_IS_EMAIL, "k.adresse_email, k.emailb2, k.emailb3", "emails_bureau")
 
 INCOMPLETE_SQL = f"""
-    WITH pol AS (
-        SELECT code, COALESCE(ARRAY_AGG(numero || ' : ' || ARRAY_TO_STRING(manque, ', ') ORDER BY numero) FILTER (WHERE CARDINALITY(manque) > 0), ARRAY[]::text[]) AS polices
-        FROM (
-            SELECT TRIM(p.code_client) AS code, TRIM(p.num_police) AS numero,
-                   CASE WHEN UPPER(TRIM(p.etat)) IN ('AN', 'RV') THEN ARRAY_REMOVE(ARRAY[
-                       CASE WHEN p.code_compagnie IS NULL THEN 'compagnie' END,
-                       CASE WHEN p.effet IS NULL THEN 'date effet' END,
-                       CASE WHEN {_empty('p.risque')} THEN 'risque' END,
-                       CASE WHEN TRIM(COALESCE(p."Renouv_An", '')) = 'O' AND {_empty('p.echeance')} THEN 'échéance' END,
-                       CASE WHEN TRIM(COALESCE(p."Renouv_An", '')) <> 'O' AND p.expiration IS NULL THEN 'expiration' END
-                   ], NULL) ELSE ARRAY[]::text[] END AS manque
-            FROM dbo."TPolice" p
-        ) x
-        GROUP BY 1
-    ), quit AS (
-        SELECT TRIM(q.code_client) AS code, ARRAY_AGG(TRIM(q.num_quittance) || ' : ' || ARRAY_TO_STRING(ARRAY_REMOVE(ARRAY[
-                   CASE WHEN q.date_emission IS NULL THEN 'date émission' END, CASE WHEN q.echeance IS NULL THEN 'échéance' END,
-                   CASE WHEN q.prime_net IS NULL THEN 'prime nette' END, CASE WHEN q.prime_total IS NULL THEN 'prime totale' END,
-                   CASE WHEN q.montant_quittance IS NULL THEN 'montant' END, CASE WHEN q.solde_quittance IS NULL THEN 'solde' END
-               ], NULL), ', ') ORDER BY TRIM(q.num_quittance)) AS quittances
-        FROM dbo."TQuittance" q
-        JOIN dbo."TPolice" p ON TRIM(p.num_int) = TRIM(q.num_int) AND UPPER(TRIM(p.etat)) IN ('AN', 'RV')
-        WHERE q.date_emission IS NULL OR q.echeance IS NULL OR q.prime_net IS NULL OR q.prime_total IS NULL
-           OR q.montant_quittance IS NULL OR q.solde_quittance IS NULL
-        GROUP BY 1
+    WITH pol AS (SELECT DISTINCT TRIM(p.code_client) AS code FROM dbo."TPolice" p
     ), c AS (
         SELECT TRIM(k.code_client) AS code_client, TRIM(k.nom_client) AS nom_client,
                ARRAY_REMOVE(ARRAY[
                    CASE WHEN {_no_place('k.adresse')} AND {_no_place('k.adresse_b')} THEN 'adresse' END,
                    CASE WHEN {_no_place('k.ville')} AND {_no_place('k.ville_b')} THEN 'ville' END,
                    CASE WHEN COALESCE(k.cp, 0) = 0 AND COALESCE(k.cp_b, 0) = 0 THEN 'code postal' END,
-                   CASE WHEN TRIM(COALESCE(k."Correspondant", '')) = 'B'
-                        THEN CASE WHEN NOT {PHONE_OFFICE} THEN 'téléphone (bureau)' END
-                        ELSE CASE WHEN NOT {PHONE_HOME} THEN 'téléphone (domicile)' END END,
-                   CASE WHEN TRIM(COALESCE(k."Correspondant", '')) = 'B'
-                        THEN CASE WHEN NOT {EMAIL_OFFICE} THEN 'email (bureau)' END
-                        ELSE CASE WHEN NOT {EMAIL_HOME} THEN 'email (domicile)' END END
+                   CASE WHEN NOT ({PHONE_HOME} OR {PHONE_OFFICE}) THEN 'téléphone' END
                ], NULL) AS coordonnees,
-               pol.code IS NULL AS sans_police,
-               COALESCE(pol.polices, ARRAY[]::text[]) AS polices,
-               COALESCE(quit.quittances, ARRAY[]::text[]) AS quittances
+               pol.code IS NULL AS sans_police
         FROM dbo."TClient" k
         LEFT JOIN pol ON pol.code = TRIM(k.code_client)
-        LEFT JOIN quit ON quit.code = TRIM(k.code_client)
     )
     SELECT * FROM c
-    WHERE CARDINALITY(coordonnees) > 0 OR sans_police OR CARDINALITY(polices) > 0 OR CARDINALITY(quittances) > 0
+    WHERE CARDINALITY(coordonnees) > 0 OR sans_police
     ORDER BY CASE WHEN code_client ~ '^[0-9]+$' THEN CAST(code_client AS bigint) END DESC NULLS LAST, code_client
 """
 
@@ -166,7 +129,7 @@ def incomplete_clients(
     limit: int = Query(default=50, ge=1, le=200),
     q: str = Query(default="", max_length=100),  # code or name of a client; the counters stay those of the whole list
     # Module "Clients à compléter": one kind of gap only, the next pages, and every entry of each client
-    categorie: str = Query(default="", pattern="^(|coordonnees|sans_police|polices|quittances)$"),
+    categorie: str = Query(default="", pattern="^(|coordonnees|sans_police)$"),
     offset: int = Query(default=0, ge=0),
     user: dict[str, Any] = Depends(require_current_user),
     db: Session = Depends(get_db),
@@ -185,14 +148,10 @@ def incomplete_clients(
         manques = list(row["coordonnees"])
         if row["sans_police"]:
             manques.append("aucune police")
-        # "police 074202646653 : date effet, risque"
-        manques.extend(f"police {entry}" for entry in row["polices"][:3])
-        manques.extend(f"quittance {entry}" for entry in row["quittances"][:3])
         items.append({
             "code_client": row["code_client"], "nom_client": row["nom_client"], "manques": manques,
             "details": {
                 "coordonnees": list(row["coordonnees"]), "sans_police": bool(row["sans_police"]),
-                "polices": list(row["polices"]), "quittances": list(row["quittances"]),
             },
         })
     return {
@@ -200,8 +159,6 @@ def incomplete_clients(
         "found": len(found),
         "coordonnees": sum(1 for row in rows if row["coordonnees"]),
         "sans_police": sum(1 for row in rows if row["sans_police"]),
-        "polices": sum(1 for row in rows if row["polices"]),
-        "quittances": sum(1 for row in rows if row["quittances"]),
         "items": items,
     }
 
