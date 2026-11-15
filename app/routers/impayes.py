@@ -212,6 +212,8 @@ def unpaid_statement(
     code_compagnie: int | None = None,
     mise_en_demeure: bool = False,
     limit: int = Query(default=5000, ge=1, le=10000),
+    # TC of the quittance: "C" comptant, "T" terme, "" both
+    tc: str = Query(default="", pattern="^(|C|T)$"),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """Etat des impayés, read live from TQuittance (TTempEtatImpaye is only a print buffer of the legacy software).
@@ -242,6 +244,7 @@ def unpaid_statement(
             FROM "{schema}"."TQuittance" q
             WHERE TRIM(q.type_quittance) = 'P' AND q.solde_quittance > 0 AND COALESCE(q.annule, 'N') <> 'O'
               AND (:code = '' OR TRIM(q.code_client) = :code)
+              AND (:tc = '' OR UPPER(TRIM(q.tc)) = :tc)
               AND (NOT :mise OR q.mised = 'O' OR q.observation ILIKE '%mise en demeure%')
               AND (CAST(:debut AS timestamp) IS NULL OR q.echeance >= CAST(:debut AS timestamp))
               AND (CAST(:fin AS timestamp) IS NULL OR q.echeance < CAST(:fin AS timestamp))
@@ -293,7 +296,7 @@ def unpaid_statement(
     """
     params = {
         "piece": piece, "code": code_client.strip(), "nom": nom_client.strip(), "nom_like": f"%{nom_client.strip()}%",
-        "type_client": type_client, "compagnie": code_compagnie, "mise": mise_en_demeure, "limit": limit,
+        "type_client": type_client, "compagnie": code_compagnie, "mise": mise_en_demeure, "limit": limit, "tc": tc,
         "debut": datetime.combine(date_debut, time.min) if date_debut else None,
         "fin": datetime.combine(date_fin + timedelta(days=1), time.min) if date_fin else None,
     }

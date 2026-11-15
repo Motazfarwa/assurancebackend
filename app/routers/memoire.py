@@ -53,9 +53,10 @@ def _term(row: dict[str, Any]) -> str:
     return f"T{periode}" if tc == "T" and periode else tc
 
 
-def _rows(db: Session, code: str, piece: str, date_debut: date | None, date_fin: date | None, code_compagnie: int | None) -> list[dict[str, Any]]:
+def _rows(db: Session, code: str, piece: str, date_debut: date | None, date_fin: date | None, code_compagnie: int | None,
+          tc: str | None = None) -> list[dict[str, Any]]:
     body = unpaid_statement(code_client=code, nom_client="", piece=piece, date_debut=date_debut, date_fin=date_fin, type_client="",
-                            code_compagnie=code_compagnie, mise_en_demeure=False, limit=5000, db=db)
+                            code_compagnie=code_compagnie, mise_en_demeure=False, limit=5000, tc=tc or "", db=db)
     return body["items"]
 
 
@@ -171,11 +172,12 @@ def memoire_download(
     date_debut: date | None = None,
     date_fin: date | None = None,
     code_compagnie: int | None = None,
+    tc: str = Query(default="", pattern="^(|C|T)$"),
     db: Session = Depends(get_db),
 ) -> Response:
     code = code_client.strip()
     client = _client(db, code)
-    rows = _rows(db, code, piece, date_debut, date_fin, code_compagnie)
+    rows = _rows(db, code, piece, date_debut, date_fin, code_compagnie, tc)
     return Response(memoire_pdf(client, rows), media_type="application/pdf",
                     headers={"Content-Disposition": f'attachment; filename="{_file_name(code)}"'})
 
@@ -189,6 +191,7 @@ class Envoi(BaseModel):
     date_debut: date | None = None
     date_fin: date | None = None
     code_compagnie: int | None = None
+    tc: str | None = Field(default=None, pattern="^(|C|T)$")  # comptant / terme / both
 
     # The criteria of the statement come as they are on screen: an empty one ("") is no criterion.
     @field_validator("date_debut", "date_fin", "code_compagnie", mode="before")
@@ -269,7 +272,7 @@ def _send_whatsapp(number: str, message: str, pdf: bytes, name: str) -> None:
 def send_memoire(code_client: str, payload: Envoi, db: Session = Depends(get_db)) -> dict[str, Any]:
     code = code_client.strip()
     client = _client(db, code)
-    rows = _rows(db, code, payload.piece, payload.date_debut, payload.date_fin, payload.code_compagnie)
+    rows = _rows(db, code, payload.piece, payload.date_debut, payload.date_fin, payload.code_compagnie, payload.tc)
     if not rows:
         raise HTTPException(status_code=422, detail="Aucune quittance impayée : il n’y a pas de mémoire de règlement à envoyer.")
     pdf, name = memoire_pdf(client, rows), _file_name(code)
