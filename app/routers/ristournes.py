@@ -65,6 +65,10 @@ WITH q AS MATERIALIZED (
     WHERE TRIM(q.type_quittance) = 'R'
       AND (CAST(:debut AS date) IS NULL OR q.date_saisie >= CAST(:debut AS date))
       AND (CAST(:lendemain AS date) IS NULL OR q.date_saisie < CAST(:lendemain AS date))
+      -- the search: N° ristourne, N° police (or its internal number), code client or client name
+      AND (:term = '' OR TRIM(q.num_quittance) ILIKE :like OR TRIM(q.num_int) ILIKE :like OR TRIM(q.code_client) = :term
+           OR TRIM(q.num_int) IN (SELECT TRIM(p.num_int) FROM dbo."TPolice" p WHERE TRIM(p.num_police) ILIKE :like)
+           OR TRIM(q.code_client) IN (SELECT TRIM(k.code_client) FROM dbo."TClient" k WHERE k.nom_client ILIKE :like))
     ORDER BY q.date_saisie DESC NULLS LAST, q.num_quittance DESC
     LIMIT :limit
 ),
@@ -194,28 +198,19 @@ def list_ristournes(
     limit: int = Query(200, ge=1, le=2000),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """The ristournes, newest first, searched by number, policy, client code or name; "Lister" with two dates: those
-    whose date de saisie falls between them (both days included)."""
+    """The ristournes, newest first, searched by number, policy, client code or name (in every ristourne, not only the
+    latest ones), with two dates: those whose date de saisie falls between them (both days included)."""
     if date_debut and date_fin and date_debut > date_fin:
         raise HTTPException(status_code=422, detail="La date de début doit précéder la date de fin.")
     term = q.strip()
-    where = "TRUE"
-    if term:
-        where = ("(TRIM(q.num_quittance) ILIKE :like OR pol.num_police ILIKE :like OR TRIM(q.code_client) = :term "
-                 "OR c.nom_client ILIKE :like)")
     params = {"term": term, "like": f"%{term}%", "limit": limit, "debut": date_debut,
               "lendemain": date_fin + timedelta(days=1) if date_fin else None}
     try:
-        if term:
-            rows = db.execute(
-                text(_ristourne_sql(where) + " ORDER BY q.date_saisie DESC NULLS LAST, q.num_quittance DESC LIMIT :limit"), params,
-            ).mappings().all()
-        else:
-            # "Lister": the ristournes chosen first, then their policies read in one pass (hash joins: a per-row lookup
-            # on TRIM(num_int) reads the whole policy table for each ristourne).
-            db.execute(text("SET LOCAL enable_nestloop = off"))
-            rows = db.execute(text(LIST_SQL), params).mappings().all()
-            db.rollback()
+        # the ristournes chosen first, then their policies read in one pass (hash joins: a per-row lookup on
+        # TRIM(num_int) reads the whole policy table for each ristourne)
+        db.execute(text("SET LOCAL enable_nestloop = off"))
+        rows = db.execute(text(LIST_SQL), params).mappings().all()
+        db.rollback()
     except SQLAlchemyError as exc:
         raise _fail(exc) from exc
     return {"items": [_plain(row) for row in rows]}

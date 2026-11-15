@@ -1492,7 +1492,8 @@ def validate_cash_sheet(payload: ValiderFeuille, user: dict[str, Any] = Depends(
         if _cash_validation(db, payload.compagnie, jour):
             raise HTTPException(status_code=409, detail=f"La feuille de caisse du {jour.strftime('%d/%m/%Y')} de cette compagnie est déjà validée.")
         numbers = sorted({n.strip() for n in payload.quittances if n.strip()}) if payload.quittances is not None else None
-        receipts = [] if numbers == [] else [
+        # only a journal day (the 15th, the end of the month) declares what is still to declare, as its feuille shows
+        receipts = [] if numbers == [] or not _is_period_end(jour) else [
             line for line in _receipts(db, payload.compagnie, jour, False, numbers, regles=True)
             if not line["comptabilise"] and not line["hors_journal"]
         ]
@@ -1501,8 +1502,8 @@ def validate_cash_sheet(payload: ValiderFeuille, user: dict[str, Any] = Depends(
             _declare_receipt(db, line, jour, name)
         withdrawn: list[str] = []
         ids = sorted(set(payload.depenses)) if payload.depenses is not None else None
-        expenses = [] if ids == [] else [line for line in _expenses(db, payload.compagnie, jour, False, None, ids, pending_from=_pending_start(jour))
-                                         if not line["comptabilise"]]
+        expenses = [] if ids == [] or not _is_period_end(jour) else [
+            line for line in _expenses(db, payload.compagnie, jour, False, None, ids, pending_from=_pending_start(jour)) if not line["comptabilise"]]
         if expenses:
             expense_ids = [line["num_dep"] for line in expenses]
             db.execute(text(
@@ -1514,11 +1515,17 @@ def validate_cash_sheet(payload: ValiderFeuille, user: dict[str, Any] = Depends(
                     'INSERT INTO dbo."TDepenseValide" (num_dep, jour, utilisateur, date_saisie) '
                     "VALUES (:n, :j, :u, now() AT TIME ZONE 'Africa/Tunis') ON CONFLICT DO NOTHING"
                 ), {"n": num_dep, "j": jour, "u": name})
+        # the feuille validated: everything declared on the day once validated (the figures the feuille shows)
+        sheet = {"compagnie": payload.compagnie, "debut": jour, "fin": jour}
+        db.execute(text("SET LOCAL enable_nestloop = off"))
+        day_receipts = db.execute(text(CASH_RECEIPTS_SQL), sheet).mappings().all()
+        day_expenses = db.execute(text(CASH_EXPENSES_SQL), sheet).mappings().all()
         db.execute(text(
             'INSERT INTO dbo."TFeuilleCaisseValide" (code_compagnie, jour, quittances, encaissements, depenses, montant_depenses, utilisateur, date_saisie) '
             "VALUES (:c, :j, :q, :e, :n, :m, :u, now() AT TIME ZONE 'Africa/Tunis')"
-        ), {"c": payload.compagnie, "j": jour, "q": len(receipts), "e": round(sum(line["montant"] for line in receipts), 3),
-            "n": len(expenses), "m": round(sum(float(line["montant"] or 0) for line in expenses), 3), "u": name})
+        ), {"c": payload.compagnie, "j": jour, "q": sum(int(row["quittances"] or 0) for row in day_receipts),
+            "e": round(sum(float(row["primes"] or 0) for row in day_receipts), 3),
+            "n": len(day_expenses), "m": round(sum(float(row["montant"] or 0) for row in day_expenses), 3), "u": name})
         validation = _cash_validation(db, payload.compagnie, jour)
         db.commit()
     except SQLAlchemyError as exc:
