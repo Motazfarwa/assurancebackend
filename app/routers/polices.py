@@ -2,6 +2,7 @@
 import os
 import re
 from datetime import date, datetime, timedelta
+from typing import Any
 from secrets import randbelow
 
 from dotenv import load_dotenv
@@ -42,8 +43,22 @@ CARTE_VERTE_DDL = """
         num_quittance character varying(15) PRIMARY KEY,
         date_debut date,
         date_fin date
-    )
+    );
+    ALTER TABLE dbo."TQuittanceCarteVerte" ADD COLUMN IF NOT EXISTS periode_consommee character varying(50);
+    ALTER TABLE dbo."TQuittanceCarteVerte" ADD COLUMN IF NOT EXISTS solde_echeance character varying(50);
+    ALTER TABLE dbo."TQuittanceCarteVerte" ADD COLUMN IF NOT EXISTS observations character varying(200)
 """
+CARTE_VERTE_INSERT = (
+    'INSERT INTO dbo."TQuittanceCarteVerte" (num_quittance, date_debut, date_fin, periode_consommee, solde_echeance, observations) '
+    "VALUES (:n, :du, :au, :periode, :solde, :obs)"
+)
+
+
+def carte_verte_params(number: str, carte: Any) -> dict[str, Any]:
+    """The values of a carte verte for CARTE_VERTE_INSERT (empty texts stored as NULL)."""
+    clean = lambda value: (value or "").strip() or None  # noqa: E731
+    return {"n": number, "du": carte.du, "au": carte.au, "periode": clean(carte.periode_consommee),
+            "solde": clean(carte.solde_echeance), "obs": clean(carte.observations)}
 
 
 REVALORISATION_DDL = """
@@ -324,14 +339,9 @@ def create_police_with_quittance(
 
                 # Green card validity ("Carte verte"): from / to dates, kept with the receipt.
                 if payload.carte_verte and (payload.carte_verte.du or payload.carte_verte.au):
-                    conn.execute(text(CARTE_VERTE_DDL))
-                    conn.execute(
-                        text(
-                            'INSERT INTO dbo."TQuittanceCarteVerte" (num_quittance, date_debut, date_fin) '
-                            "VALUES (:num_quittance, :du, :au)"
-                        ),
-                        {"num_quittance": receipt_id, "du": payload.carte_verte.du, "au": payload.carte_verte.au},
-                    )
+                    for statement in CARTE_VERTE_DDL.split(";"):
+                        conn.execute(text(statement))
+                    conn.execute(text(CARTE_VERTE_INSERT), carte_verte_params(receipt_id, payload.carte_verte))
 
         return {
             "message": "Police et quittance créées",
@@ -724,6 +734,29 @@ FROM cand JOIN dbo."TBranche" b ON b.code_compagnie = cand.code_compagnie AND TR
 WHERE LENGTH(cand.code) = cand.n
 ORDER BY cand.code_compagnie, cand.code, cand.forme
 """
+
+
+# N° of a police flotte, as the legacy software numbers them: the flotte prefix (three identical digits, the GAT flotte
+# branches: 999 PNT, 666 PNC, 777 BFPME, 888 CTFCI, and 555), the year, then a 5-digit counter of the prefix and the year
+# (555202600045 -> 555202600046).
+FLOTTE_PREFIXES = ("555", "666", "777", "888", "999")
+
+
+@router.get("/numero-flotte")
+def next_fleet_number(prefixe: str = Query("555", pattern="^(555|666|777|888|999)$")):
+    """The next N° police flotte of the prefix for the current year (Tunis), and the branch the prefix names (if any)."""
+    with engine.connect() as conn:
+        year = conn.execute(text("SELECT EXTRACT(YEAR FROM (now() AT TIME ZONE 'Africa/Tunis'))::int")).scalar()
+        start = f"{prefixe}{year}"
+        last = conn.execute(
+            text(r"""SELECT MAX(CAST(SUBSTRING(TRIM(num_police) FROM 8) AS integer)) FROM dbo."TPolice"
+                     WHERE TRIM(num_police) ~ ('^' || :start || '\d{5}$')"""),
+            {"start": start},
+        ).scalar() or 0
+        branch = conn.execute(
+            text('SELECT TRIM(nom_branche) FROM dbo."TBranche" WHERE code_compagnie = 9 AND TRIM(code_branche) = :p LIMIT 1'), {"p": prefixe}
+        ).scalar()
+    return {"num_police": f"{start}{last + 1:05d}", "prefixe": prefixe, "annee": year, "dernier": last, "nom_branche": branch}
 
 
 @router.get("/numero-branche")

@@ -204,9 +204,10 @@ def _comptabiliser(db: Session, numero: int, user: str) -> date:
     date saisie as Date_Comptabiliser (kept in TEncaissementValide, like a validation in the journal),
     and so does each quittance it settles in full (an acompte leaves the quittance to declare, as in the journal).
     TEncaissementValide must exist (_ensure_validated, which commits: called before the settlement is written)."""
-    # Date_Comptabiliser = the date saisie of the settlement (TRegCli.date_reg_cli); the journal d'encaissement of its half
-    # month (the 15th or the last day of the month) shows it ticked.
-    day = db.execute(text('SELECT CAST(date_reg_cli AS date) FROM dbo."TRegCli" WHERE num_reg_cli = :r'), {"r": numero}).scalar()
+    # Date_Comptabiliser = the journal day of the settlement's date (TRegCli.date_reg_cli): the 15th until the 15th, then
+    # the last day of the month, the date the window shows; the journal d'encaissement and the feuille of that day count it.
+    from app.routers.sinistres import journal_day
+    day = journal_day(db.execute(text('SELECT CAST(date_reg_cli AS date) FROM dbo."TRegCli" WHERE num_reg_cli = :r'), {"r": numero}).scalar())
     params = {"r": numero, "d": day, "u": user[:50]}
     db.execute(text(
         """UPDATE dbo."RDetRegCli" SET "Comptabiliser" = 'O', "Date_Comptabiliser" = :d WHERE "Num_reg_cli" = :r"""

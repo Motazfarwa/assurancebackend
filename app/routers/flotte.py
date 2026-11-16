@@ -420,7 +420,7 @@ def _insert_vehicle(db: Session, contract: dict[str, Any], values: dict[str, Any
 
 def _vehicle_receipt(db: Session, contract: dict[str, Any], vehicle: dict[str, Any], payload: VehiculeIn, user: str) -> str:
     """The vehicle's own quittance, paid by its client; the contract's premiums are the sum of those of its vehicles."""
-    from app.routers.polices import CARTE_VERTE_DDL  # here: polices imports records_search, which imports this module
+    from app.routers.polices import CARTE_VERTE_DDL, CARTE_VERTE_INSERT, carte_verte_params  # here: polices imports records_search, which imports this module
 
     q = payload.quittance
     number = _next_number(db)
@@ -445,11 +445,9 @@ def _vehicle_receipt(db: Session, contract: dict[str, Any], vehicle: dict[str, A
         },
     )
     if payload.carte_verte and (payload.carte_verte.du or payload.carte_verte.au):
-        db.execute(text(CARTE_VERTE_DDL))
-        db.execute(
-            text('INSERT INTO dbo."TQuittanceCarteVerte" (num_quittance, date_debut, date_fin) VALUES (:n, :du, :au)'),
-            {"n": number, "du": payload.carte_verte.du, "au": payload.carte_verte.au},
-        )
+        for statement in CARTE_VERTE_DDL.split(";"):
+            db.execute(text(statement))
+        db.execute(text(CARTE_VERTE_INSERT), carte_verte_params(number, payload.carte_verte))
     db.execute(
         text(
             'UPDATE dbo."TPolice" SET prime_net = COALESCE(prime_net, 0) + :net, prime_total = COALESCE(prime_total, 0) + :total, '

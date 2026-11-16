@@ -7,7 +7,7 @@ of three digits within that month (202610003 = 3rd claim of October 2026).
 import json
 import re
 import unicodedata
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import anthropic
@@ -398,6 +398,17 @@ class ReglementIn(BaseModel):
     mod_dep: str = Field(default="C", pattern="^[CTVB]$")
     # Type de dépense (TDepense.Typ_dep): T technique.
     typ_dep: str = Field(default="T", pattern="^T$")
+    # Comptabilisé in the feuille de caisse (and the journal de dépense) of the journal day of its date (the 15th, or the
+    # last day of the month); otherwise it stays to comptabiliser (as a piece "à verser" not comptabilisée).
+    comptabiliser: bool = False
+
+
+def journal_day(day: date) -> date:
+    """The journal day of a date: the 15th until the 15th, then the last day of the month."""
+    if day.day <= 15:
+        return day.replace(day=15)
+    following = (day.replace(day=28) + timedelta(days=4)).replace(day=1)
+    return following - timedelta(days=1)
 
 
 def _settlement(payload: dict[str, Any]) -> ReglementIn | None:
@@ -449,16 +460,26 @@ def _store_settlement(db: Session, reglement: ReglementIn, numero: str, login: s
     db.execute(
         text(
             'INSERT INTO dbo."TDepense" (num_dep, "Typ_dep", date_dep, mont_dep, objet_dep, code_banque, num_cheq, date_cheq, code_client, '
-            'num_police, sinistre, num_quittance, mod_dep, code_type, "Comptabiliser", "Validation", "Montant_RS", "Create_User", "Create_Date") '
-            "VALUES (:num, :typ, :date, :montant, :objet, :compte, :piece, :date, :client, :police, :sinistre, '', :mode, :type, 'N', 'N', 0, :user, now())"
+            'num_police, sinistre, num_quittance, mod_dep, code_type, "Comptabiliser", "Date_Comptabiliser", "Validation", "Montant_RS", "Create_User", "Create_Date") '
+            "VALUES (:num, :typ, :date, :montant, :objet, :compte, :piece, :date, :client, :police, :sinistre, '', :mode, :type, :compta, :jour, 'N', 0, :user, now())"
         ),
         {
+            "compta": "O" if reglement.comptabiliser else "N", "jour": journal_day(reglement.date_reglement) if reglement.comptabiliser else None,
             "num": num_dep, "typ": reglement.typ_dep, "date": reglement.date_reglement, "montant": montant,
             "objet": (f"SIN{sinistre} : {nom}" if nom else f"SIN{sinistre}")[:50], "compte": compte, "piece": piece, "client": client[:8],
             "police": (police or None) and police[:15], "sinistre": sinistre, "mode": reglement.mod_dep,
             "type": CLAIM_EXPENSE_TYPES.get(int(claim["Code_Type_Branche"]), "T05"), "user": login,
         },
     )
+    if reglement.comptabiliser:
+        # counted in the feuille de caisse of that day, as a dépense comptabilisée by its validation
+        db.execute(text(
+            'CREATE TABLE IF NOT EXISTS dbo."TDepenseValide" (num_dep integer PRIMARY KEY, jour date NOT NULL, utilisateur varchar(50), date_saisie timestamp)'
+        ))
+        db.execute(text(
+            'INSERT INTO dbo."TDepenseValide" (num_dep, jour, utilisateur, date_saisie) '
+            "VALUES (:n, :j, :u, now() AT TIME ZONE 'Africa/Tunis') ON CONFLICT DO NOTHING"
+        ), {"n": num_dep, "j": journal_day(reglement.date_reglement), "u": login[:50]})
 
 
 @router.post("", status_code=201)

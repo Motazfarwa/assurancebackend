@@ -86,6 +86,10 @@ class CarteVerteCreate(BaseModel):
 
     du: Optional[date] = None
     au: Optional[date] = None
+    # the popup "Carte verte": the period used and what is left until the échéance (as typed, e.g. "45 jours"), remarks
+    periode_consommee: Optional[str] = Field(default=None, max_length=50)
+    solde_echeance: Optional[str] = Field(default=None, max_length=50)
+    observations: Optional[str] = Field(default=None, max_length=200)
 
 
 class RevalorisationCreate(BaseModel):
