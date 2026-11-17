@@ -264,6 +264,8 @@ def list_sinistres(
     code_expert: int | None = None,
     date_min: date | None = None,
     numero: str = Query(default="", max_length=20),
+    # the step the file has reached (its highest Sinistre_Suivi.Code_Etape), "aucune": a file without any step
+    code_etape: str = Query(default="", pattern=r"^(|aucune|\d{1,6})$"),
     limit: int = Query(default=100, ge=1, le=2000),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
@@ -322,7 +324,16 @@ def list_sinistres(
     if date_max is not None:
         conditions.append('"Date_Sinistre" < :date_after')
         params["date_after"] = date.fromordinal(date_max.toordinal() + 1)  # the whole day, whatever the time
-    # The counts follow the search, the date, the company, the type, the expert and the period, not the status filters.
+    if code_etape:
+        # one grouped read of the suivi (hashed), not a lookup per file
+        if code_etape == "aucune":
+            conditions.append('TRIM("Num_Sinistre_Agence") NOT IN (SELECT TRIM(s."Num_Sinistre_Agence") FROM dbo."Sinistre_Suivi" s '
+                              'WHERE s."Code_Etape" IS NOT NULL AND s."Num_Sinistre_Agence" IS NOT NULL)')
+        else:
+            conditions.append('TRIM("Num_Sinistre_Agence") IN (SELECT TRIM(s."Num_Sinistre_Agence") FROM dbo."Sinistre_Suivi" s '
+                              'WHERE s."Num_Sinistre_Agence" IS NOT NULL GROUP BY 1 HAVING MAX(s."Code_Etape") = :etape)')
+            params["etape"] = int(code_etape)
+    # The counts follow the search, the date, the company, the type, the expert, the step and the period, not the status filters.
     counted = " AND ".join(conditions)
     # A file whose "Regle" / "Cloture" is empty (26 files saved in 2023) is not settled / not closed either.
     if non_regle:
