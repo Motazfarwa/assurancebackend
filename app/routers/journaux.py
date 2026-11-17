@@ -520,6 +520,9 @@ WITH d AS MATERIALIZED (
     LEFT JOIN dbo.ttype_dep t ON TRIM(t.code_type) = TRIM(d.code_type)
     -- Every dépense of type T (Typ_dep); S/R (the Nat_quit of its type) only when chosen.
     WHERE TRIM(d."Typ_dep") = 'T'
+      -- as the legacy (joined to its client): a dépense saved without a code client is not listed (orphan legacy lines,
+      -- e.g. 10611, the duplicate of 10614 on the same chèque, and 9037)
+      AND COALESCE(TRIM(d.code_client), '') <> ''
       AND (CAST(:nature AS text) IS NULL OR TRIM(COALESCE(to_jsonb(t)->>'Nat_quit', to_jsonb(t)->>'nat_quit')) = CAST(:nature AS text))
       AND (
         -- To comptabiliser: Comptabiliser 'N' and no Date_Comptabiliser.
@@ -1410,6 +1413,9 @@ WITH d AS MATERIALIZED (
     SELECT d.*, TRIM(t.libelle) AS libelle, TRIM(COALESCE(to_jsonb(t)->>'Nat_quit', to_jsonb(t)->>'nat_quit')) AS nature
     FROM dbo."TDepense" d JOIN dbo.ttype_dep t ON TRIM(t.code_type) = TRIM(d.code_type)
     WHERE TRIM(d."Typ_dep") = 'T'
+      -- as the legacy (joined to its client): a dépense saved without a code client is not listed (orphan legacy lines,
+      -- e.g. 10611, the duplicate of 10614 on the same chèque, and 9037)
+      AND COALESCE(TRIM(d.code_client), '') <> ''
       -- the month asked for, or (non_comptabilisees) every dépense not comptabilisée yet, whatever its date
       AND (CAST(:debut AS date) IS NULL OR (d.date_dep >= :debut AND d.date_dep < :fin))
       AND (NOT :pending OR COALESCE(d."Comptabiliser", 'N') <> 'O')
@@ -1420,11 +1426,7 @@ pol AS (
     ORDER BY TRIM(num_police), effet DESC NULLS LAST
 )
 SELECT d.num_dep, d.date_dep::date AS date_dep, TRIM(d.num_police) AS num_police, TRIM(d.code_client) AS code_client,
-       -- the client of the dépense; when it has none (legacy lines saved without a client), the name its objet carries
-       -- ("SIN20260123683B : BACCOUCHE AHMED")
-       COALESCE((SELECT TRIM(c.nom_client) FROM dbo."TClient" c WHERE TRIM(c.code_client) = TRIM(d.code_client) AND TRIM(d.code_client) <> '' LIMIT 1),
-                NULLIF(TRIM(SUBSTRING(d.objet_dep FROM POSITION(':' IN d.objet_dep) + 1)), '')) AS assure,
-       TRIM(d.code_client) = '' OR d.code_client IS NULL AS sans_client,
+       (SELECT TRIM(c.nom_client) FROM dbo."TClient" c WHERE TRIM(c.code_client) = TRIM(d.code_client) LIMIT 1) AS assure,
        p.code_compagnie, (SELECT TRIM(k.nom_compagnie) FROM dbo."TCompagnie" k WHERE k.code_compagnie = p.code_compagnie) AS nom_compagnie,
        d.libelle, d.nature, ROUND(COALESCE(d.mont_dep, 0)::numeric, 3) AS montant, TRIM(d.num_cheq) AS num_cheq,
        TRIM(d.code_banque) AS banque, NULLIF(TRIM(d.sinistre), '') AS sinistre,
@@ -1651,6 +1653,9 @@ kept AS MATERIALIZED (
     JOIN pol p ON p.num_police = TRIM(d.num_police)
     JOIN dbo."TCompagnie" k ON k.code_compagnie = p.code_compagnie
     WHERE TRIM(d."Typ_dep") = 'T'
+      -- as the legacy (joined to its client): a dépense saved without a code client is not listed (orphan legacy lines,
+      -- e.g. 10611, the duplicate of 10614 on the same chèque, and 9037)
+      AND COALESCE(TRIM(d.code_client), '') <> ''
       AND (CAST(:nature AS text) IS NULL OR TRIM(COALESCE(to_jsonb(t)->>'Nat_quit', to_jsonb(t)->>'nat_quit')) = CAST(:nature AS text))
       AND (CAST(:compagnie AS integer) IS NULL OR p.code_compagnie = CAST(:compagnie AS integer))
       AND UPPER(TRIM(k.nom_compagnie)) <> ALL(:excluded)
