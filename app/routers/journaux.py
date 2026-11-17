@@ -1409,7 +1409,10 @@ TECH_EXPENSES_SQL = """
 WITH d AS MATERIALIZED (
     SELECT d.*, TRIM(t.libelle) AS libelle, TRIM(COALESCE(to_jsonb(t)->>'Nat_quit', to_jsonb(t)->>'nat_quit')) AS nature
     FROM dbo."TDepense" d JOIN dbo.ttype_dep t ON TRIM(t.code_type) = TRIM(d.code_type)
-    WHERE TRIM(d."Typ_dep") = 'T' AND d.date_dep >= :debut AND d.date_dep < :fin
+    WHERE TRIM(d."Typ_dep") = 'T'
+      -- the month asked for, or (non_comptabilisees) every dépense not comptabilisée yet, whatever its date
+      AND (CAST(:debut AS date) IS NULL OR (d.date_dep >= :debut AND d.date_dep < :fin))
+      AND (NOT :pending OR COALESCE(d."Comptabiliser", 'N') <> 'O')
 ),
 pol AS (
     SELECT DISTINCT ON (TRIM(num_police)) TRIM(num_police) AS num_police, code_compagnie
@@ -1417,30 +1420,48 @@ pol AS (
     ORDER BY TRIM(num_police), effet DESC NULLS LAST
 )
 SELECT d.num_dep, d.date_dep::date AS date_dep, TRIM(d.num_police) AS num_police, TRIM(d.code_client) AS code_client,
-       (SELECT TRIM(c.nom_client) FROM dbo."TClient" c WHERE TRIM(c.code_client) = TRIM(d.code_client) LIMIT 1) AS assure,
+       -- the client of the dépense; when it has none (legacy lines saved without a client), the name its objet carries
+       -- ("SIN20260123683B : BACCOUCHE AHMED")
+       COALESCE((SELECT TRIM(c.nom_client) FROM dbo."TClient" c WHERE TRIM(c.code_client) = TRIM(d.code_client) AND TRIM(d.code_client) <> '' LIMIT 1),
+                NULLIF(TRIM(SUBSTRING(d.objet_dep FROM POSITION(':' IN d.objet_dep) + 1)), '')) AS assure,
+       TRIM(d.code_client) = '' OR d.code_client IS NULL AS sans_client,
+       p.code_compagnie, (SELECT TRIM(k.nom_compagnie) FROM dbo."TCompagnie" k WHERE k.code_compagnie = p.code_compagnie) AS nom_compagnie,
        d.libelle, d.nature, ROUND(COALESCE(d.mont_dep, 0)::numeric, 3) AS montant, TRIM(d.num_cheq) AS num_cheq,
        TRIM(d.code_banque) AS banque, NULLIF(TRIM(d.sinistre), '') AS sinistre,
        COALESCE(d."Comptabiliser", 'N') = 'O' AS comptabilise, d."Date_Comptabiliser"::date AS date_feuille
 FROM d JOIN pol p ON p.num_police = TRIM(d.num_police)
-WHERE p.code_compagnie = :compagnie
-ORDER BY d.date_dep, d.num_dep
+WHERE p.code_compagnie = ANY(CAST(:compagnies AS int[]))
+ORDER BY nom_compagnie, d.date_dep, d.num_dep
 """
 
 
 @router.get("/depenses-techniques")
 def technical_expenses(
-    compagnie: int = Query(...),
-    mois: str = Query(..., pattern=r"^\d{4}-\d{2}$", description="AAAA-MM"),
+    compagnie: int | None = Query(default=None),
+    # several companies at once: "9,2,4" (the companies ticked)
+    compagnies: str = Query(default="", pattern=r"^(\d+(,\d+)*)?$"),
+    mois: str = Query(default="", pattern=r"^(|\d{4}-\d{2})$", description="AAAA-MM"),
+    # every dépense not comptabilisée yet, whatever its date (then no month)
+    non_comptabilisees: bool = False,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    year, month = (int(part) for part in mois.split("-"))
-    if not 1 <= month <= 12:
-        raise HTTPException(status_code=422, detail="Mois invalide.")
-    debut = date(year, month, 1)
-    fin = date(year + month // 12, month % 12 + 1, 1)
+    codes = [int(code) for code in compagnies.split(",") if code] or ([compagnie] if compagnie is not None else [])
+    if not codes:
+        raise HTTPException(status_code=422, detail="Choisissez au moins une compagnie.")
+    debut = fin = None
+    if not non_comptabilisees:
+        if not mois:
+            raise HTTPException(status_code=422, detail="Choisissez le mois.")
+        year, month = (int(part) for part in mois.split("-"))
+        if not 1 <= month <= 12:
+            raise HTTPException(status_code=422, detail="Mois invalide.")
+        debut = date(year, month, 1)
+        fin = date(year + month // 12, month % 12 + 1, 1)
     try:
         db.execute(text("SET LOCAL enable_nestloop = off"))  # same planner issue as the feuille de caisse
-        items = [_plain(row) for row in db.execute(text(TECH_EXPENSES_SQL), {"compagnie": compagnie, "debut": debut, "fin": fin}).mappings().all()]
+        items = [_plain(row) for row in db.execute(text(TECH_EXPENSES_SQL), {
+            "compagnies": codes, "debut": debut, "fin": fin, "pending": non_comptabilisees,
+        }).mappings().all()]
     except SQLAlchemyError as exc:
         raise _fail(exc) from exc
     finally:
