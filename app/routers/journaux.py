@@ -960,7 +960,7 @@ LEFT JOIN dbo."TQuittance" q ON TRIM(q.num_quittance) = TRIM(d."Num_quitance")
 LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(r.code_client)
 LEFT JOIN LATERAL (SELECT TRIM(k.nom_compagnie) AS nom FROM dbo."TPolice" po JOIN dbo."TCompagnie" k ON k.code_compagnie = po.code_compagnie
                    WHERE TRIM(po.num_int) = TRIM(q.num_int) LIMIT 1) kq ON TRUE
-LEFT JOIN LATERAL (SELECT TRIM(k.nom_compagnie) AS nom FROM dbo."TBanque" b JOIN dbo."TCompagnie" k ON k.code_compagnie = b.code_compagnie
+LEFT JOIN LATERAL (SELECT TRIM(k.nom_compagnie) AS nom FROM dbo."TBanque" b JOIN dbo."TCompagnie" k ON k.code_compagnie = b."Code_Compagnie"
                    WHERE TRIM(b.code_banque) = TRIM(r.code_banque) LIMIT 1) kb ON TRUE
 LEFT JOIN LATERAL (SELECT datep FROM dbo."TPiece" p WHERE TRIM(p.nump) = TRIM(r.num_piece) ORDER BY (TRIM(p.code_client) = TRIM(r.code_client)) DESC LIMIT 1) p ON TRUE
 WHERE r.date_reg_cli >= :debut AND r.date_reg_cli < :fin AND COALESCE(TRIM(r.type_reg_cli), '') <> 'R'

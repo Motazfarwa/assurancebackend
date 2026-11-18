@@ -49,12 +49,14 @@ _quittance_column_ready = False
 
 
 def _ensure_quittance_column(db: Session) -> None:
-    """Adds "Montant_Quittance" (amount of the claim's quittance) when the legacy table does not have it yet."""
+    """Adds the columns the legacy table lacks: "Montant_Quittance" (amount of the claim's quittance) and nom_client
+    (the client's name held on the claim, migration 007), so a database freshly converted from the .BAK works as is."""
     global _quittance_column_ready
     if _quittance_column_ready:
         return
     try:
         db.execute(text('ALTER TABLE dbo."Sinistre" ADD COLUMN IF NOT EXISTS "Montant_Quittance" double precision DEFAULT 0'))
+        db.execute(text('ALTER TABLE dbo."Sinistre" ADD COLUMN IF NOT EXISTS nom_client character varying(255)'))
         db.commit()
     except SQLAlchemyError:
         db.rollback()
@@ -277,6 +279,7 @@ def list_sinistres(
     company (Code_Compagnie_Advers1), `type_sinistre` the claims of that type, `code_expert` the claims of that expert
     (Code_Expert1, a TPrestataire), `date_min` the claims that happened on or after that day. `counts` gives, for the same
     search, date, company, type, expert and period, how many files are not settled and not closed."""
+    _ensure_quittance_column(db)
     conditions = ["TRUE"]
     params: dict[str, Any] = {"limit": limit, "offset": offset}
     if numero.strip():  # the "N° sinistre" dropdown: the claim numbers starting with what is typed
