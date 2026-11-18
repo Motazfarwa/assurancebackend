@@ -35,6 +35,8 @@ TYPE_NAMES = {"T": "Traite", "C": "Chèque", "V": "Virement", "E": "Espèce", "B
 class AllocationIn(BaseModel):
     num_quittance: str = Field(min_length=1, max_length=15)
     montant: float = Field(ge=0)
+    # Moins perçu: the rest of the quittance after this amount is written off (a règlement of type 'R', as the legacy)
+    moins_percu: bool = False
 
 
 class ChequeIn(BaseModel):
@@ -182,6 +184,39 @@ def _store_reglement(db: Session, payload: ChequeIn, user: str, allocations: lis
         db.execute(
             text('UPDATE dbo."TQuittance" SET solde_quittance = :left, "Date_Reglement" = CURRENT_DATE WHERE TRIM(num_quittance) = :quittance'),
             {"left": left, "quittance": item.num_quittance.strip()},
+        )
+    # Moins perçu: the rest of a quittance the agency writes off, as the legacy software does — its own client settlement of
+    # type 'R' (no pièce, Fectif 'N', same day and account), one line closing the quittance (Acompte_Solde 'S', solde 0);
+    # listed in "Etat des moins perçus" and the opérations journalières.
+    for item in allocations:
+        if not item.moins_percu:
+            continue
+        rest = db.execute(
+            text('SELECT COALESCE(solde_quittance, 0) FROM dbo."TQuittance" WHERE TRIM(num_quittance) = :q FOR UPDATE'), {"q": item.num_quittance.strip()}
+        ).scalar() or 0
+        rest = round(float(rest), 3)
+        if rest <= TOLERANCE:
+            continue
+        written_off = db.execute(text('SELECT COALESCE(MAX(num_reg_cli), 0) + 1 FROM dbo."TRegCli"')).scalar()
+        db.execute(
+            text(
+                'INSERT INTO dbo."TRegCli" (num_reg_cli, date_reg_cli, code_client, type_reg_cli, num_piece, mont_reg_cli, code_banque, "Fectif", "Create_User", "Create_Date") '
+                "VALUES (:numero, CURRENT_DATE, :client, 'R', '', :rest, :compte, 'N', :user, now())"
+            ),
+            {**values, "numero": written_off, "rest": rest},
+        )
+        recu += 1
+        db.execute(
+            text(
+                'INSERT INTO dbo."RDetRegCli" ("Num_Recu", "Num_reg_cli", "Num_quitance", "Ncpt", "Montant", "Validation", "Comptabiliser", '
+                '"Acompte_Solde", "Solde_Quittance", create_user, create_date) '
+                "VALUES (:recu, :numero, :quittance, :client, :rest, 'N', 'N', 'S', 0, :user, now())"
+            ),
+            {**values, "recu": recu, "numero": written_off, "quittance": item.num_quittance.strip(), "rest": rest},
+        )
+        db.execute(
+            text('UPDATE dbo."TQuittance" SET solde_quittance = 0, "Date_Reglement" = CURRENT_DATE WHERE TRIM(num_quittance) = :quittance'),
+            {"quittance": item.num_quittance.strip()},
         )
     # Trop perçu: what the piece pays over the quittances is kept for the client, as the legacy software does — a line on
     # the placeholder quittance 9999999999 (Num_Recu 0), listed in "Etat des trop perçus" and the opérations journalières.

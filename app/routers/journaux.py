@@ -963,7 +963,8 @@ LEFT JOIN LATERAL (SELECT TRIM(k.nom_compagnie) AS nom FROM dbo."TPolice" po JOI
 LEFT JOIN LATERAL (SELECT TRIM(k.nom_compagnie) AS nom FROM dbo."TBanque" b JOIN dbo."TCompagnie" k ON k.code_compagnie = b."Code_Compagnie"
                    WHERE TRIM(b.code_banque) = TRIM(r.code_banque) LIMIT 1) kb ON TRUE
 LEFT JOIN LATERAL (SELECT datep FROM dbo."TPiece" p WHERE TRIM(p.nump) = TRIM(r.num_piece) ORDER BY (TRIM(p.code_client) = TRIM(r.code_client)) DESC LIMIT 1) p ON TRUE
-WHERE r.date_reg_cli >= :debut AND r.date_reg_cli < :fin AND COALESCE(TRIM(r.type_reg_cli), '') <> 'R'
+-- the moins perçus (règlements of type 'R', no pièce) included, as the legacy état: they are in its total recette
+WHERE r.date_reg_cli >= :debut AND r.date_reg_cli < :fin
 UNION ALL
 SELECT 'D', d.date_dep::date, d.num_dep, 0, TRIM(d.code_client), TRIM(c.nom_client), TRIM(d.num_police), NULL, NULL,
        NULL, d.mont_dep, NULL, TRIM(d.num_cheq), d.date_cheq::date, TRIM(d.code_banque),
