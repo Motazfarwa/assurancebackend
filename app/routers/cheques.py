@@ -22,7 +22,7 @@ from app.auth import require_current_user
 from app.config import settings
 from app.database import get_db
 from app.routers.assistant import FicheRequest, _gemini_generate, _ocr_space
-from app.routers.journaux import _ensure_validated
+from app.routers.journaux import OVERPAID_RECEIPT, _ensure_validated
 
 
 router = APIRouter(prefix="/api/cheques", tags=["Chèques"], dependencies=[Depends(require_current_user)])
@@ -182,6 +182,17 @@ def _store_reglement(db: Session, payload: ChequeIn, user: str, allocations: lis
         db.execute(
             text('UPDATE dbo."TQuittance" SET solde_quittance = :left, "Date_Reglement" = CURRENT_DATE WHERE TRIM(num_quittance) = :quittance'),
             {"left": left, "quittance": item.num_quittance.strip()},
+        )
+    # Trop perçu: what the piece pays over the quittances is kept for the client, as the legacy software does — a line on
+    # the placeholder quittance 9999999999 (Num_Recu 0), listed in "Etat des trop perçus" and the opérations journalières.
+    surplus = round(payload.montant - sum(item.montant for item in allocations), 3)
+    if surplus > TOLERANCE:
+        db.execute(
+            text(
+                'INSERT INTO dbo."RDetRegCli" ("Num_Recu", "Num_reg_cli", "Num_quitance", "Ncpt", "Montant", create_user, create_date) '
+                "VALUES (0, :numero, :overpaid, :client, :surplus, :user, now())"
+            ),
+            {**values, "overpaid": OVERPAID_RECEIPT, "surplus": surplus},
         )
     return numero
 

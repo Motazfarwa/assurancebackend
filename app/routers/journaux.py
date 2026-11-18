@@ -950,11 +950,18 @@ SELECT 'R' AS ope, r.date_reg_cli::date AS date_op, r.num_reg_cli AS numero, d."
        q.montant_quittance AS prime, d."Montant" AS reglement,
        CASE WHEN ROW_NUMBER() OVER (PARTITION BY r.num_reg_cli ORDER BY d."Num_Recu") = 1 THEN r.mont_reg_cli END AS total,
        TRIM(r.num_piece) AS num_cheq, p.datep::date AS date_cheq, TRIM(r.code_banque) AS compte,
-       NULL AS sin_rist, NULL AS beneficiaire
+       NULL AS sin_rist,
+       -- a prime paid into the account of another company, as the legacy: "LLOYD VERSÉ GAT" (company of the quittance,
+       -- then the company of the account)
+       CASE WHEN kq.nom IS NOT NULL AND kb.nom IS NOT NULL AND kq.nom <> kb.nom THEN kq.nom || ' VERSÉ ' || kb.nom END AS beneficiaire
 FROM dbo."TRegCli" r
 JOIN dbo."RDetRegCli" d ON d."Num_reg_cli" = r.num_reg_cli
 LEFT JOIN dbo."TQuittance" q ON TRIM(q.num_quittance) = TRIM(d."Num_quitance")
 LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(r.code_client)
+LEFT JOIN LATERAL (SELECT TRIM(k.nom_compagnie) AS nom FROM dbo."TPolice" po JOIN dbo."TCompagnie" k ON k.code_compagnie = po.code_compagnie
+                   WHERE TRIM(po.num_int) = TRIM(q.num_int) LIMIT 1) kq ON TRUE
+LEFT JOIN LATERAL (SELECT TRIM(k.nom_compagnie) AS nom FROM dbo."TBanque" b JOIN dbo."TCompagnie" k ON k.code_compagnie = b.code_compagnie
+                   WHERE TRIM(b.code_banque) = TRIM(r.code_banque) LIMIT 1) kb ON TRUE
 LEFT JOIN LATERAL (SELECT datep FROM dbo."TPiece" p WHERE TRIM(p.nump) = TRIM(r.num_piece) ORDER BY (TRIM(p.code_client) = TRIM(r.code_client)) DESC LIMIT 1) p ON TRUE
 WHERE r.date_reg_cli >= :debut AND r.date_reg_cli < :fin AND COALESCE(TRIM(r.type_reg_cli), '') <> 'R'
 UNION ALL
@@ -1018,7 +1025,11 @@ q AS MATERIALIZED (
     FROM dbo."TQuittance" q
     WHERE COALESCE(q.annule, 'N') <> 'O'
       AND q."Date_Retour" IS NULL  -- a quittance returned to the company is no longer the client's
-      AND (CAST(:debut AS date) IS NULL OR (q.echeance >= CAST(:debut AS date) AND q.echeance < CAST(:fin AS date)))
+      -- as the legacy ImpComptesClient: a prime by its échéance, a ristourne by its date d'émission (a ristourne issued
+      -- in 2025 that falls due in 2026 is not one of 2026: total 74 609,459 for 2026, as the legacy)
+      AND (CAST(:debut AS date) IS NULL OR (
+            CASE WHEN TRIM(COALESCE(q.type_quittance, '')) = 'R' THEN COALESCE(q.date_emission, q.echeance) ELSE q.echeance END >= CAST(:debut AS date)
+        AND CASE WHEN TRIM(COALESCE(q.type_quittance, '')) = 'R' THEN COALESCE(q.date_emission, q.echeance) ELSE q.echeance END < CAST(:fin AS date)))
       AND (CAST(:client AS text) IS NULL OR TRIM(q.code_client) = CAST(:client AS text))
       AND (CAST(:compagnie AS int) IS NULL AND CAST(:police AS text) IS NULL OR TRIM(q.num_int) IN (SELECT num_int FROM pol))
       AND CASE CAST(:etat AS text)
@@ -1057,7 +1068,9 @@ SELECT COALESCE(quit.code_client, sin.code_client) AS code_client,
        ROUND(COALESCE(sin.sinistre, 0)::numeric, 3) AS sinistre, ROUND(COALESCE(quit.reglement, 0)::numeric, 3) AS reglement,
        ROUND(COALESCE(quit.reste, 0)::numeric, 3) AS reste, ROUND(COALESCE(quit.commission, 0)::numeric, 3) AS commission
 FROM quit FULL JOIN sin ON sin.code_client = quit.code_client
-ORDER BY COALESCE(quit.prime, 0) DESC, 1
+-- as the legacy ImpComptesClient: by commission, the largest first (the ristournes, negative, last), then by code client
+ORDER BY ROUND(COALESCE(quit.commission, 0)::numeric, 3) DESC,
+         CASE WHEN COALESCE(quit.code_client, sin.code_client) ~ '^[0-9]+$' THEN CAST(COALESCE(quit.code_client, sin.code_client) AS bigint) END NULLS LAST, 1
 """
 ACCOUNT_TOTALS = ("prime", "ristourne", "sinistre", "reglement", "reste", "commission")
 
@@ -1081,7 +1094,11 @@ q AS MATERIALIZED (
     FROM dbo."TQuittance" q
     WHERE COALESCE(q.annule, 'N') <> 'O'
       AND q."Date_Retour" IS NULL
-      AND (CAST(:debut AS date) IS NULL OR (q.echeance >= CAST(:debut AS date) AND q.echeance < CAST(:fin AS date)))
+      -- as the legacy ImpComptesClient: a prime by its échéance, a ristourne by its date d'émission (a ristourne issued
+      -- in 2025 that falls due in 2026 is not one of 2026: total 74 609,459 for 2026, as the legacy)
+      AND (CAST(:debut AS date) IS NULL OR (
+            CASE WHEN TRIM(COALESCE(q.type_quittance, '')) = 'R' THEN COALESCE(q.date_emission, q.echeance) ELSE q.echeance END >= CAST(:debut AS date)
+        AND CASE WHEN TRIM(COALESCE(q.type_quittance, '')) = 'R' THEN COALESCE(q.date_emission, q.echeance) ELSE q.echeance END < CAST(:fin AS date)))
       AND (CAST(:client AS text) IS NULL OR TRIM(q.code_client) = CAST(:client AS text))
       AND (CAST(:compagnie AS int) IS NULL AND CAST(:police AS text) IS NULL OR TRIM(q.num_int) IN (SELECT num_int FROM pol))
       AND (TRIM(COALESCE(q.type_quittance, '')) = 'R') = (CAST(:etat AS text) = 'ristourne')
@@ -1183,8 +1200,8 @@ def recette_technique(debut: date, fin: date, code_compagnie: int | None = None,
 # Retour des quittances
 # ---------------------------------------------------------------------------------------------
 # The quittances of a type (T/C) and period, of one company or all; ticking « Retour » gives them back to the company:
-# TQuittance "Date_Retour" is set (as the legacy software did), unticking clears it. With `retournees`, the quittances
-# returned during the period's month (by their return date, whatever their own period).
+# TQuittance "Date_Retour" is set (as the legacy software did), unticking clears it. With `retournees`, as the legacy:
+# the quittances of the period that are returned, whatever the day they were returned (11/2026 returned on 31/10/2026).
 RETURNS_SQL = """
 SELECT TRIM(q.num_int) AS num_police, TRIM(q.code_client) AS code_client, TRIM(c.nom_client) AS nom_client, q.echeance::date AS echeance,
        TRIM(q.num_quittance) AS num_quittance, q.prime_net, q.commission, q.prime_total, q.solde_quittance, q."Date_Retour" AS date_retour,
@@ -1196,7 +1213,7 @@ LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(q.code_client)
 WHERE q.tc = :tc AND TRIM(COALESCE(q.type_quittance, '')) <> 'R'
   AND (CAST(:compagnie AS integer) IS NULL OR p.code_compagnie = CAST(:compagnie AS integer))
   AND UPPER(TRIM(k.nom_compagnie)) <> ALL(:excluded)
-  AND CASE WHEN :retournees THEN q."Date_Retour" >= :debut AND q."Date_Retour" < :fin ELSE TRIM(q."Periode") = :periode END
+  AND TRIM(q."Periode") = :periode AND (NOT :retournees OR q."Date_Retour" IS NOT NULL)
 ORDER BY CASE WHEN :retournees THEN q."Date_Retour" END, q.echeance, TRIM(q.num_quittance)
 """
 # Companies the agency does not return quittances to (as in Réception comptant, Gestion des quittances, Etat du terme).
