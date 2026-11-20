@@ -618,6 +618,77 @@ def set_quittance_period(payload: QuittancePeriodIn, user: dict[str, Any] = Depe
     return {"num_quittance": payload.num_quittance.strip(), "periode": payload.periode}
 
 
+class QuittanceLineIn(BaseModel):
+    num_quittance: str = Field(min_length=1, max_length=15)  # the number it has now
+    num_int: str = Field(min_length=1, max_length=20)
+    nouveau_numero: str | None = Field(default=None, min_length=1, max_length=15)
+    prime_total: float | None = Field(default=None, ge=0)
+
+
+# Tables naming a quittance once it is paid, en instance or spent on: its number can no longer change.
+QUITTANCE_USES = (
+    ("RDetRegCli", "Num_quitance", "un règlement"), ("RPiece", "Num_Quittance", "une pièce"),
+    ("TDepense", "num_quittance", "une dépense"), ("TEncaissementValide", "Num_quitance", "un journal validé"),
+)
+
+
+@router.put("/quittances/ligne")
+def update_quittance_line(payload: QuittanceLineIn, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Réception comptant: corrects the number or the Prime Total of a comptant quittance of dbo."TQuittance".
+    A new Prime Total is also its montant, and moves its solde by the same difference (what was paid stays paid).
+    The number changes only while nothing names the quittance (règlement, pièce, dépense) and no other quittance has it."""
+    old = payload.num_quittance.strip()
+    params = {"q": old, "n": payload.num_int.strip(), "u": str(user.get("sub", ""))[:20]}
+    numero = old
+    try:
+        quittance = db.execute(
+            text('SELECT COALESCE(montant_quittance, prime_total, 0) AS montant, COALESCE(solde_quittance, 0) AS solde '
+                 'FROM dbo."TQuittance" WHERE TRIM(num_quittance) = :q AND TRIM(num_int) = :n AND tc = \'C\' FOR UPDATE'),
+            params,
+        ).mappings().first()
+        if quittance is None:
+            raise HTTPException(status_code=404, detail=f"Quittance comptant N° {old} introuvable : rechargez la liste.")
+        if payload.prime_total is not None:
+            prime = round(payload.prime_total, 3)
+            solde = round(float(quittance["solde"]) + prime - float(quittance["montant"]), 3)
+            if solde < -0.0005:
+                paid = float(quittance["montant"]) - float(quittance["solde"])
+                raise HTTPException(status_code=422, detail=f"Prime trop basse : la quittance N° {old} est déjà réglée de {paid:.3f}.")
+            db.execute(
+                text('UPDATE dbo."TQuittance" SET prime_total = :p, montant_quittance = :p, solde_quittance = :s, "Update_User" = :u, "Update_Date" = now() '
+                     'WHERE TRIM(num_quittance) = :q AND TRIM(num_int) = :n AND tc = \'C\''),
+                {**params, "p": prime, "s": max(solde, 0.0)},
+            )
+        new = (payload.nouveau_numero or "").strip()
+        if new and new != old:
+            if db.execute(text('SELECT 1 FROM dbo."TQuittance" WHERE TRIM(num_quittance) = :x LIMIT 1'), {"x": new}).first():
+                raise HTTPException(status_code=409, detail=f"Le N° de quittance {new} existe déjà.")
+            for table, column, label in QUITTANCE_USES:
+                if db.execute(text(f'SELECT 1 FROM dbo."{table}" WHERE TRIM("{column}") = :q LIMIT 1'), params).first():
+                    raise HTTPException(status_code=409, detail=f"La quittance N° {old} est déjà utilisée par {label} : son numéro ne peut plus changer.")
+            db.execute(
+                text('UPDATE dbo."TQuittance" SET num_quittance = :x, "Update_User" = :u, "Update_Date" = now() '
+                     'WHERE TRIM(num_quittance) = :q AND TRIM(num_int) = :n AND tc = \'C\''),
+                {**params, "x": new},
+            )
+            # its carte verte dates (table of this application, when present) follow the number
+            if db.execute(text("SELECT to_regclass('dbo.\"TQuittanceCarteVerte\"')")).scalar():
+                db.execute(text('UPDATE dbo."TQuittanceCarteVerte" SET num_quittance = :x WHERE TRIM(num_quittance) = :q'), {**params, "x": new})
+            numero = new
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(status_code=503, detail=f"Modification impossible : {str(getattr(exc, 'orig', exc))[:200]}") from exc
+    row = db.execute(
+        text('SELECT TRIM(num_quittance) AS num_quittance, prime_total, solde_quittance FROM dbo."TQuittance" WHERE TRIM(num_quittance) = :x AND TRIM(num_int) = :n'),
+        {"x": numero, "n": params["n"]},
+    ).mappings().first()
+    return _plain(row)
+
+
 @router.get("/{bordereau_id}")
 def get_bordereau(bordereau_id: int, db: Session = Depends(get_db)) -> dict[str, Any]:
     _ensure_tables(db)
