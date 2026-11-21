@@ -9,7 +9,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -20,8 +20,12 @@ from app.database import get_db
 # A normal module (400): every user given it in "Access users" may use it.
 router = APIRouter(prefix="/api/frais-generaux", tags=["Frais généraux"], dependencies=[Depends(require_current_user)])
 
-# Only the W.J frais are entered now; the M.J ones (Typ_dep 'F') stay in TDepense as history.
-NATURES = {"D": "Frais Généraux (W.J)"}
+# Only the W.J frais are entered now; the M.J ones (Typ_dep 'F') stay in TDepense as history. As in the legacy software,
+# the frais accounts also get the recettes ('E', the commissions of the companies' feuilles de caisse transferred to
+# them: "COM FC GAT DU 15/10/2026", types E01..E10) and the sorties diverses ('S'): the état détaillé of the account
+# lists them all (crédit 'E', débit 'D' and 'S').
+NATURES = {"D": "Frais Généraux (W.J)", "E": "Recettes diverses", "S": "Sorties diverses"}
+NATURE_CODES = "".join(NATURES)
 MODES = {"C": "Chèque", "V": "Virement", "E": "Espèces", "T": "Traite"}
 
 
@@ -41,7 +45,7 @@ def _fail(exc: SQLAlchemyError) -> HTTPException:
 
 
 class FraisCreate(BaseModel):
-    nature: str = Field(pattern="^D$")
+    nature: str = Field(pattern=f"^[{NATURE_CODES}]$")
     code_type: str = Field(min_length=1, max_length=10)
     mode: str = Field(pattern="^[CVET]$")
     date_dep: date
@@ -59,17 +63,17 @@ def options(db: Session = Depends(get_db)) -> dict[str, Any]:
     try:
         types = db.execute(text(
             'SELECT TRIM(code_type) AS code_type, TRIM(libelle) AS libelle, TRIM(typ_dep) AS nature FROM dbo.ttype_dep '
-            "WHERE TRIM(typ_dep) = 'D' ORDER BY code_type"
-        )).mappings().all()
+            "WHERE TRIM(typ_dep) IN :natures ORDER BY code_type"
+        ).bindparams(bindparam("natures", expanding=True)), {"natures": list(NATURES)}).mappings().all()
         banks = db.execute(text(
             'SELECT TRIM(code_banque) AS code_banque, TRIM(nom_banque) AS nom_banque FROM dbo."TBanque" '
             "WHERE TRIM(\"Type_Dep\") = 'D' AND COALESCE(\"Archive\", FALSE) = FALSE ORDER BY code_banque"
         )).mappings().all()
         last = db.execute(text(
             'SELECT DISTINCT ON ("Typ_dep") TRIM("Typ_dep") AS nature, TRIM(code_banque) AS code_banque FROM dbo."TDepense" '
-            "WHERE \"Typ_dep\" = 'D' AND TRIM(code_banque) IN (SELECT TRIM(code_banque) FROM dbo.\"TBanque\" "
+            "WHERE TRIM(\"Typ_dep\") IN :natures AND TRIM(code_banque) IN (SELECT TRIM(code_banque) FROM dbo.\"TBanque\" "
             "WHERE TRIM(\"Type_Dep\") = 'D' AND COALESCE(\"Archive\", FALSE) = FALSE) ORDER BY \"Typ_dep\", num_dep DESC"
-        )).mappings().all()
+        ).bindparams(bindparam("natures", expanding=True)), {"natures": list(NATURES)}).mappings().all()
     except SQLAlchemyError as exc:
         raise _fail(exc) from exc
     return {
@@ -82,7 +86,7 @@ def options(db: Session = Depends(get_db)) -> dict[str, Any]:
 
 @router.get("")
 def list_frais(
-    nature: str = Query("D", pattern="^[DF]$"), debut: date | None = None, fin: date | None = None,
+    nature: str = Query("D", pattern=f"^[F{NATURE_CODES}]$"), debut: date | None = None, fin: date | None = None,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """The frais of a nature between two dates (by default the current month), newest first."""
