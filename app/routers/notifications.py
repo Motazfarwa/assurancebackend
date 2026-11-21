@@ -77,8 +77,9 @@ def my_notifications(
 # Clients to complete (administrator): the clients that have
 #  - missing coordonnées: no address, no city or no postal code (neither at home nor at the office), or no phone at all
 #    (home or office). The email is not required: most clients of the agency have none;
-#  - no police at all.
-# A client lacking both is counted once in the total.
+#  - no police at all;
+#  - no quittance at all (neither in their code nor on one of their polices).
+# A client lacking several is counted once in the total.
 # What counts as filled comes from Render's data: phones are often typed with spaces ("50 932 532"), and the old software
 # left "." or "neant" where there was nothing. A phone is one field with at least 6 digits, not all the same ("000000").
 _ITEMS = "jsonb_array_elements(CASE WHEN jsonb_typeof(to_jsonb(k)->'{json}') = 'array' THEN to_jsonb(k)->'{json}' ELSE '[]'::jsonb END)"
@@ -107,6 +108,10 @@ PHONE_OFFICE = _any_contact(_IS_PHONE, "k.tel_b, k.tel_b2, k.tel_b3, k.tel_b4", 
 
 INCOMPLETE_SQL = f"""
     WITH pol AS (SELECT DISTINCT TRIM(p.code_client) AS code FROM dbo."TPolice" p
+    ), quit AS (
+        SELECT TRIM(q.code_client) AS code FROM dbo."TQuittance" q
+        UNION
+        SELECT TRIM(p.code_client) FROM dbo."TPolice" p WHERE TRIM(p.num_int) IN (SELECT TRIM(num_int) FROM dbo."TQuittance")
     ), c AS (
         SELECT TRIM(k.code_client) AS code_client, TRIM(k.nom_client) AS nom_client, k.date_creation::date AS date_creation,
                ARRAY_REMOVE(ARRAY[
@@ -115,12 +120,13 @@ INCOMPLETE_SQL = f"""
                    CASE WHEN COALESCE(k.cp, 0) = 0 AND COALESCE(k.cp_b, 0) = 0 THEN 'code postal' END,
                    CASE WHEN NOT ({PHONE_HOME} OR {PHONE_OFFICE}) THEN 'téléphone' END
                ], NULL) AS coordonnees,
-               pol.code IS NULL AS sans_police
+               pol.code IS NULL AS sans_police, quit.code IS NULL AS sans_quittance
         FROM dbo."TClient" k
         LEFT JOIN pol ON pol.code = TRIM(k.code_client)
+        LEFT JOIN quit ON quit.code = TRIM(k.code_client)
     )
     SELECT * FROM c
-    WHERE CARDINALITY(coordonnees) > 0 OR sans_police
+    WHERE CARDINALITY(coordonnees) > 0 OR sans_police OR sans_quittance
     ORDER BY CASE WHEN code_client ~ '^[0-9]+$' THEN CAST(code_client AS bigint) END DESC NULLS LAST, code_client
 """
 
@@ -130,7 +136,7 @@ def incomplete_clients(
     limit: int = Query(default=50, ge=1, le=200),
     q: str = Query(default="", max_length=100),  # code or name of a client; the counters stay those of the whole list
     # Module "Clients à compléter": one kind of gap only, the next pages, and every entry of each client
-    categorie: str = Query(default="", pattern="^(|coordonnees|sans_police)$"),
+    categorie: str = Query(default="", pattern="^(|coordonnees|sans_police|sans_quittance)$"),
     # one missing coordonnée only: adresse, ville, code postal, téléphone
     manque: str = Query(default="", pattern="^(|adresse|ville|code postal|téléphone)$"),
     offset: int = Query(default=0, ge=0),
@@ -161,11 +167,14 @@ def incomplete_clients(
         manques = list(row["coordonnees"])
         if row["sans_police"]:
             manques.append("aucune police")
+        if row["sans_quittance"]:
+            manques.append("aucune quittance")
         items.append({
             "code_client": row["code_client"], "nom_client": row["nom_client"], "manques": manques,
             "date_creation": row["date_creation"].isoformat() if row["date_creation"] else None,
             "details": {
                 "coordonnees": list(row["coordonnees"]), "sans_police": bool(row["sans_police"]),
+                "sans_quittance": bool(row["sans_quittance"]),
             },
         })
     return {
@@ -173,6 +182,7 @@ def incomplete_clients(
         "found": len(found),
         "coordonnees": sum(1 for row in rows if row["coordonnees"]),
         "sans_police": sum(1 for row in rows if row["sans_police"]),
+        "sans_quittance": sum(1 for row in rows if row["sans_quittance"]),
         "manques": {name: sum(1 for row in rows if name in row["coordonnees"]) for name in ("adresse", "ville", "code postal", "téléphone")},
         "items": items,
     }
