@@ -573,12 +573,13 @@ def expenses_journal(
     date_journal: date = Query(..., alias="date"),
     nature: str = Query(default="", pattern="^[SR]?$", description="S = sinistres, R = ristournes, empty = both"),
     comptabilises: bool = Query(default=False, description="Also the expenses comptabilisées on that date"),
-    journal: bool = Query(default=False, description="The journal of the date: comptabilisées on it, and to comptabiliser paid in its half month"),
+    journal: bool = Query(default=False, description="The journal of the date: comptabilisées on it, and every one still to comptabiliser"),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    # As the journal d'encaissement (and the legacy JOURNAL DE DEPENSE): a dépense not comptabilisée is shown, unticked, on
+    # every date from its payment on, until it is ticked and comptabilisée (then only in the journal of that date).
     try:
-        items = _expenses(db, compagnie, date_journal, comptabilises, nature or None,
-                          pending_from=_pending_start(date_journal) if journal else None)
+        items = _expenses(db, compagnie, date_journal, comptabilises, nature or None, pending_from=None)
     except SQLAlchemyError as exc:
         raise _fail(exc) from exc
     return {"items": items}

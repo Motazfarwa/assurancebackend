@@ -58,6 +58,9 @@ DDL = (
         ADD COLUMN IF NOT EXISTS date_fusion timestamp,
         ADD COLUMN IF NOT EXISTS fusion_par character varying(60)
     """,
+    # The Total of the bordereau as given by the company (typed at the top, as the legacy): the Solde is that Total less
+    # the Prime Total of the lines entered. NULL: the total of the lines (an imported file).
+    'ALTER TABLE dbo."TBordereauCie" ADD COLUMN IF NOT EXISTS total_annonce numeric(16, 3)',
 )
 _tables_ready = False
 
@@ -82,6 +85,7 @@ class BordereauIn(BaseModel):
     periode: str = Field(pattern=r"^(0[1-9]|1[0-2])/[0-9]{4}$")
     date_reception: date | None = None
     fichier: str | None = Field(default=None, max_length=200)
+    total_annonce: float | None = None
     lignes: list[LigneIn] = Field(min_length=1, max_length=20000)
 
 
@@ -209,12 +213,13 @@ def save_bordereau(payload: BordereauIn, user: dict[str, Any] = Depends(require_
         )
         bordereau_id = db.execute(
             text(
-                'INSERT INTO dbo."TBordereauCie" (code_compagnie, tc, periode, date_reception, fichier, created_by) '
-                "VALUES (:c, :t, :p, :d, :f, :u) RETURNING id_bordereau"
+                'INSERT INTO dbo."TBordereauCie" (code_compagnie, tc, periode, date_reception, fichier, created_by, total_annonce) '
+                "VALUES (:c, :t, :p, :d, :f, :u, :a) RETURNING id_bordereau"
             ),
             {
                 "c": payload.code_compagnie, "t": payload.tc, "p": payload.periode,
                 "d": payload.date_reception or date.today(), "f": payload.fichier, "u": str(user.get("sub", ""))[:60],
+                "a": payload.total_annonce,
             },
         ).scalar_one()
         rows = [{"id_bordereau": bordereau_id, **_line_params(line, number)} for number, line in enumerate(payload.lignes, start=1)]
