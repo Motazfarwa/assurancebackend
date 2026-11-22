@@ -35,6 +35,7 @@ from app.routers.banques import router as banques_router
 from app.routers.access import router as access_router
 from app.routers.historique import router as historique_router
 from app.routers.notifications import router as notifications_router
+from app.routers.controle_tables import router as controle_tables_router
 from app.routers.ocr import router as ocr_router
 from app.routers.flotte import router as flotte_router
 from app.routers.reconciliation import router as reconciliation_router
@@ -97,6 +98,7 @@ app.include_router(banques_router)
 app.include_router(access_router)
 app.include_router(historique_router)
 app.include_router(notifications_router)
+app.include_router(controle_tables_router)
 app.include_router(ocr_router)
 app.include_router(flotte_router)
 app.include_router(reconciliation_router)
