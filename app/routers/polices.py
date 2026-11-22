@@ -462,9 +462,29 @@ def get_police_detail(
             {"i": police.get("num_int")},
         ).mappings().all()
         quittance = quittance_rows[0] if quittance_rows else None
+        # Its branche: TPolice.code_branche often holds something else than a TBranche code ("015" on MAGHREBIA 001556).
+        # So, within the company: the exact code, else its first two characters, else the code the N° police starts with
+        # (001556: "00" CHAMEL), else the branche name the risque starts with ("CHAMEL M1 + M5"). None: no branche.
         branche = conn.execute(
-            text('SELECT TRIM(nom_branche) FROM dbo."TBranche" WHERE code_compagnie = :cc AND TRIM(code_branche) = TRIM(:cb) LIMIT 1'),
-            {"cc": police.get("code_compagnie"), "cb": police.get("code_branche") or ""},
+            text(
+                """
+                SELECT COALESCE(
+                    (SELECT NULLIF(TRIM(nom_branche), '') FROM dbo."TBranche"
+                     WHERE code_compagnie = :cc AND TRIM(code_branche) = TRIM(:cb) LIMIT 1),
+                    (SELECT NULLIF(TRIM(nom_branche), '') FROM dbo."TBranche"
+                     WHERE code_compagnie = :cc AND LENGTH(TRIM(:cb)) > 2 AND TRIM(code_branche) = LEFT(TRIM(:cb), 2) LIMIT 1),
+                    (SELECT NULLIF(TRIM(nom_branche), '') FROM dbo."TBranche"
+                     WHERE code_compagnie = :cc AND TRIM(code_branche) <> ''
+                       AND LEFT(TRIM(:num), LENGTH(TRIM(code_branche))) = TRIM(code_branche)
+                     ORDER BY LENGTH(TRIM(code_branche)) DESC LIMIT 1),
+                    (SELECT NULLIF(TRIM(nom_branche), '') FROM dbo."TBranche"
+                     WHERE code_compagnie = :cc AND TRIM(nom_branche) <> ''
+                       AND LEFT(UPPER(TRIM(:risque)), LENGTH(TRIM(nom_branche))) = UPPER(TRIM(nom_branche))
+                     ORDER BY LENGTH(TRIM(nom_branche)) DESC LIMIT 1))
+                """
+            ),
+            {"cc": police.get("code_compagnie"), "cb": police.get("code_branche") or "",
+             "num": police.get("num_police") or "", "risque": police.get("risque") or ""},
         ).scalar()
 
         nom_client = conn.execute(
