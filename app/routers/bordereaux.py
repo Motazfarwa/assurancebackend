@@ -144,19 +144,42 @@ def _line_params(line: LigneIn, number: int) -> dict[str, Any]:
     }
 
 
-def _clients_by_policy(db: Session, numbers: list[str]) -> dict[str, dict[str, Any]]:
-    """Internal policy numbers (num_int) -> client code and name of the policy, for the numbers known to the agency."""
-    clients: dict[str, dict[str, Any]] = {}
-    unique = sorted({_clean_number(number) for number in numbers if _clean_number(number)})
-    for start in range(0, len(unique), 1000):
+def _zeroless(number: Any) -> str:
+    """'001777' -> '1777': the insurers' Excel files drop the leading zeros of the agency's numbers."""
+    return _clean_number(number).lstrip("0")
+
+
+def _policies_by_number(db: Session, numbers: list[str], select_sql: str) -> dict[str, Any]:
+    """Number named by a file -> the agency's policy (num_int), the leading zeros aside ('1777' finds '001777').
+    The exact number wins; otherwise the policy must be the only one with that number once the zeros are dropped."""
+    wanted = sorted({_clean_number(number) for number in numbers if _clean_number(number)})
+    keys = sorted({_zeroless(number) for number in wanted if _zeroless(number)})
+    by_key: dict[str, list[Any]] = {}
+    for start in range(0, len(keys), 1000):
         statement = text(
-            'SELECT TRIM(p.num_int) AS num_int, TRIM(p.code_client) AS code_client, TRIM(c.nom_client) AS nom_client '
-            'FROM dbo."TPolice" p LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(p.code_client) '
-            "WHERE TRIM(p.num_int) IN :numbers"
-        ).bindparams(bindparam("numbers", expanding=True))
-        for row in db.execute(statement, {"numbers": unique[start:start + 1000]}).mappings().all():
-            clients.setdefault(row["num_int"], {"code_client": row["code_client"], "nom_client": row["nom_client"]})
-    return clients
+            select_sql + "WHERE LTRIM(TRIM(p.num_int), '0') IN :keys ORDER BY TRIM(p.num_int)"
+        ).bindparams(bindparam("keys", expanding=True))
+        for row in db.execute(statement, {"keys": keys[start:start + 1000]}).mappings().all():
+            same = by_key.setdefault(_zeroless(row["num_int"]), [])
+            if all(other["num_int"] != row["num_int"] for other in same):
+                same.append(row)
+    found: dict[str, Any] = {}
+    for number in wanted:
+        candidates = by_key.get(_zeroless(number), [])
+        exact = next((row for row in candidates if row["num_int"] == number), None)
+        if exact is not None or len(candidates) == 1:
+            found[number] = exact if exact is not None else candidates[0]
+    return found
+
+
+def _clients_by_policy(db: Session, numbers: list[str]) -> dict[str, dict[str, Any]]:
+    """Policy numbers of a file -> the agency's num_int and the client (code and name) of that policy."""
+    rows = _policies_by_number(
+        db, numbers,
+        'SELECT TRIM(p.num_int) AS num_int, TRIM(p.code_client) AS code_client, TRIM(c.nom_client) AS nom_client '
+        'FROM dbo."TPolice" p LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(p.code_client) ',
+    )
+    return {number: {"num_int": row["num_int"], "code_client": row["code_client"], "nom_client": row["nom_client"]} for number, row in rows.items()}
 
 
 class NumerosIn(BaseModel):
@@ -195,13 +218,15 @@ def save_bordereau(payload: BordereauIn, user: dict[str, Any] = Depends(require_
             },
         ).scalar_one()
         rows = [{"id_bordereau": bordereau_id, **_line_params(line, number)} for number, line in enumerate(payload.lignes, start=1)]
-        # The head office's files rarely carry the client: take it from the agency's policy.
-        clients = _clients_by_policy(db, [row["num_police"] for row in rows if not row["code_client"] or not row["nom_client"]])
+        # The police, the client code and the client name are the agency's ones ('1777' of the file is our '001777',
+        # the name as written in our client file, not the company's spelling); the file's only when the police is unknown.
+        clients = _clients_by_policy(db, [row["num_police"] for row in rows])
         for row in rows:
             client = clients.get(row["num_police"])
             if client:
-                row["code_client"] = row["code_client"] or (client["code_client"] or None)
-                row["nom_client"] = row["nom_client"] or ((client["nom_client"] or "")[:120] or None)
+                row["num_police"] = client["num_int"] or row["num_police"]
+                row["code_client"] = client["code_client"] or row["code_client"]
+                row["nom_client"] = (client["nom_client"] or "")[:120] or row["nom_client"]
         db.execute(text(INSERT_LINE), rows)
         _refresh_totals(db, bordereau_id)
         db.commit()
@@ -332,12 +357,7 @@ def confrontation(
 
     # The policies named by the bordereau (whatever their company), in chunks to keep the IN list small.
     numbers = sorted({_clean_number(line["num_police"]) for line in lines})
-    found: dict[str, Any] = {}
-    for start in range(0, len(numbers), 1000):
-        chunk = numbers[start:start + 1000]
-        statement = text(policy_select + "WHERE TRIM(p.num_int) IN :numbers").bindparams(bindparam("numbers", expanding=True))
-        for row in db.execute(statement, {"numbers": chunk}).mappings().all():
-            found.setdefault(row["num_int"], row)
+    found = _policies_by_number(db, numbers, policy_select)  # '1777' of the file finds our '001777'
 
     # Receipts the agency already holds for these policies, to compare amounts.
     quittance_numbers = sorted({_clean_number(line["num_quittance"]) for line in lines if line["num_quittance"]})
@@ -393,7 +413,7 @@ def confrontation(
                     reasons.append(f"Échéance différente (chez nous : {policy['echeance']})")
             if policy["etat"] not in ("AN", "RV"):
                 reasons.append(f"Police {policy['etat'] or 'sans état'} chez nous")
-            if tc == "T" and number not in expected_numbers and policy["etat"] in ("AN", "RV"):
+            if tc == "T" and policy["num_int"] not in expected_numbers and policy["etat"] in ("AN", "RV"):
                 reasons.append("Hors terme pour cette période chez nous")
             receipt = receipts_by_number.get(_clean_number(line["num_quittance"])) if line["num_quittance"] else None
             receipt = receipt or receipts_by_policy.get(str(policy["num_int"]).strip())
@@ -417,6 +437,7 @@ def confrontation(
             status = "ecart"
         results.append(_plain({
             **line,
+            "num_police": policy["num_int"] if policy else line["num_police"],
             "statut": status,
             "motifs": reasons,
             "nom_client_notre": policy["nom_client"] if policy else None,
@@ -424,7 +445,7 @@ def confrontation(
             "code_branche": policy["code_branche"] if policy else None,
         }))
 
-    received = set(numbers)
+    received = set(numbers) | {row["num_int"] for row in found.values()}
     not_received = [_plain({**row, "observation": "Terme non parvenu"}) for row in expected if row["num_int"] not in received]
 
     # Totals per branch code: bordereau side and what the agency expected.
