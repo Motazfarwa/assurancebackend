@@ -65,6 +65,29 @@ DDL = (
 _tables_ready = False
 
 TOLERANCE = 0.005
+
+# The month (1-12) a policy falls due in the period's month :m, or NULL: the month of its échéance "dd/mm", or for a policy
+# paid by months (Unite M, durée 1 to 11) :m itself when :m comes every durée months from that month (as the Etat du terme).
+DUE_MONTH_SQL = (
+    "CASE WHEN UPPER(TRIM(p.\"Unite\")) = 'M' AND p.duree BETWEEN 1 AND 11 "
+    "AND MOD(:m - CAST(SUBSTRING(TRIM(p.echeance) FROM '^[0-9]{1,2}[/-]([0-9]{1,2})') AS integer) + 12, p.duree) = 0 THEN :m "
+    "ELSE CAST(SUBSTRING(TRIM(p.echeance) FROM '^[0-9]{1,2}[/-]([0-9]{1,2})') AS integer) END"
+)
+
+
+def _same_echeance(theirs: date, policy: Any) -> bool:
+    """The bordereau's échéance is the policy's: same day and month, or for a policy paid by months (Unite M, durée 1-11)
+    same day and a month every durée months from the policy's."""
+    match = re.match(r"^\s*(\d{1,2})[/-](\d{1,2})", str(policy["echeance"] or ""))
+    if not match:
+        return True
+    day, month = int(match.group(1)), int(match.group(2))
+    if theirs.day != day:
+        return False
+    duree = int(policy["duree"] or 0)
+    if (policy["unite"] or "").strip().upper() == "M" and 1 <= duree <= 11:
+        return (theirs.month - month) % duree == 0
+    return theirs.month == month
 LINE_COLUMNS = "id_ligne, ligne, num_police, code_client, nom_client, echeance, num_quittance, prime_net, commission, prime_total"
 
 
@@ -342,11 +365,13 @@ def confrontation(
         expected = db.execute(
             text(
                 policy_select
-                + "WHERE p.code_compagnie = :c AND UPPER(TRIM(p.etat)) IN ('AN', 'RV') AND split_part(TRIM(p.echeance), '/', 2) = :mm "
+                # As the Etat du terme: the month of the échéance ("dd/mm"), or for a policy paid by months (Unite M,
+                # durée 3 or 6) every durée months from it (01/09 by 3 months: September, December, March, June).
+                + "WHERE p.code_compagnie = :c AND UPPER(TRIM(p.etat)) IN ('AN', 'RV') AND (" + DUE_MONTH_SQL + ") = :m "
                 "AND p.effet < :next_first AND (p.expiration IS NULL OR p.expiration >= :first_day) "
                 "ORDER BY TRIM(p.num_int)"
             ),
-            {"c": code_compagnie, "mm": f"{month:02d}", "next_first": next_first, "first_day": first_day},
+            {"c": code_compagnie, "m": month, "next_first": next_first, "first_day": first_day},
         ).mappings().all()
     else:
         expected = db.execute(
@@ -413,8 +438,8 @@ def confrontation(
             if line["code_client"] and str(line["code_client"]).strip() != (policy["code_client"] or ""):
                 reasons.append(f"Code client différent (chez nous : {policy['code_client']})")
             if tc == "T" and line["echeance"] and policy["echeance"]:
-                theirs = f"{line['echeance'].day:02d}/{line['echeance'].month:02d}"
-                if theirs != policy["echeance"]:
+                # A policy paid by months: its échéance comes back every durée months (01/09 by 3 months: 01/12 too).
+                if not _same_echeance(line["echeance"], policy):
                     reasons.append(f"Échéance différente (chez nous : {policy['echeance']})")
             if policy["etat"] not in ("AN", "RV"):
                 reasons.append(f"Police {policy['etat'] or 'sans état'} chez nous")
