@@ -4,7 +4,7 @@ Reception stores the lines of the file; confrontation compares them with what th
 (policies and receipts) and lists what does not match. Nothing in the policy / receipt tables is modified.
 """
 import re
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -76,19 +76,25 @@ DUE_MONTH_SQL = (
 
 
 def _same_echeance(theirs: date, policy: Any) -> bool:
-    """The bordereau's échéance is the policy's: same day and month, or for a policy paid by months (Unite M, durée 1-11)
-    same day and a month every durée months from the policy's."""
+    """The bordereau's échéance is the policy's: the same day and month, or the day after (the police keeps the last day
+    covered, 25/06, the quittance and the company the first day of the next terme, 26/06). For a policy paid by months
+    (Unite M, durée 1 to 11: mensuelle, trimestrielle, semestrielle) the same every durée months from it (25/06 by 6
+    months: 26/12 too)."""
     match = re.match(r"^\s*(\d{1,2})[/-](\d{1,2})", str(policy["echeance"] or ""))
     if not match:
         return True
     day, month = int(match.group(1)), int(match.group(2))
-    if theirs.day != day:
-        return False
     duree = int(policy["duree"] or 0)
-    if (policy["unite"] or "").strip().upper() == "M" and 1 <= duree <= 11:
-        return (theirs.month - month) % duree == 0
-    return theirs.month == month
-LINE_COLUMNS = "id_ligne, ligne, num_police, code_client, nom_client, echeance, num_quittance, prime_net, commission, prime_total"
+    step = duree if (policy["unite"] or "").strip().upper() == "M" and 1 <= duree <= 11 else 12
+    for shift in range(0, 12, step):
+        due_month = (month - 1 + shift) % 12 + 1
+        try:
+            due = date(theirs.year, due_month, day)
+        except ValueError:  # 31 in a month of 30 days, 29/02: its last day
+            due = date(theirs.year, due_month, 28 if due_month == 2 else 30)
+        if (theirs.month, theirs.day) in ((due.month, due.day), ((due + timedelta(days=1)).month, (due + timedelta(days=1)).day)):
+            return True
+    return False
 
 
 class LigneIn(BaseModel):
@@ -396,7 +402,7 @@ def confrontation(
         chunk = quittance_numbers[start:start + 1000]
         statement = text(
             'SELECT TRIM(num_quittance) AS num_quittance, TRIM(num_int) AS num_int, prime_net, commission, prime_total, COALESCE(frais_quit, 0) AS frais_quit FROM dbo."TQuittance" '
-            "WHERE TRIM(num_quittance) IN :numbers"
+            "WHERE TRIM(num_quittance) IN :numbers AND COALESCE(TRIM(type_quittance), '') <> 'R'"
         ).bindparams(bindparam("numbers", expanding=True))
         for row in db.execute(statement, {"numbers": chunk}).mappings().all():
             receipts_by_number[row["num_quittance"]] = row
@@ -406,7 +412,9 @@ def confrontation(
         chunk = internal_ids[start:start + 1000]
         statement = text(
             'SELECT TRIM(num_quittance) AS num_quittance, TRIM(num_int) AS num_int, prime_net, commission, prime_total, COALESCE(frais_quit, 0) AS frais_quit FROM dbo."TQuittance" '
-            "WHERE TRIM(num_int) IN :ids AND echeance >= :first_day AND echeance < :next_first ORDER BY echeance DESC"
+            "WHERE TRIM(num_int) IN :ids AND echeance >= :first_day AND echeance < :next_first "
+            # the quittance itself: not a ristourne (type R) of the policy falling in the month
+            "AND COALESCE(TRIM(type_quittance), '') <> 'R' ORDER BY echeance DESC"
         ).bindparams(bindparam("ids", expanding=True))
         for row in db.execute(statement, {"ids": chunk, "first_day": first_day, "next_first": next_first}).mappings().all():
             receipts_by_policy.setdefault(row["num_int"], row)
