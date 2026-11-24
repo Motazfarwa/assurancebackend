@@ -941,8 +941,9 @@ def daily_production(
 # Opérations journalières (financières)
 # ---------------------------------------------------------------------------------------------
 # Technique: the client payments of the period (TRegCli with a piece, one line per quittance paid, Opé R) and the
-# technical payments (TDepense 'T': claims, rebates, experts; Opé D). Divers: the sorties diverses (TDepense 'S', Opé D)
-# and entrées diverses (TDepense 'E', Opé R).
+# technical payments (TDepense 'T': claims, rebates, experts; Opé D). Divers: the sorties diverses (TDepense 'S', Opé D),
+# the frais généraux (TDepense 'D' W.J and 'F' M.J, Opé D, as the legacy état: 10093 RS+FOPROLOS…) and the entrées
+# diverses (TDepense 'E', Opé R).
 FINANCIAL_SQL = {
     "technique": """
 SELECT 'R' AS ope, r.date_reg_cli::date AS date_op, r.num_reg_cli AS numero, d."Num_Recu" AS ligne,
@@ -980,7 +981,7 @@ SELECT CASE WHEN TRIM(d."Typ_dep") = 'E' THEN 'R' ELSE 'D' END AS ope, d.date_de
        d.mont_dep AS reglement, TRIM(d.num_cheq) AS num_cheq, d.date_cheq::date AS date_cheq, TRIM(d.code_banque) AS compte,
        TRIM(d.objet_dep) AS beneficiaire
 FROM dbo."TDepense" d
-WHERE TRIM(d."Typ_dep") IN ('S', 'E') AND d.date_dep >= :debut AND d.date_dep < :fin
+WHERE TRIM(d."Typ_dep") IN ('S', 'E', 'D', 'F') AND d.date_dep >= :debut AND d.date_dep < :fin
 ORDER BY date_op, ope, numero
 """,
 }
