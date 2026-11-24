@@ -524,7 +524,15 @@ def confrontation(
         "total_prime_total": sum(float(row["prime_total"] or 0) for row in results),
         "fusion": counts["ecart"] == 0 and counts["inconnue"] == 0 and not not_received,
         "fusionne": header["fusionne"] == "O",
+        # lines the fusion cannot write into TQuittance (no N° de quittance in the file)
+        "nb_sans_quittance": sum(1 for row in results if not str(row.get("num_quittance") or "").strip()),
     }
+    if header.get("id_bordereau") and header["fusionne"] == "O":
+        # the quittances this bordereau's fusion wrote into TQuittance (0: fused before they were written)
+        summary["nb_quittances_fusion"] = db.execute(
+            text("""SELECT COUNT(*) FROM dbo."TQuittance" WHERE bordcie = 'O' AND num_bordcie = :t"""),
+            {"t": _fusion_tag(header["id_bordereau"], 0, "", "")},
+        ).scalar()
     return {
         "bordereau": _plain(header),
         "resume": summary,
