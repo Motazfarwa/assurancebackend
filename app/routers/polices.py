@@ -435,12 +435,15 @@ def _plain(row) -> dict:
 def get_police_detail(
     num_police: str | None = Query(default=None, max_length=20),
     code_client: str | None = Query(default=None, max_length=20),
+    num_imat: str | None = Query(default=None, max_length=20),
 ):
-    """Full policy (and its latest receipt) by policy number or, failing that, the client's latest policy."""
+    """Full policy (and its latest receipt) by policy number, by registration plate (spaces and case ignored: the
+    policy in force first, then the latest), or failing that the client's latest policy."""
     number = (num_police or "").strip()
     client = (code_client or "").strip()
-    if not number and not client:
-        raise HTTPException(status_code=422, detail="Renseignez un numéro de police ou un code client")
+    plate = re.sub(r"\s", "", (num_imat or "")).upper()
+    if not number and not client and not plate:
+        raise HTTPException(status_code=422, detail="Renseignez un numéro de police, une immatriculation ou un code client")
 
     with engine.connect() as conn:
         if number:
@@ -448,6 +451,16 @@ def get_police_detail(
                 text('SELECT * FROM dbo."TPolice" p WHERE TRIM(p.num_police) = :n ORDER BY p.date_creation DESC NULLS LAST'),
                 {"n": number},
             ).mappings().all()
+        elif plate:
+            rows = conn.execute(
+                text(
+                    """SELECT * FROM dbo."TPolice" p WHERE REPLACE(UPPER(TRIM(p.num_imat)), ' ', '') = :i """
+                    "ORDER BY (UPPER(TRIM(p.etat)) IN ('AN', 'RV')) DESC, p.effet DESC NULLS LAST, p.date_creation DESC NULLS LAST"
+                ),
+                {"i": plate},
+            ).mappings().all()
+            if not rows:
+                raise HTTPException(status_code=404, detail="Aucune police pour cette immatriculation")
         else:
             rows = conn.execute(
                 text('SELECT * FROM dbo."TPolice" p WHERE TRIM(p.code_client) = :c ORDER BY p.date_creation DESC NULLS LAST, p.num_police DESC'),
