@@ -406,7 +406,7 @@ def confrontation(
         chunk = quittance_numbers[start:start + 1000]
         statement = text(
             'SELECT TRIM(num_quittance) AS num_quittance, TRIM(num_int) AS num_int, prime_net, commission, prime_total, COALESCE(frais_quit, 0) AS frais_quit FROM dbo."TQuittance" '
-            "WHERE TRIM(num_quittance) IN :numbers AND COALESCE(TRIM(type_quittance), '') <> 'R'"
+            "WHERE TRIM(num_quittance) IN :numbers AND UPPER(COALESCE(TRIM(type_quittance), '')) <> 'R' AND COALESCE(prime_total, 0) >= 0"
         ).bindparams(bindparam("numbers", expanding=True))
         for row in db.execute(statement, {"numbers": chunk}).mappings().all():
             receipts_by_number[row["num_quittance"]] = row
@@ -417,10 +417,13 @@ def confrontation(
         statement = text(
             'SELECT TRIM(num_quittance) AS num_quittance, TRIM(num_int) AS num_int, prime_net, commission, prime_total, COALESCE(frais_quit, 0) AS frais_quit FROM dbo."TQuittance" '
             "WHERE TRIM(num_int) IN :ids AND echeance >= :first_day AND echeance < :next_first "
-            # the quittance itself: not a ristourne (type R) of the policy falling in the month
-            "AND COALESCE(TRIM(type_quittance), '') <> 'R' ORDER BY echeance DESC"
+            # only the quittance itself (a prime of the same T/C, that period's first): never a ristourne of the
+            # policy falling in the month (type R, or written without T/C)
+            "AND UPPER(COALESCE(TRIM(type_quittance), 'P')) <> 'R' AND TRIM(COALESCE(tc, '')) = :tc "
+            "AND COALESCE(prime_total, 0) >= 0 "
+            "ORDER BY (TRIM(COALESCE(\"Periode\", '')) = :periode) DESC, echeance DESC"
         ).bindparams(bindparam("ids", expanding=True))
-        for row in db.execute(statement, {"ids": chunk, "first_day": first_day, "next_first": next_first}).mappings().all():
+        for row in db.execute(statement, {"ids": chunk, "first_day": first_day, "next_first": next_first, "tc": tc, "periode": periode}).mappings().all():
             receipts_by_policy.setdefault(row["num_int"], row)
 
     branch_names = {

@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.auth import require_current_user
 from app.database import get_db
-from app.routers.client_records import serialize
+from app.routers.client_records import serialize, with_display_primes
 from app.routers.flotte import ACTIVE_SQL
 
 
@@ -88,7 +88,7 @@ def search_policies(
         ),
         params,
     ).mappings().all()
-    return {"items": [serialize(row) for row in rows], "total": len(rows)}
+    return {"items": with_display_primes(db, [serialize(row) for row in rows]), "total": len(rows)}
 
 
 POLICY_ORDERS = {

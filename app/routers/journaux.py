@@ -1723,6 +1723,18 @@ def _journal_validations(db: Session, kind: str, compagnie: int | None, days: li
         item = _plain(row)
         item["date_saisie"] = row["date_saisie"].isoformat(timespec="minutes") if row["date_saisie"] else None
         out[row["jour"].isoformat()] = item
+    # a journal is "Validé" once its feuille de caisse is validated (module "Feuille de caisse"): the feuille of the
+    # company, or, for every company, any feuille of that day
+    sheets = db.execute(text(
+        'SELECT DISTINCT ON (jour) jour, utilisateur, date_saisie FROM dbo."TFeuilleCaisseValide" '
+        'WHERE jour = ANY(CAST(:days AS date[])) AND (CAST(:c AS integer) IS NULL OR code_compagnie = CAST(:c AS integer)) '
+        'ORDER BY jour, date_saisie DESC'
+    ), {"days": days, "c": compagnie}).mappings().all()
+    for row in sheets:
+        key = row["jour"].isoformat()
+        if key not in out:
+            out[key] = {"utilisateur": row["utilisateur"],
+                        "date_saisie": row["date_saisie"].isoformat(timespec="minutes") if row["date_saisie"] else None}
     return out
 
 

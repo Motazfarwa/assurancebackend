@@ -458,8 +458,9 @@ def unpaid_statement_links(code_client: str, db: Session = Depends(get_db)) -> d
     return {"client": {"code_client": client["code_client"], "nom_client": client["nom_client"]}, "liens": ordered}
 
 
-# Compagnies the agency does not work with: left out of the Etat des impayés choice.
-HIDDEN_COMPANIES = ("MAE", "EL AMANA TAKAFUL", "SALIM", "STAR")
+# Compagnies the agency does not work with (archivées: EL AMANA TAKAFUL, EUROP ASSISTANCE, BIAT…): left out of the
+# Etat des impayés choice.
+HIDDEN_COMPANIES = ("MAE", "EL AMANA TAKAFUL", "SALIM", "STAR", "EUROP ASSISTANCE", "BIAT")
 
 
 @router.get("/etat/compagnies")
