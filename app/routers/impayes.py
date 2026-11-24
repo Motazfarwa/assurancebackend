@@ -201,6 +201,30 @@ def list_partial_payments(
     return {"items": items, "count": len(items), "limit": limit}
 
 
+
+# A quittance of a company bordereau counts (état des impayés, taux de recouvrement) only once its bordereau is fused
+# (module 550): its fusion cancelled, it leaves the état again. The bordereau is the legacy one (TBordereau, one row per
+# quittance, "Fusion" O/N) or an imported one (TBordereauLigne of TBordereauCie, fusionne O/N); a quittance found in a
+# fused bordereau is kept even if another, not fused, also has it.
+FUSED_ONLY_SQL = """
+  AND TRIM(q.num_quittance) NOT IN (
+    SELECT n FROM (
+      SELECT TRIM(bx.num_quittance) AS n FROM "{schema}"."TBordereau" bx
+      WHERE UPPER(COALESCE(TRIM(bx."Fusion"), 'N')) <> 'O' AND bx.num_quittance IS NOT NULL
+      UNION
+      SELECT TRIM(lx.num_quittance) FROM "{schema}"."TBordereauLigne" lx JOIN "{schema}"."TBordereauCie" cx ON cx.id_bordereau = lx.id_bordereau
+      WHERE COALESCE(cx.fusionne, 'N') <> 'O' AND lx.num_quittance IS NOT NULL
+      EXCEPT
+      SELECT TRIM(bx.num_quittance) FROM "{schema}"."TBordereau" bx
+      WHERE UPPER(COALESCE(TRIM(bx."Fusion"), 'N')) = 'O' AND bx.num_quittance IS NOT NULL
+      EXCEPT
+      SELECT TRIM(lx.num_quittance) FROM "{schema}"."TBordereauLigne" lx JOIN "{schema}"."TBordereauCie" cx ON cx.id_bordereau = lx.id_bordereau
+      WHERE cx.fusionne = 'O' AND lx.num_quittance IS NOT NULL
+    ) unfused WHERE n IS NOT NULL
+  )
+"""
+
+
 @router.get("/etat")
 def unpaid_statement(
     code_client: str = Query(default="", max_length=8),
@@ -248,6 +272,7 @@ def unpaid_statement(
               AND (NOT :mise OR q.mised = 'O' OR q.observation ILIKE '%mise en demeure%')
               AND (CAST(:debut AS timestamp) IS NULL OR q.echeance >= CAST(:debut AS timestamp))
               AND (CAST(:fin AS timestamp) IS NULL OR q.echeance < CAST(:fin AS timestamp))
+              {FUSED_ONLY_SQL.format(schema=schema)}
         ),
         -- The latest version of each policy, read once (a per-row lookup on TRIM(num_int) cannot use an index).
         pol AS (
@@ -318,6 +343,7 @@ WITH q AS MATERIALIZED (
       AND q.echeance >= :debut AND q.echeance < :lendemain
       AND (:code = '' OR TRIM(q.code_client) = :code)
       AND (:tc = '' OR UPPER(TRIM(q.tc)) = :tc)
+      {fused_only}
 ),
 pol AS (
     SELECT DISTINCT ON (TRIM(num_int)) TRIM(num_int) AS num_int, code_compagnie
@@ -371,7 +397,7 @@ def recovery_rate(
         start = today.replace(month=1, day=1)
         db.execute(text("SET LOCAL enable_nestloop = off"))  # TRIM joins on legacy tables: hash joins only
         def period(first: date, last: date) -> Any:
-            return db.execute(text(RECOVERY_SQL.format(schema=settings.db_schema)), {
+            return db.execute(text(RECOVERY_SQL.format(schema=settings.db_schema, fused_only=FUSED_ONLY_SQL.format(schema=settings.db_schema))), {
                 "code": code_client.strip(), "type_client": type_client, "compagnie": code_compagnie, "tc": tc, "piece": piece,
                 "debut": datetime.combine(first, time.min), "lendemain": datetime.combine(last + timedelta(days=1), time.min),
             }).mappings().one()
