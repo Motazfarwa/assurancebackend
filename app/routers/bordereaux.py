@@ -97,6 +97,9 @@ def _same_echeance(theirs: date, policy: Any) -> bool:
     return False
 
 
+LINE_COLUMNS = "id_ligne, ligne, num_police, code_client, nom_client, echeance, num_quittance, prime_net, commission, prime_total"
+
+
 class LigneIn(BaseModel):
     num_police: str = Field(min_length=1, max_length=30)
     code_client: str | None = Field(default=None, max_length=12)
