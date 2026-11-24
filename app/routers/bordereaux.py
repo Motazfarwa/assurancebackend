@@ -92,7 +92,8 @@ def _same_echeance(theirs: date, policy: Any) -> bool:
             due = date(theirs.year, due_month, day)
         except ValueError:  # 31 in a month of 30 days, 29/02: its last day
             due = date(theirs.year, due_month, 28 if due_month == 2 else 30)
-        if (theirs.month, theirs.day) in ((due.month, due.day), ((due + timedelta(days=1)).month, (due + timedelta(days=1)).day)):
+        # the day itself, the day after (GAT: 25/06 -> 26/06) or the day before (LLOYD: 28/12 -> 27/12)
+        if any((theirs.month, theirs.day) == ((due + timedelta(days=d)).month, (due + timedelta(days=d)).day) for d in (-1, 0, 1)):
             return True
     return False
 
@@ -569,6 +570,78 @@ def _legacy_bordereau(db: Session, code_compagnie: int, tc: str, periode: str) -
     return header, [{key: row[key] for key in keys} for row in rows]
 
 
+# ---------------------------------------------------------------------------------------------
+# Fusion: the quittances of the bordereau go into TQuittance (as the legacy software), montant = solde = prime totale
+# (nothing paid yet), Comptabiliser 'N', with the T/C and the période of the bordereau. A quittance already in
+# TQuittance is not written again. Each quittance written is tagged (bordcie 'O', num_bordcie = the bordereau) so the
+# fusion can be cancelled: the ones still unpaid are removed.
+# ---------------------------------------------------------------------------------------------
+INSERT_FUSED_QUITTANCE = """
+INSERT INTO dbo."TQuittance" (num_quittance, date_saisie, date_emission, num_int, echeance, tc, "Periode", code_client,
+    prime_net, montant_quittance, solde_quittance, prime_total, commission, type_quittance, "Comptabiliser", timbre,
+    "Create_User", "Create_Date", bordcie, num_bordcie, observation)
+VALUES (:num, now(), :emission, :num_int, :echeance, :tc, :periode, :code_client,
+    :prime_net, :total, :total, :total, :commission, :type, 'N', 0,
+    :user, now(), 'O', :tag, '...')
+"""
+
+USED_FUSED_QUITTANCES = """
+SELECT TRIM(q.num_quittance) FROM dbo."TQuittance" q
+WHERE q.bordcie = 'O' AND q.num_bordcie = :t
+  AND (COALESCE(q.solde_quittance, 0) <> COALESCE(q.montant_quittance, 0) OR COALESCE(q."Comptabiliser", 'N') = 'O'
+       OR EXISTS (SELECT 1 FROM dbo."RDetRegCli" d WHERE TRIM(d."Num_quitance") = TRIM(q.num_quittance)))
+"""
+
+
+def _fusion_tag(bordereau_id: int | None, code_compagnie: int, tc: str, periode: str) -> str:
+    return f"CIE{bordereau_id}" if bordereau_id else f"{code_compagnie}/{tc}/{periode}"[:20]
+
+
+def _write_fused_quittances(db: Session, lines: list[Any], tc: str, periode: str, emission: Any, tag: str, user: str) -> dict[str, int]:
+    """Writes the bordereau's quittances that TQuittance does not have yet; returns the counts."""
+    numbers = sorted({str(line["num_quittance"] or "").strip() for line in lines} - {""})
+    existing: set[str] = set()
+    if numbers:
+        existing = {
+            row[0] for row in db.execute(
+                text('SELECT TRIM(num_quittance) FROM dbo."TQuittance" WHERE TRIM(num_quittance) = ANY(:n)'), {"n": numbers}
+            )
+        }
+    written, without_number = 0, 0
+    for line in lines:
+        number = str(line["num_quittance"] or "").strip()
+        if not number:
+            without_number += 1
+            continue
+        if number in existing:
+            continue
+        num_int = str(line["num_police"] or "").strip()
+        code_client = str(line["code_client"] or "").strip() or db.execute(
+            text('SELECT TRIM(code_client) FROM dbo."TPolice" WHERE TRIM(num_int) = :n LIMIT 1'), {"n": num_int}
+        ).scalar()
+        total = float(line["prime_total"] or 0)
+        db.execute(text(INSERT_FUSED_QUITTANCE), {
+            "num": number[:15], "emission": emission, "num_int": num_int[:15] or None, "echeance": line["echeance"],
+            "tc": tc, "periode": periode, "code_client": code_client[:8] if code_client else None,
+            "prime_net": float(line["prime_net"] or 0), "total": total, "commission": float(line["commission"] or 0),
+            "type": "R" if total < 0 else "P", "user": user[:20], "tag": tag,
+        })
+        existing.add(number)
+        written += 1
+    return {"quittances_creees": written, "quittances_existantes": len(lines) - written - without_number, "lignes_sans_quittance": without_number}
+
+
+def _remove_fused_quittances(db: Session, tag: str) -> None:
+    """Removes the quittances written by the fusion; refused when one of them was paid or comptabilisée since."""
+    used = db.execute(text(USED_FUSED_QUITTANCES), {"t": tag}).scalars().all()
+    if used:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Fusion non annulable : {len(used)} quittance(s) déjà réglée(s) ou comptabilisée(s) ({', '.join(used[:5])}).",
+        )
+    db.execute(text("""DELETE FROM dbo."TQuittance" WHERE bordcie = 'O' AND num_bordcie = :t"""), {"t": tag})
+
+
 class PeriodFusionIn(BaseModel):
     code_compagnie: int
     tc: str = Field(default="T", pattern="^[TC]$")
@@ -594,12 +667,17 @@ def fuse_period(payload: PeriodFusionIn, user: dict[str, Any] = Depends(require_
                 f"{summary['nb_non_parvenus']} terme(s) non parvenu(s) : consultez la confrontation ou confirmez la fusion."
             ),
         )
+    header, lines = _legacy_bordereau(db, payload.code_compagnie, payload.tc, payload.periode)
+    counts = _write_fused_quittances(
+        db, lines, payload.tc, payload.periode, header["date_reception"],
+        _fusion_tag(None, payload.code_compagnie, payload.tc, payload.periode), str(user.get("sub", "")),
+    )
     db.execute(
         text(f'UPDATE dbo."TBordereau" b SET "Fusion" = \'O\', "Update_User" = :u, "Update_Date" = now() WHERE {LEGACY_KEY}'),
         {"c": payload.code_compagnie, "t": payload.tc, "p": payload.periode, "u": str(user.get("sub", ""))[:50]},
     )
     db.commit()
-    return {**summary, "fusionne": True}
+    return {**summary, **counts, "fusionne": True}
 
 
 @router.delete("/fusion-periode", status_code=204)
@@ -610,7 +688,9 @@ def cancel_period_fusion(
     user: dict[str, Any] = Depends(require_current_user),
     db: Session = Depends(get_db),
 ) -> None:
-    """Cancels the fusion of the bordereau of dbo."TBordereau": its lines go back to "Fusion" = 'N'."""
+    """Cancels the fusion of the bordereau of dbo."TBordereau": its lines go back to "Fusion" = 'N' and the quittances
+    the fusion wrote (still unpaid) are removed."""
+    _remove_fused_quittances(db, _fusion_tag(None, code_compagnie, tc, periode))
     db.execute(
         text(f'UPDATE dbo."TBordereau" b SET "Fusion" = \'N\', "Update_User" = :u, "Update_Date" = now() WHERE {LEGACY_KEY}'),
         {"c": code_compagnie, "t": tc, "p": periode, "u": str(user.get("sub", ""))[:50]},
@@ -788,7 +868,7 @@ def fuse_bordereau(
     """Marks a bordereau as merged ("fusionné") once it has been confronted with the agency data."""
     _ensure_tables(db)
     header = db.execute(
-        text('SELECT code_compagnie, tc, periode, fusionne FROM dbo."TBordereauCie" WHERE id_bordereau = :i'), {"i": bordereau_id}
+        text('SELECT code_compagnie, tc, periode, fusionne, date_reception FROM dbo."TBordereauCie" WHERE id_bordereau = :i'), {"i": bordereau_id}
     ).mappings().first()
     if not header:
         raise HTTPException(status_code=404, detail="Bordereau introuvable.")
@@ -804,17 +884,25 @@ def fuse_bordereau(
                 f"{summary['nb_non_parvenus']} terme(s) non parvenu(s) : consultez la confrontation ou confirmez la fusion."
             ),
         )
+    lines = db.execute(
+        text(f'SELECT {LINE_COLUMNS} FROM dbo."TBordereauLigne" WHERE id_bordereau = :i ORDER BY ligne'), {"i": bordereau_id}
+    ).mappings().all()
+    counts = _write_fused_quittances(
+        db, lines, header["tc"], header["periode"], header["date_reception"], _fusion_tag(bordereau_id, 0, "", ""),
+        str(user.get("sub", "")),
+    )
     db.execute(
         text("""UPDATE dbo."TBordereauCie" SET fusionne = 'O', date_fusion = now(), fusion_par = :u WHERE id_bordereau = :i"""),
         {"i": bordereau_id, "u": str(user.get("sub", ""))[:60]},
     )
     db.commit()
-    return {**summary, "fusionne": True}
+    return {**summary, **counts, "fusionne": True}
 
 
 @router.delete("/{bordereau_id}/fusion", status_code=204)
 def cancel_fusion(bordereau_id: int, db: Session = Depends(get_db)) -> None:
     _ensure_tables(db)
+    _remove_fused_quittances(db, _fusion_tag(bordereau_id, 0, "", ""))
     db.execute(
         text("""UPDATE dbo."TBordereauCie" SET fusionne = 'N', date_fusion = NULL, fusion_par = NULL WHERE id_bordereau = :i"""),
         {"i": bordereau_id},
