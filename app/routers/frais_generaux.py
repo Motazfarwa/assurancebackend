@@ -86,10 +86,11 @@ def options(db: Session = Depends(get_db)) -> dict[str, Any]:
 
 @router.get("")
 def list_frais(
-    nature: str = Query("D", pattern=f"^[F{NATURE_CODES}]$"), debut: date | None = None, fin: date | None = None,
+    nature: str = Query("D", pattern=f"^[TF{NATURE_CODES}]$"), debut: date | None = None, fin: date | None = None,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """The frais of a nature between two dates (by default the current month), newest first."""
+    """The frais of a nature between two dates (by default the current month), newest first. T (tous): the dépenses
+    (frais généraux, D) and the recettes (E) together, with the total of each."""
     today = date.today()
     debut = debut or today.replace(day=1)
     fin = fin or today
@@ -97,15 +98,18 @@ def list_frais(
         rows = db.execute(text("""
             SELECT d.num_dep, d.date_dep, TRIM(d.code_type) AS code_type, TRIM(t.libelle) AS libelle, TRIM(d.mod_dep) AS mode,
                    TRIM(d.num_cheq) AS num_piece, d.date_cheq AS date_piece, TRIM(d.code_banque) AS code_banque,
-                   d.mont_dep AS montant, TRIM(d.objet_dep) AS observation, COALESCE(d."Comptabiliser", 'N') = 'O' AS comptabilise
+                   d.mont_dep AS montant, TRIM(d.objet_dep) AS observation, COALESCE(d."Comptabiliser", 'N') = 'O' AS comptabilise,
+                   TRIM(d."Typ_dep") AS nature
             FROM dbo."TDepense" d LEFT JOIN dbo.ttype_dep t ON TRIM(t.code_type) = TRIM(d.code_type)
-            WHERE d."Typ_dep" = :nature AND d.date_dep >= :debut AND d.date_dep < :fin
+            WHERE TRIM(d."Typ_dep") = ANY(:natures) AND d.date_dep >= :debut AND d.date_dep < :fin
             ORDER BY d.date_dep DESC, d.num_dep DESC
-        """), {"nature": nature, "debut": debut, "fin": fin + timedelta(days=1)}).mappings().all()
+        """), {"natures": ["D", "E"] if nature == "T" else [nature], "debut": debut, "fin": fin + timedelta(days=1)}).mappings().all()
     except SQLAlchemyError as exc:
         raise _fail(exc) from exc
     items = [_plain(row) for row in rows]
-    return {"items": items, "total": round(sum(float(row["montant"] or 0) for row in items), 3)}
+    depenses = round(sum(float(row["montant"] or 0) for row in items if row["nature"] != "E"), 3)
+    recettes = round(sum(float(row["montant"] or 0) for row in items if row["nature"] == "E"), 3)
+    return {"items": items, "total": round(depenses + recettes, 3), "total_depenses": depenses, "total_recettes": recettes}
 
 
 @router.post("", status_code=201)
