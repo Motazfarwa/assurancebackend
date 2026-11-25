@@ -618,6 +618,12 @@ def _write_fused_quittances(db: Session, lines: list[Any], tc: str, periode: str
                 text('SELECT TRIM(num_quittance) FROM dbo."TQuittance" WHERE TRIM(num_quittance) = ANY(:n)'), {"n": numbers}
             )
         }
+    # The police as we know it ('1777' of the file is our '001777'): its num_int, client and company link the quittance
+    # to the client and the compagnie in the état des impayés.
+    policies = _policies_by_number(
+        db, [str(line["num_police"] or "") for line in lines],
+        'SELECT TRIM(p.num_int) AS num_int, TRIM(p.code_client) AS code_client FROM dbo."TPolice" p ',
+    )
     written, without_number = 0, 0
     for line in lines:
         number = str(line["num_quittance"] or "").strip()
@@ -626,10 +632,9 @@ def _write_fused_quittances(db: Session, lines: list[Any], tc: str, periode: str
             continue
         if number in existing:
             continue
-        num_int = str(line["num_police"] or "").strip()
-        code_client = str(line["code_client"] or "").strip() or db.execute(
-            text('SELECT TRIM(code_client) FROM dbo."TPolice" WHERE TRIM(num_int) = :n LIMIT 1'), {"n": num_int}
-        ).scalar()
+        policy = policies.get(_clean_number(line["num_police"]))
+        num_int = policy["num_int"] if policy else _clean_number(line["num_police"])
+        code_client = (policy["code_client"] if policy else "") or str(line["code_client"] or "").strip()
         total = float(line["prime_total"] or 0)
         db.execute(text(INSERT_FUSED_QUITTANCE), {
             "num": number[:15], "emission": emission, "num_int": num_int[:15] or None, "echeance": line["echeance"],
