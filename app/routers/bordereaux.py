@@ -209,6 +209,25 @@ def _policies_by_number(db: Session, numbers: list[str], select_sql: str) -> dic
     return found
 
 
+def _fill_echeances(db: Session, rows: list[dict[str, Any]], periode: str) -> list[dict[str, Any]]:
+    """A line without échéance (a file without that column, as BH): the day of our police's échéance in the month of the
+    période (police échéance 03/12, période 12/2026: 03/12/2026). Left empty when the police is unknown."""
+    missing = sorted({str(row.get("num_police") or "").strip() for row in rows if not row.get("echeance")} - {""})
+    if not missing or not re.match(r"^\d{2}/\d{4}$", periode or ""):
+        return rows
+    month, year = int(periode[:2]), int(periode[3:])
+    policies = _policies_by_number(db, missing, 'SELECT TRIM(p.num_int) AS num_int, TRIM(p.echeance) AS echeance FROM dbo."TPolice" p ')
+    last_day = (date(year + month // 12, month % 12 + 1, 1) - timedelta(days=1)).day
+    for row in rows:
+        if row.get("echeance"):
+            continue
+        policy = policies.get(_clean_number(row.get("num_police")))
+        match = re.match(r"^\s*(\d{1,2})[/-]", str(policy["echeance"] or "")) if policy else None
+        if match and 1 <= int(match.group(1)) <= 31:
+            row["echeance"] = date(year, month, min(int(match.group(1)), last_day))
+    return rows
+
+
 def _clients_by_policy(db: Session, numbers: list[str]) -> dict[str, dict[str, Any]]:
     """Policy numbers of a file -> the agency's num_int and the client (code and name) of that policy."""
     rows = _policies_by_number(
@@ -265,6 +284,7 @@ def save_bordereau(payload: BordereauIn, user: dict[str, Any] = Depends(require_
                 row["num_police"] = client["num_int"] or row["num_police"]
                 row["code_client"] = client["code_client"] or row["code_client"]
                 row["nom_client"] = (client["nom_client"] or "")[:120] or row["nom_client"]
+        _fill_echeances(db, rows, payload.periode)
         db.execute(text(INSERT_LINE), rows)
         _refresh_totals(db, bordereau_id)
         db.commit()
@@ -358,6 +378,7 @@ def confrontation(
             text(f'SELECT {LINE_COLUMNS} FROM dbo."TBordereauLigne" WHERE id_bordereau = :i ORDER BY ligne'),
             {"i": header["id_bordereau"]},
         ).mappings().all()]
+        _fill_echeances(db, lines, periode)
 
     month, year = int(periode[:2]), int(periode[3:])
     first_day = date(year, month, 1)
@@ -859,7 +880,8 @@ def get_bordereau(bordereau_id: int, db: Session = Depends(get_db)) -> dict[str,
     lines = db.execute(
         text(f'SELECT {LINE_COLUMNS} FROM dbo."TBordereauLigne" WHERE id_bordereau = :i ORDER BY ligne'), {"i": bordereau_id}
     ).mappings().all()
-    return {"bordereau": _plain(header), "lignes": [_plain(line) for line in lines]}
+    # a bordereau stored without échéances (before they were taken from the police): shown with the police's
+    return {"bordereau": _plain(header), "lignes": [_plain(line) for line in _fill_echeances(db, [dict(line) for line in lines], header["periode"])]}
 
 
 @router.delete("/{bordereau_id}", status_code=204)
@@ -900,9 +922,9 @@ def fuse_bordereau(
                 f"{summary['nb_non_parvenus']} terme(s) non parvenu(s) : consultez la confrontation ou confirmez la fusion."
             ),
         )
-    lines = db.execute(
+    lines = _fill_echeances(db, [dict(line) for line in db.execute(
         text(f'SELECT {LINE_COLUMNS} FROM dbo."TBordereauLigne" WHERE id_bordereau = :i ORDER BY ligne'), {"i": bordereau_id}
-    ).mappings().all()
+    ).mappings().all()], header["periode"])
     counts = _write_fused_quittances(
         db, lines, header["tc"], header["periode"], header["date_reception"], _fusion_tag(bordereau_id, 0, "", ""),
         str(user.get("sub", "")),
