@@ -617,6 +617,40 @@ def list_all_polices():
 
 
 
+# N° police typed in Gestion des polices: the polices whose number (or dossier number) contains what is typed, the
+# ones starting with it first, of the company chosen when there is one; 15 at most.
+@router.get("/suggestions")
+def police_suggestions(
+    q: str = Query(min_length=2, max_length=20),
+    code_compagnie: int | None = None,
+    limit: int = Query(default=15, ge=1, le=50),
+) -> dict[str, Any]:
+    typed = re.sub(r"\s", "", q)
+    if len(typed) < 2:
+        return {"items": []}
+    like = "%" + typed.replace("%", "").replace("_", "") + "%"
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            """
+            SELECT DISTINCT ON (TRIM(p.num_police), TRIM(p.num_int)) TRIM(p.num_police) AS num_police, TRIM(p.num_int) AS num_int,
+                   TRIM(p.code_client) AS code_client, TRIM(c.nom_client) AS nom_client, TRIM(k.nom_compagnie) AS nom_compagnie,
+                   UPPER(TRIM(p.etat)) AS etat, NULLIF(TRIM(p.num_imat), '') AS num_imat, p.effet,
+                   (TRIM(p.num_police) LIKE :prefix OR TRIM(p.num_int) LIKE :prefix) AS starts
+            FROM dbo."TPolice" p
+            LEFT JOIN dbo."TClient" c ON TRIM(c.code_client) = TRIM(p.code_client)
+            LEFT JOIN dbo."TCompagnie" k ON k.code_compagnie = p.code_compagnie
+            WHERE (TRIM(p.num_police) LIKE :like OR TRIM(p.num_int) LIKE :like)
+              AND (CAST(:c AS integer) IS NULL OR p.code_compagnie = CAST(:c AS integer))
+            ORDER BY TRIM(p.num_police), TRIM(p.num_int), p.effet DESC NULLS LAST
+            """
+        ), {"like": like, "prefix": like[1:], "c": code_compagnie}).mappings().all()
+    items = sorted((dict(row) for row in rows), key=lambda row: (not row["starts"], row["etat"] not in ("AN", "RV"), row["num_police"] or ""))[:limit]
+    for item in items:
+        item.pop("starts", None)
+        item["effet"] = item["effet"].isoformat()[:10] if item["effet"] else None
+    return {"items": items}
+
+
 @router.get("/search")
 def search_polices(
     numero: str | None = Query(default=None, min_length=4, max_length=50),
