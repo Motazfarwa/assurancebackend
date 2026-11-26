@@ -259,6 +259,12 @@ def save_bordereau(payload: BordereauIn, user: dict[str, Any] = Depends(require_
     """Stores a received bordereau; a bordereau already stored for the same company / type / period is replaced."""
     _ensure_tables(db)
     try:
+        # The bordereau replaced: when it was fused, the new one stays fused (its quittances are kept, the new lines'
+        # are added, the removed lines' are taken out while still unpaid).
+        previous = db.execute(
+            text('SELECT id_bordereau, fusionne, date_fusion, fusion_par FROM dbo."TBordereauCie" WHERE code_compagnie = :c AND tc = :t AND periode = :p'),
+            {"c": payload.code_compagnie, "t": payload.tc, "p": payload.periode},
+        ).mappings().first()
         db.execute(
             text('DELETE FROM dbo."TBordereauCie" WHERE code_compagnie = :c AND tc = :t AND periode = :p'),
             {"c": payload.code_compagnie, "t": payload.tc, "p": payload.periode},
@@ -287,11 +293,26 @@ def save_bordereau(payload: BordereauIn, user: dict[str, Any] = Depends(require_
         _fill_echeances(db, rows, payload.periode)
         db.execute(text(INSERT_LINE), rows)
         _refresh_totals(db, bordereau_id)
+        counts: dict[str, int] = {}
+        if previous and previous["fusionne"] == "O":
+            old_tag, new_tag = _fusion_tag(previous["id_bordereau"], 0, "", ""), _fusion_tag(bordereau_id, 0, "", "")
+            db.execute(
+                text("""UPDATE dbo."TBordereauCie" SET fusionne = 'O', date_fusion = :d, fusion_par = :u WHERE id_bordereau = :i"""),
+                {"i": bordereau_id, "d": previous["date_fusion"], "u": previous["fusion_par"]},
+            )
+            db.execute(text("""UPDATE dbo."TQuittance" SET num_bordcie = :n WHERE bordcie = 'O' AND num_bordcie = :o"""), {"n": new_tag, "o": old_tag})
+            kept = sorted({str(row["num_quittance"] or "").strip() for row in rows} - {""})
+            db.execute(text(
+                """DELETE FROM dbo."TQuittance" q WHERE q.bordcie = 'O' AND q.num_bordcie = :t AND NOT (TRIM(q.num_quittance) = ANY(:kept))
+                     AND COALESCE(q.solde_quittance, 0) = COALESCE(q.montant_quittance, 0) AND COALESCE(q."Comptabiliser", 'N') <> 'O'
+                     AND NOT EXISTS (SELECT 1 FROM dbo."RDetRegCli" d WHERE TRIM(d."Num_quitance") = TRIM(q.num_quittance))"""
+            ), {"t": new_tag, "kept": kept})
+            counts = _write_fused_quittances(db, rows, payload.tc, payload.periode, payload.date_reception or date.today(), new_tag, str(user.get("sub", "")))
         db.commit()
     except SQLAlchemyError as exc:
         db.rollback()
         raise HTTPException(status_code=503, detail=f"Enregistrement impossible : {str(getattr(exc, 'orig', exc))[:250]}") from exc
-    return {"id_bordereau": bordereau_id, "nb_lignes": len(payload.lignes)}
+    return {"id_bordereau": bordereau_id, "nb_lignes": len(payload.lignes), "fusionne": bool(counts), **counts}
 
 
 @router.get("")
@@ -887,6 +908,9 @@ def get_bordereau(bordereau_id: int, db: Session = Depends(get_db)) -> dict[str,
 @router.delete("/{bordereau_id}", status_code=204)
 def delete_bordereau(bordereau_id: int, db: Session = Depends(get_db)) -> None:
     _ensure_tables(db)
+    # a fused bordereau: its quittances go with it (refused when one is paid or comptabilisée since), as « Annuler la fusion »
+    if db.execute(text('SELECT fusionne FROM dbo."TBordereauCie" WHERE id_bordereau = :i'), {"i": bordereau_id}).scalar() == "O":
+        _remove_fused_quittances(db, _fusion_tag(bordereau_id, 0, "", ""))
     db.execute(text('DELETE FROM dbo."TBordereauCie" WHERE id_bordereau = :i'), {"i": bordereau_id})
     db.commit()
 

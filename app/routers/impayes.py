@@ -24,6 +24,12 @@ def unpaid_table(db: Session) -> Table:
         raise HTTPException(status_code=503, detail="Impossible de lire la table des impayés.") from exc
 
 
+
+def _name_pattern(name: str) -> str:
+    """The name typed, word by word: "JEMMALI WAL" finds "JEMMALI  WALID" (extra spaces, a dot or a middle name between)."""
+    words = [word.replace("\\", "").replace("%", "").replace("_", "") for word in name.split()]
+    return "%" + "%".join(word for word in words if word) + "%"
+
 @router.get("/compagnies")
 def list_unpaid_companies(db: Session = Depends(get_db)) -> dict[str, Any]:
     table = unpaid_table(db)
@@ -92,7 +98,7 @@ def list_clients_by_settlement(
     try:
         rows = db.execute(
             text(sql),
-            {"code": code_client.strip(), "nom": nom_client.strip(), "nom_like": f"%{nom_client.strip()}%", "acompte": acompte_solde, "limit": limit},
+            {"code": code_client.strip(), "nom": nom_client.strip(), "nom_like": _name_pattern(nom_client), "acompte": acompte_solde, "limit": limit},
         ).mappings().all()
     except SQLAlchemyError as exc:
         raise HTTPException(status_code=503, detail="Impossible de lire les règlements clients (TRDetRegCli).") from exc
@@ -189,7 +195,7 @@ def list_partial_payments(
         LIMIT :limit
     """
     params = {
-        "code": code_client.strip(), "nom": nom_client.strip(), "nom_like": f"%{nom_client.strip()}%", "limit": limit,
+        "code": code_client.strip(), "nom": nom_client.strip(), "nom_like": _name_pattern(nom_client), "limit": limit,
         "debut": datetime.combine(date_debut, time.min) if date_debut else None,
         "fin": datetime.combine(date_fin + timedelta(days=1), time.min) if date_fin else None,
     }
@@ -259,7 +265,7 @@ def unpaid_statement(
             FROM "{schema}"."RPiece" r
             -- A cashed pièce (regle = 'O') has already lowered solde_quittance: only the ones en instance are subtracted.
             JOIN "{schema}"."TPiece" t ON TRIM(t.nump) = TRIM(r."NumP") AND TRIM(t.code_client) = TRIM(r."Code_Client")
-            WHERE COALESCE(t.regle, 'N') <> 'O'
+            WHERE COALESCE(t.regle, 'N') <> 'O' AND COALESCE(t.verser, 'N') <> 'O'  -- a pièce versée is already a règlement
             GROUP BY 1
         ),
         -- The quittances kept, chosen before the client / policy / company lookups.
@@ -320,7 +326,7 @@ def unpaid_statement(
         LIMIT :limit
     """
     params = {
-        "piece": piece, "code": code_client.strip(), "nom": nom_client.strip(), "nom_like": f"%{nom_client.strip()}%",
+        "piece": piece, "code": code_client.strip(), "nom": nom_client.strip(), "nom_like": _name_pattern(nom_client),
         "type_client": type_client, "compagnie": code_compagnie, "mise": mise_en_demeure, "limit": limit, "tc": tc,
         "debut": datetime.combine(date_debut, time.min) if date_debut else None,
         "fin": datetime.combine(date_fin + timedelta(days=1), time.min) if date_fin else None,
@@ -362,7 +368,7 @@ instance AS (
     SELECT TRIM(r."Num_Quittance") AS num_quittance, SUM(r."Montant_Reglement") AS montant
     FROM "{schema}"."RPiece" r
     JOIN "{schema}"."TPiece" t ON TRIM(t.nump) = TRIM(r."NumP") AND TRIM(t.code_client) = TRIM(r."Code_Client")
-    WHERE :piece = 'avec' AND COALESCE(t.regle, 'N') <> 'O' AND TRIM(r."Num_Quittance") IN (SELECT num_quittance FROM scope)
+    WHERE :piece = 'avec' AND COALESCE(t.regle, 'N') <> 'O' AND COALESCE(t.verser, 'N') <> 'O' AND TRIM(r."Num_Quittance") IN (SELECT num_quittance FROM scope)
     GROUP BY 1
 )
 SELECT COALESCE(SUM(s.montant), 0) AS primes_exigibles,

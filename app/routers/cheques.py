@@ -79,7 +79,7 @@ def _open_quittances(db: Session, code_client: str, exclude_nump: str | None = N
                        FROM dbo."RPiece" r
                        JOIN dbo."TPiece" tp ON TRIM(tp.nump) = TRIM(r."NumP")
                        WHERE TRIM(r."Num_Quittance") = TRIM(q.num_quittance)
-                         AND COALESCE(tp.regle, 'N') = 'N'
+                         AND COALESCE(tp.regle, 'N') = 'N' AND COALESCE(tp.verser, 'N') = 'N'
                          AND (CAST(:exclude AS text) IS NULL OR TRIM(tp.nump) <> CAST(:exclude AS text))
                    ), 0) AS instance
             FROM dbo."TQuittance" q
@@ -410,7 +410,8 @@ def list_pieces(
     conditions = ["TRUE"]
     params: dict[str, Any] = {"limit": limit}
     if instance:
-        conditions.append("COALESCE(p.regle, 'N') = 'N'")
+        # en instance: neither settled nor paid into the bank (a piece versée is a client règlement already: TRegCli)
+        conditions.append("COALESCE(p.regle, 'N') = 'N' AND COALESCE(p.verser, 'N') = 'N'")
     if code_client and code_client.strip():
         conditions.append("TRIM(p.code_client) = :client")
         params["client"] = code_client.strip()

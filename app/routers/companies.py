@@ -1,11 +1,13 @@
 ﻿from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Response
-from sqlalchemy import MetaData, Table, func, select
+from pydantic import BaseModel
+from sqlalchemy import MetaData, Table, func, select, text
 from sqlalchemy.exc import IntegrityError, NoSuchTableError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.auth import require_current_user
+from app.routers.access import is_admin
 from app.config import settings
 from app.database import get_db
 
@@ -41,11 +43,57 @@ def row_dict(row: Any) -> dict[str, Any]:
     return {key: value.isoformat() if hasattr(value, "isoformat") else value for key, value in result.items()}
 
 
+# A company is never deleted (its polices, quittances and bordereaux keep pointing to it): it is archived. The archived
+# codes are kept apart (dbo."TCompagnieArchive"), the legacy table TCompagnie is not changed.
+ARCHIVE_DDL = """
+CREATE TABLE IF NOT EXISTS dbo."TCompagnieArchive" (
+    code_compagnie integer PRIMARY KEY,
+    archive_par varchar(50),
+    date_archive timestamp DEFAULT now()
+)
+"""
+
+
+def _archived(db: Session) -> set[int]:
+    db.execute(text(ARCHIVE_DDL))
+    db.commit()
+    return {row[0] for row in db.execute(text('SELECT code_compagnie FROM dbo."TCompagnieArchive"'))}
+
+
 @router.get("")
 def list_companies(db: Session = Depends(get_db)) -> dict[str, Any]:
     companies = table(db, settings.db_company_table)
     rows = db.execute(select(companies).order_by(companies.c[COMPANY_KEY])).mappings().all()
-    return {"items": [row_dict(row) for row in rows]}
+    archived = _archived(db)
+    return {"items": [{**row_dict(row), "archive": row[COMPANY_KEY] in archived} for row in rows]}
+
+
+class ArchiveIn(BaseModel):
+    archive: bool
+
+
+@router.put("/{company_code}/archive")
+def archive_company(company_code: int, payload: ArchiveIn, user: dict[str, Any] = Depends(require_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Archives a company (no longer offered in the lists; its history stays) or takes it back. Administrator only."""
+    if not is_admin(user):
+        raise HTTPException(status_code=403, detail="Seul l'administrateur archive une compagnie.")
+    companies = table(db, settings.db_company_table)
+    if db.execute(select(companies.c[COMPANY_KEY]).where(companies.c[COMPANY_KEY] == company_code)).first() is None:
+        raise HTTPException(status_code=404, detail="Compagnie introuvable.")
+    _archived(db)
+    try:
+        if payload.archive:
+            db.execute(text(
+                'INSERT INTO dbo."TCompagnieArchive" (code_compagnie, archive_par, date_archive) VALUES (:c, :u, now()) '
+                "ON CONFLICT (code_compagnie) DO NOTHING"
+            ), {"c": company_code, "u": str(user.get("sub", ""))[:50]})
+        else:
+            db.execute(text('DELETE FROM dbo."TCompagnieArchive" WHERE code_compagnie = :c'), {"c": company_code})
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(status_code=503, detail="Erreur lors de l'archivage de la compagnie.") from exc
+    return {"code_compagnie": company_code, "archive": payload.archive}
 
 
 @router.post("", status_code=201)
@@ -104,26 +152,9 @@ def update_company(company_code: int, values: dict[str, Any], db: Session = Depe
 
 
 @router.delete("/{company_code}", status_code=204)
-def delete_company(company_code: int, db: Session = Depends(get_db)) -> Response:
-    companies = table(db, settings.db_company_table)
-    branches = table(db, settings.db_branch_table)
-    prestataire_companies = table(db, settings.db_prestataire_company_table)
-    if db.execute(select(companies.c[COMPANY_KEY]).where(companies.c[COMPANY_KEY] == company_code)).first() is None:
-        raise HTTPException(status_code=404, detail="Compagnie introuvable.")
-    if db.execute(select(branches.c[BRANCH_KEY]).where(branches.c[COMPANY_KEY] == company_code).limit(1)).first():
-        raise HTTPException(status_code=409, detail="Supprimez d'abord les branches rattachées à cette compagnie.")
-    if db.execute(select(prestataire_companies.c.Code_Prestataire).where(prestataire_companies.c.Code_Compagnie == company_code).limit(1)).first():
-        raise HTTPException(status_code=409, detail="Cette compagnie est rattachée à un prestataire et ne peut pas être supprimée.")
-    try:
-        db.execute(companies.delete().where(companies.c[COMPANY_KEY] == company_code))
-        db.commit()
-        return Response(status_code=204)
-    except IntegrityError as exc:
-        db.rollback()
-        raise HTTPException(status_code=409, detail="Suppression impossible : cette compagnie est utilisée par d'autres données.") from exc
-    except SQLAlchemyError as exc:
-        db.rollback()
-        raise HTTPException(status_code=503, detail="Erreur lors de la suppression de la compagnie.") from exc
+def delete_company(company_code: int) -> Response:
+    """A company is not deleted: it is archived (PUT /{code}/archive)."""
+    raise HTTPException(status_code=405, detail="Une compagnie ne peut pas être supprimée : archivez-la.")
 
 
 @router.get("/{company_code}/branches")

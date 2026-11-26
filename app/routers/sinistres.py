@@ -275,6 +275,8 @@ def list_sinistres(
     code_etape: str = Query(default="", pattern=r"^(|aucune|\d{1,6})$"),
     limit: int = Query(default=100, ge=1, le=2000),
     offset: int = Query(default=0, ge=0),
+    # "desc": the most recent numbers first (the N° sinistre dropdown)
+    ordre: str = Query(default="asc", pattern="^(asc|desc)$"),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """Claims, most recent first; `q` searches the number, client, policy, plate, third party and expert,
@@ -360,7 +362,7 @@ def list_sinistres(
         ).mappings().first()
         total = db.execute(text(f'SELECT COUNT(*) FROM dbo."Sinistre" WHERE {where}'), params).scalar()
         rows = db.execute(
-            text(f'SELECT {LIST_COLUMNS} FROM dbo."Sinistre" WHERE {where} ORDER BY LENGTH(TRIM("Num_Sinistre_Agence")), TRIM("Num_Sinistre_Agence") LIMIT :limit OFFSET :offset'),
+            text(f'SELECT {LIST_COLUMNS} FROM dbo."Sinistre" WHERE {where} ORDER BY LENGTH(TRIM("Num_Sinistre_Agence")) {"DESC" if ordre == "desc" else ""}, TRIM("Num_Sinistre_Agence") {"DESC" if ordre == "desc" else ""} LIMIT :limit OFFSET :offset'),
             params,
         ).mappings().all()
         items = [_plain(row) for row in rows]

@@ -40,6 +40,7 @@ from app.routers.ocr import router as ocr_router
 from app.routers.flotte import router as flotte_router
 from app.routers.reconciliation import router as reconciliation_router
 from app.routers.journal_employe import router as journal_employe_router
+from app.routers.signature import router as signature_router
 from app.audit import audit_middleware
 from app.repairs import run_repairs
 from app import whatsapp_robot
@@ -103,6 +104,7 @@ app.include_router(ocr_router)
 app.include_router(flotte_router)
 app.include_router(reconciliation_router)
 app.include_router(journal_employe_router)
+app.include_router(signature_router)
 
 
 @app.get("/health", tags=["Health"])
