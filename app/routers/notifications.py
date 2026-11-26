@@ -105,6 +105,12 @@ def _no_place(col: str) -> str:
 
 PHONE_HOME = _any_contact(_IS_PHONE, "k.tel, k.tel1, k.tel2, k.tel3, k.mobile, k.tel_contact", "telephones_domicile")
 PHONE_OFFICE = _any_contact(_IS_PHONE, "k.tel_b, k.tel_b2, k.tel_b3, k.tel_b4", "telephones_bureau")
+# An email: something@something.something, in the old columns or the saved lists (home or office).
+_IS_MAIL = r"(COALESCE({v}, '') ~* '^[^@\s]+@[^@\s]+\.[^@\s]+$')"
+EMAIL_ANY = (
+    "(" + _any_contact(_IS_MAIL, "k.adresse_email, k.email1, k.email2, k.email3, k.emailb2, k.emailb3", "emails_domicile")
+    + " OR " + _any_contact(_IS_MAIL, "NULL", "emails_bureau") + ")"
+)
 
 INCOMPLETE_SQL = f"""
     WITH pol AS (SELECT DISTINCT TRIM(p.code_client) AS code FROM dbo."TPolice" p
@@ -120,13 +126,15 @@ INCOMPLETE_SQL = f"""
                    CASE WHEN COALESCE(k.cp, 0) = 0 AND COALESCE(k.cp_b, 0) = 0 THEN 'code postal' END,
                    CASE WHEN NOT ({PHONE_HOME} OR {PHONE_OFFICE}) THEN 'téléphone' END
                ], NULL) AS coordonnees,
-               pol.code IS NULL AS sans_police, quit.code IS NULL AS sans_quittance
+               pol.code IS NULL AS sans_police, quit.code IS NULL AS sans_quittance,
+               -- the email is not one of the coordonnées required: only its own filter « Sans email » lists it
+               NOT {EMAIL_ANY} AS sans_email
         FROM dbo."TClient" k
         LEFT JOIN pol ON pol.code = TRIM(k.code_client)
         LEFT JOIN quit ON quit.code = TRIM(k.code_client)
     )
     SELECT * FROM c
-    WHERE CARDINALITY(coordonnees) > 0 OR sans_police OR sans_quittance
+    WHERE CARDINALITY(coordonnees) > 0 OR sans_police OR sans_quittance OR sans_email
     ORDER BY CASE WHEN code_client ~ '^[0-9]+$' THEN CAST(code_client AS bigint) END DESC NULLS LAST, code_client
 """
 
@@ -138,7 +146,7 @@ def incomplete_clients(
     # Module "Clients à compléter": one kind of gap only, the next pages, and every entry of each client
     categorie: str = Query(default="", pattern="^(|coordonnees|sans_police|sans_quittance)$"),
     # one missing coordonnée only: adresse, ville, code postal, téléphone
-    manque: str = Query(default="", pattern="^(|adresse|ville|code postal|téléphone)$"),
+    manque: str = Query(default="", pattern="^(|adresse|ville|code postal|téléphone|email)$"),
     offset: int = Query(default=0, ge=0),
     # "Entre deux dates": the clients created (date de création) between them, both days included; the counters too
     date_debut: date | None = None,
@@ -150,21 +158,25 @@ def incomplete_clients(
         raise HTTPException(status_code=403, detail="Accès réservé à l'administrateur.")
     if date_debut and date_fin and date_debut > date_fin:
         raise HTTPException(status_code=422, detail="La date de début doit précéder la date de fin.")
-    rows = db.execute(text(INCOMPLETE_SQL)).mappings().all()
+    every = db.execute(text(INCOMPLETE_SQL)).mappings().all()
     if date_debut or date_fin:
-        rows = [row for row in rows if row["date_creation"] is not None
-                and (date_debut is None or row["date_creation"] >= date_debut) and (date_fin is None or row["date_creation"] <= date_fin)]
+        every = [row for row in every if row["date_creation"] is not None
+                 and (date_debut is None or row["date_creation"] >= date_debut) and (date_fin is None or row["date_creation"] <= date_fin)]
+    # the clients to complete (a coordonnée, a police or a quittance missing); « Sans email »: every client without one
+    rows = [row for row in every if row["coordonnees"] or row["sans_police"] or row["sans_quittance"]]
     # Every word typed must be in the code or the name, in any order; the exact code comes first.
     search = q.strip().lower()
-    found = [row for row in rows if all(word in f'{row["code_client"]} {row["nom_client"] or ""}'.lower() for word in search.split())]
-    if categorie:
+    found = [row for row in (every if manque == "email" else rows) if all(word in f'{row["code_client"]} {row["nom_client"] or ""}'.lower() for word in search.split())]
+    if categorie and manque != "email":  # « Sans email » comes as coordonnees:email: every client without one
         found = [row for row in found if row[categorie]]
-    if manque:
+    if manque == "email":
+        found = [row for row in found if row["sans_email"]]
+    elif manque:
         found = [row for row in found if manque in row["coordonnees"]]
     found.sort(key=lambda row: row["code_client"].lower() != search)
     items = []
     for row in found[offset:offset + limit]:
-        manques = list(row["coordonnees"])
+        manques = list(row["coordonnees"]) + (["email"] if manque == "email" else [])
         if row["sans_police"]:
             manques.append("aucune police")
         if row["sans_quittance"]:
@@ -183,7 +195,8 @@ def incomplete_clients(
         "coordonnees": sum(1 for row in rows if row["coordonnees"]),
         "sans_police": sum(1 for row in rows if row["sans_police"]),
         "sans_quittance": sum(1 for row in rows if row["sans_quittance"]),
-        "manques": {name: sum(1 for row in rows if name in row["coordonnees"]) for name in ("adresse", "ville", "code postal", "téléphone")},
+        "manques": {**{name: sum(1 for row in rows if name in row["coordonnees"]) for name in ("adresse", "ville", "code postal", "téléphone")},
+                    "email": sum(1 for row in every if row["sans_email"])},
         "items": items,
     }
 
