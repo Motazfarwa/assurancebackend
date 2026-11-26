@@ -2,7 +2,7 @@
 from datetime import date, timedelta
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -199,3 +199,87 @@ def _cash_sheets(db: Session, numbers: list[str]) -> dict[str, str]:
         parts = [part for part in (row["jours"], "À déclarer" if row["a_declarer"] else None) if part]
         result[row["num_quittance"]] = " · ".join(parts)
     return result
+
+
+# ---------------------------------------------------------------------------------------------
+# One quittance, as the company's printed « QUITTANCE DE PRIME »: the company and the agency (TCompagnie: name,
+# address, code agent), the police and its validity (from the échéance, for the durée of the police), the client, the
+# prime nette, accessoires, taxes and prime totale, and how it was paid (the client's règlements of it).
+# ---------------------------------------------------------------------------------------------
+def _meaningful(value: Any) -> str:
+    text_value = str(value or "").strip()
+    return "" if text_value in {"", ".", "0", "-"} else text_value
+
+
+def _add_duration(start: date, unit: str, count: int) -> date:
+    if unit == "J":
+        return start + timedelta(days=count)
+    months = count * (12 if unit == "A" else 1)
+    month_index = start.month - 1 + months
+    year, month = start.year + month_index // 12, month_index % 12 + 1
+    for day in (start.day, 30, 29, 28):
+        try:
+            return date(year, month, day)
+        except ValueError:
+            continue
+    return date(year, month, 28)
+
+
+@router.get("/receipts/{num_quittance}/impression")
+def receipt_print(num_quittance: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    q = db.execute(text('SELECT * FROM dbo."TQuittance" WHERE TRIM(num_quittance) = :n LIMIT 1'), {"n": num_quittance.strip()}).mappings().first()
+    if q is None:
+        raise HTTPException(status_code=404, detail="Quittance introuvable.")
+    police = db.execute(text(
+        'SELECT TRIM(num_police) AS num_police, TRIM(num_int) AS num_int, code_compagnie, duree, UPPER(TRIM("Unite")) AS unite, effet, expiration '
+        'FROM dbo."TPolice" WHERE TRIM(num_int) = :i ORDER BY effet DESC NULLS LAST LIMIT 1'
+    ), {"i": str(q["num_int"] or "").strip()}).mappings().first()
+    company = db.execute(text(
+        'SELECT TRIM(nom_compagnie) AS nom, "Adresse_Compagnie" AS adresse, "Ville_Compagnie" AS ville, "Code_Agent" AS code_agent, '
+        '"Nom_Agence" AS nom_agence FROM dbo."TCompagnie" WHERE code_compagnie = :c'
+    ), {"c": police["code_compagnie"] if police else None}).mappings().first() if police else None
+    client = db.execute(text(
+        'SELECT TRIM(code_client) AS code_client, TRIM(nom_client) AS nom_client, TRIM("Type_Client") AS type_client, '
+        "COALESCE(NULLIF(TRIM(adresse), ''), NULLIF(TRIM(adresse_b), '')) AS adresse, "
+        """COALESCE(NULLIF(TRIM(ville), ''), NULLIF(TRIM(ville_b), '')) AS ville FROM dbo."TClient" WHERE TRIM(code_client) = :c LIMIT 1"""
+    ), {"c": str(q["code_client"] or "").strip()}).mappings().first()
+    payments = db.execute(text(
+        'SELECT r.date_reg_cli::date AS date, UPPER(TRIM(r.type_reg_cli)) AS mode, TRIM(r.num_piece) AS piece, TRIM(r.code_banque) AS banque, d."Montant" AS montant '
+        'FROM dbo."RDetRegCli" d JOIN dbo."TRegCli" r ON r.num_reg_cli = d."Num_reg_cli" '
+        'WHERE TRIM(d."Num_quitance") = :n ORDER BY r.date_reg_cli'
+    ), {"n": num_quittance.strip()}).mappings().all()
+    start = q["echeance"].date() if q["echeance"] else None
+    end = None
+    if start and police and police["duree"] and police["unite"] in ("A", "M", "J"):
+        end = _add_duration(start, police["unite"], int(police["duree"])) - timedelta(days=1)
+    plain = lambda value: float(value) if value is not None else 0.0  # noqa: E731
+    return {
+        "num_quittance": str(q["num_quittance"]).strip(),
+        "compagnie": {
+            "nom": company["nom"] if company else "",
+            # an address left as the placeholder "Adresse <compagnie>" is not printed
+            "adresse": "" if not company or _meaningful(company["adresse"]).lower() == f"adresse {company['nom'] or ''}".lower().strip()
+            else _meaningful(company["adresse"]),
+            "ville": _meaningful(company["ville"]) if company else "",
+            "code_agence": _meaningful(company["code_agent"]) if company else "",
+            "nom_agence": _meaningful(company["nom_agence"]) if company else "",
+        },
+        "police": {"num_police": (police["num_police"] if police else "") or str(q["num_int"] or "").strip(), "tc": str(q["tc"] or "").strip(),
+                   "periode": str(q["Periode"] or "").strip()},
+        "validite": {"du": start.isoformat() if start else None, "au": end.isoformat() if end else None},
+        "client": {
+            "code_client": client["code_client"] if client else str(q["code_client"] or "").strip(),
+            "nom_client": client["nom_client"] if client else "",
+            "societe": bool(client and (client["type_client"] or "").upper().startswith("S")),
+            "adresse": " ".join(part for part in ((client["adresse"] if client else ""), (client["ville"] if client else "")) if _meaningful(part)),
+        },
+        "montants": {
+            "prime_nette": plain(q["prime_net"]), "accessoires": plain(q["frais_quit"]),
+            "taxes": [plain(q["Taxe"]), plain(q["transport"]), plain(q["timbre"])],
+            "prime_totale": plain(q["montant_quittance"] if q["montant_quittance"] is not None else q["prime_total"]),
+            "solde": plain(q["solde_quittance"]),
+        },
+        "reglements": [{"date": row["date"].isoformat() if row["date"] else None, "mode": row["mode"] or "", "piece": row["piece"] or "",
+                        "banque": row["banque"] or "", "montant": plain(row["montant"])} for row in payments],
+        "date_reglement": q["Date_Reglement"].date().isoformat() if q["Date_Reglement"] else None,
+    }
